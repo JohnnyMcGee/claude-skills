@@ -66,4 +66,4 @@ When the next item is a `🔍 Smoke test` checkpoint, remind the user to run it;
 
 ## 4. Finish
 
-When every item is checked, re-read the issue's requirements and acceptance criteria and account for each one explicitly — a gap becomes a new checklist item and you return to step 2. This step is complete only when every criterion maps to landed work. Then ask: **"Would you like me to open a PR?"** — the user may open it themselves, keep editing, or say "open a PR", in which case you do.
+When every item is checked, re-read the issue's requirements and acceptance criteria and account for each one explicitly — a gap becomes a new checklist item and you return to step 2. This step is complete only when every criterion maps to landed work. Then ask: **"Would you like me to open a PR?"** — the user may open it themselves, keep editing, or say "open a PR", in which case use the `open-pr` skill, which opens it and drives it to a human-reviewable state.
