@@ -16,16 +16,22 @@ Builds a four-section dossier (Business Context, Technical Context, Possible App
 
 Invoke with `/brief-me <PR number, ticket id, or task description>`.
 
+### open-pr
+
+Opens a pull request and drives it to a human-reviewable state: resolves merge conflicts, gets the checks green (or excuses a failure with named evidence), then waits for AI reviewers, triages each comment as valid / invalid / out-of-scope, and lands the valid fixes as atomic commits before resolving every thread. It never replies to human reviewers, never makes out-of-scope changes, and never merges — it just clears the automated gates. Hands off naturally from `atomic-commits`.
+
+Invoke with `/open-pr [base branch]`.
+
 ## Installation
 
 Copy the skill folders into your skills directory:
 
 ```bash
 # Personal (all projects)
-cp -r atomic-commits brief-me ~/.claude/skills/
+cp -r atomic-commits brief-me open-pr ~/.claude/skills/
 
 # Or per-project
-cp -r atomic-commits brief-me <project>/.claude/skills/
+cp -r atomic-commits brief-me open-pr <project>/.claude/skills/
 ```
 
 Each skill is a folder containing a `SKILL.md` (plus any supporting files) — see the [skills documentation](https://code.claude.com/docs/en/skills) for details.
