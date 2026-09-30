@@ -86,14 +86,11 @@ Later layers win, key by key, so an override only needs the fields it changes:
    model = "haiku"
    ```
 
-## Project tables
+## Repos
 
-Two more tables in the project's `config.toml` span every repo in the project:
+A project can span repos. The `[repos]` table in the project's `config.toml` lists their clones:
 
 ```toml
-[limits]
-max_workers = 3            # workers running at once; `afk start` refuses beyond it
-
 [repos]
 "acme/widgets-api" = "/home/me/code/widgets-api"
 ```

@@ -90,10 +90,11 @@ class Afk:
         }, indent=2))
 
     def capacity(self, workers):
-        return max(0, self.max_workers() - len(workers))
+        """Free worker slots: as for `afk start`, workers in review are parked on the human and don't count."""
+        return max(0, self.max_workers() - sum(w["phase"] != "review" for w in workers))
 
     def max_workers(self):
-        return self.config().get("limits", {}).get("max_workers", MAX_WORKERS)
+        return {**LIMITS, **self.config().get("limits", {})}["max_workers"]
 
     def worker_statuses(self):
         return [read_json(p) for p in sorted(self.workers_dir().glob("*/status.json"))]
@@ -159,7 +160,7 @@ class Afk:
                  "-c", str(worktree), "-P", "-F", "#{pane_id}"]
             ).strip()
             undo.append(lambda: self.run(["tmux", "kill-window", "-t", pane]))
-            self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree)])
+            shell = self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree), "-P", "-F", "#{pane_id}"]).strip()
 
             settings = worker_dir / "settings.json"
             settings.write_text(json.dumps(worker_settings(base), indent=2) + "\n")
@@ -172,7 +173,8 @@ class Afk:
             write_json(
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "title": ticket.title, "phase": "implement", "state": "working", "message": "",
-                 "pane": pane, "window": window_name(ticket), "slot": slot, "repo": repo, **choices, "phase_started_at": self.clock()},
+                 "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "repo": repo, **choices,
+                 "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
@@ -186,19 +188,19 @@ class Afk:
         self.out(f"started {ticket.id} in {worktree} on {branch}")
 
     def claim_worker(self, worker_dir):
-        """Create the worker's dir and claim the lowest slot no active worker holds; removing the dir frees it.
-
-        Refuses once max_workers workers hold slots, so concurrent starts can't overshoot the limit.
-        """
+        """Create the worker's dir and claim the lowest slot no active worker holds; removing the dir frees it."""
         workers = worker_dir.parent
         workers.mkdir(parents=True, exist_ok=True)
         with locked(workers):
-            taken = {int(p.read_text()) for p in workers.glob("*/slot")}
             if worker_dir.exists():
                 raise SystemExit(f"afk: ticket {worker_dir.name} is already started; see `afk status`")
-            if len(taken) >= self.max_workers():
-                raise SystemExit(f"afk: {len(taken)} workers are running, the project's max_workers; see `afk status`")
+            max_workers = self.max_workers()
+            # Workers in review are parked on the human, so they don't count; one still starting has no status yet.
+            active = [d for d in workers.glob("*/slot") if not is_reviewing(d.parent / "status.json")]
+            if len(active) >= max_workers:
+                raise SystemExit(f"afk: {len(active)} workers already active (max_workers = {max_workers}); see `afk status`")
             worker_dir.mkdir()
+            taken = {int(p.read_text()) for p in workers.glob("*/slot")}
             slot = next(n for n in range(1, len(taken) + 2) if n not in taken)
             (worker_dir / "slot").write_text(f"{slot}\n")
         return slot
@@ -250,6 +252,7 @@ class Afk:
 
     def tick_workers(self):
         now = self.clock()
+        limits = self.config().get("limits", {})
         shown, failures = [], []
         paths = sorted(self.workers_dir().glob("*/status.json"))
         # Only ticks change phases and ticks don't overlap, so a snapshot of them stays true for the whole tick.
@@ -259,18 +262,26 @@ class Afk:
         for path in paths:
             with locked(path.parent):
                 before = read_json(path)
-                may_verify = verify.may_start(before)
-                status, effects = tick(path.parent.name, before, now, may_verify=may_verify)
-                if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
-                    # Pasting into a bare shell would run the prompt's markdown as commands.
-                    status, effects = tick(path.parent.name, before, now, agent_running=False, may_verify=may_verify)
+                given = dict(may_verify=verify.may_start(before), limits=limits,
+                             last_activity=last_write(before.get("transcript_path")))
                 try:
+                    pr_state = None
+                    if before["phase"] == "review" and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
+                        pr_state = self.pr_state(before["pr"])
+                    merged = pr_state == "MERGED" or before["state"] == "cleanup-pending"
+                    blocker = self.cleanup_blocker(before) if merged else None
+                    status, effects = tick(path.parent.name, before, now, pr_state=pr_state, cleanup_blocker=blocker, **given)
+                    if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
+                        # Pasting into a bare shell would run the prompt's markdown as commands.
+                        status, effects = tick(path.parent.name, before, now, agent_running=False, pr_state=pr_state, **given)
                     for effect in effects:
                         self.perform(*effect)
                 except subprocess.CalledProcessError as error:
                     failures.append(error)
                     shown.append(before)
                     continue
+                if status is None:
+                    continue  # cleaned up: the worker is gone
                 if status != before:
                     write_json(path, status)
                 verify.update(before, status)
@@ -313,8 +324,40 @@ class Afk:
             pane, name, state = args
             self.best_effort(["tmux", "rename-window", "-t", pane, name + WINDOW_MARKS.get(state, "")])
             self.best_effort(["tmux", "set-option", "-w", "-t", pane, "@afk_state", state])
+        elif kind == "interrupt":
+            # Best-effort: the worker is marked stuck and the human notified even if its pane is gone.
+            self.best_effort(["tmux", "send-keys", "-t", args[0], "Escape"])
         elif kind == "notify":
             self.notify(*args)
+        elif kind == "cleanup":
+            self.clean_up(*args)
+
+    def cleanup_blocker(self, status):
+        """Why cleaning up this worker could lose the human's work, or None if it's safe."""
+        if "shell_pane" not in status:
+            return "its shell pane is unknown (it was started by an older afk)"
+        command = self.pane_command(status["shell_pane"])
+        if command is None:
+            return "its shell pane is gone"
+        if command not in SHELLS:
+            return f"its shell pane is running {command}"
+        if self.run(["git", "-C", str(self.worktree(status["ticket"])), "status", "--porcelain"]).strip():
+            return "its worktree has uncommitted changes"
+        return None
+
+    def clean_up(self, ticket_id, pane):
+        """Remove a merged worker's window, worktree, local branch and state; removing its dir frees its slot."""
+        project = self.current_project()
+        repo = str(self.clone(read_json(self.workers_dir() / ticket_id / "status.json").get("repo")))
+        tracker = self.tracker()
+        tracker.complete(tracker.get(ticket_id))
+        self.run(["tmux", "kill-window", "-t", pane])
+        self.run(["git", "-C", repo, "worktree", "remove", str(self.worktree(ticket_id))])
+        self.run(["git", "-C", repo, "branch", "-D", f"afk/{project}-{ticket_id}"])
+        shutil.rmtree(self.workers_dir() / ticket_id)
+
+    def worktree(self, ticket_id):
+        return self.project_dir(self.current_project()) / "worktrees" / ticket_id
 
     def notify(self, message):
         """The only way afk gets the human's attention. Backends are best-effort: none may stop the watcher."""
@@ -347,11 +390,19 @@ class Afk:
             prompt = f"{task_type['skill']} {prompt}"
         return prompt
 
+    def pr_state(self, pr):
+        """GitHub's state for the PR: OPEN, CLOSED or MERGED. afk only ever reads PRs; merging is the human's call."""
+        return self.run(["gh", "pr", "view", pr, "--json", "state", "-q", ".state"]).strip()
+
     def agent_running(self, pane):
+        return self.pane_command(pane) == "claude"
+
+    def pane_command(self, pane):
+        """The pane's foreground command, or None if the pane is gone."""
         try:
-            return self.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"]).strip() == "claude"
+            return self.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"]).strip()
         except subprocess.CalledProcessError:
-            return False
+            return None
 
     def send_prompt(self, ticket_id, pane, text):
         """Paste as one bracketed paste, so the prompt's newlines don't submit it early, then submit."""
@@ -426,33 +477,59 @@ REPORT_STATES = ("done", "blocked", "question")
 
 AGENTS = ("claude",)
 
-MAX_WORKERS = 3
-
 FRONTIER_POLL = 60  # seconds between the watcher's reads of the tracker
 
 # Corrections the user can make at Gate 1, each a `afk start` option.
 START_OPTIONS = ("--type", "--agent", "--model", "--effort", "--repo")
 
+# Runaway limits; a project's config.toml [limits] table overrides any of them.
+LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
+
 PHASES = ("implement", "verify", "prepr", "pr", "review")
 
+PR_POLL_SECONDS = 60
+
+# A shell pane running one of these at its prompt is idle, so closing it loses nothing.
+SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh"}
+
 # Appended to a worker's window name so its state shows even without afk's tmux status format.
-WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "review": "✓"}
+WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "stuck": "!", "review": "✓"}
 
 
-def tick(ticket, status, now, agent_running=True, may_verify=True):
+def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None,
+         pr_state=None, cleanup_blocker=None):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
+    pr_state is GitHub's state for the worker's PR when this tick polled it, else None.
+    cleanup_blocker, for a merged PR, says why cleaning up now could lose the human's work.
+    A status of None out means the worker is cleaned up and gone.
     """
-    status, effects = advance(ticket, status, now, agent_running, may_verify)
+    merged = pr_state == "MERGED" or status["state"] == "cleanup-pending"
+    if merged and cleanup_blocker is None:
+        return None, [
+            ("cleanup", ticket, status["pane"]),
+            ("notify", f"{ticket} merged and cleaned up; run `/afk next` to propose the next batch"),
+        ]
+    if pr_state is not None:
+        status = {**status, "pr_polled_at": now}
+    if merged:
+        # Checked again every tick, but the human hears about it once.
+        effects = [] if status["state"] == "cleanup-pending" else [("notify", f"{ticket} merged; cleanup pending: {cleanup_blocker}")]
+        status = {**status, "state": "cleanup-pending", "message": cleanup_blocker}
+    else:
+        limits = {**LIMITS, **(limits or {})}
+        status, effects = advance(ticket, status, now, agent_running, may_verify, limits)
+        if not effects:
+            status, effects = enforce(ticket, status, now, limits, last_activity)
     if status["state"] != status.get("shown"):
         status = {**status, "shown": status["state"]}
         effects.append(("window", status["pane"], status["window"], status["state"]))
     return status, effects
 
 
-def advance(ticket, status, now, agent_running, may_verify):
+def advance(ticket, status, now, agent_running, may_verify, limits):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
     if state == "queued" and may_verify:
         state = "done"  # its turn to verify: advance as if it had just finished
@@ -462,7 +539,14 @@ def advance(ticket, status, now, agent_running, may_verify):
     # Only act on done once the worker has also stopped: never type into a busy session.
     if state == "done" and status.get("idle"):
         if phase == "review":
-            return {**status, "state": "review"}, [("notify", f"{ticket} addressed review feedback: {message}")]
+            loops = status.get("fix_loops", 0) + 1
+            if loops > limits["fix_loops"]:
+                # The worker has already stopped, so there is nothing to interrupt. Counting restarts, so the
+                # human, having looked, gets another fix_loops rounds.
+                reason = f"over {limits['fix_loops']} PR fix loops"
+                return {**status, "state": "stuck", "message": reason, "fix_loops": 0}, [("notify", f"{ticket} stuck: {reason}")]
+            status = {**status, "state": "review", "fix_loops": loops}
+            return status, [("notify", f"{ticket} addressed review feedback: {message}")]
         phase = PHASES[PHASES.index(phase) + 1]
         if phase == "verify" and not may_verify:
             # Stays in its finished phase, so if it needs attention while queued, done still leads to verify.
@@ -478,6 +562,28 @@ def advance(ticket, status, now, agent_running, may_verify):
         label = "needs attention" if state == "attention" else state
         return {**status, "notified": status.get("reports")}, [("notify", f"{ticket} {label}: {message}")]
     return status, []
+
+
+def enforce(ticket, status, now, limits, last_activity):
+    """Trip a runaway limit: interrupt the worker, mark it stuck and notify. Never kill it.
+
+    last_activity is when the worker's session last wrote anything; a phase prompt counts as activity.
+    """
+    # A worker that reported done but hasn't stopped is still running. Review has no phase clock: it waits on the human.
+    running = status["state"] == "working" or (status["state"] == "done" and not status.get("idle"))
+    # A limit trips once per phase: after the human has looked, a recovered worker isn't interrupted again.
+    tripped = status.get("tripped") == status["phase_started_at"]
+    if not running or tripped or status["phase"] == "review":
+        return status, []
+    reason = None
+    if now - status["phase_started_at"] > limits["phase_minutes"] * 60:
+        reason = f"over {limits['phase_minutes']}m in {status['phase']}"
+    elif now - max(last_activity or 0, status["phase_started_at"]) > limits["idle_minutes"] * 60:
+        reason = f"idle for over {limits['idle_minutes']}m"
+    if reason is None:
+        return status, []
+    status = {**status, "state": "stuck", "message": reason, "tripped": status["phase_started_at"]}
+    return status, [("interrupt", status["pane"]), ("notify", f"{ticket} stuck: {reason}")]
 
 
 class VerifyQueue:
@@ -547,6 +653,10 @@ class LocalTracker:
 
     def release(self, ticket):
         pass
+
+    def complete(self, ticket):
+        """Merged: mark it done, as GitHub closes an issue, so the frontier doesn't offer it again."""
+        ticket.path.write_text(set_field(ticket.path.read_text(), "Status", "done"))
 
     def split(self, ticket, parts):
         numbers = [int(t.id) for t in self.tickets()]
@@ -618,6 +728,9 @@ class GithubTracker:
 
     def release(self, ticket):
         self.run(["gh", "issue", "edit", ticket.id, "--repo", self.repo, "--remove-assignee", "@me"])
+
+    def complete(self, ticket):
+        """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it."""
 
     def blockers(self, ticket):
         """Native blocked-by dependencies; failing those, the issues the body's "Blocked by" section names."""
@@ -778,6 +891,21 @@ def locked(worker_dir):
     with open(worker_dir / "lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
+
+
+def is_reviewing(status_path):
+    try:
+        return read_json(status_path)["phase"] == "review"
+    except FileNotFoundError:
+        return False
+
+
+def last_write(path):
+    """When a file was last written, or None if there's no such file."""
+    try:
+        return os.path.getmtime(path) if path else None
+    except OSError:
+        return None
 
 
 def read_json(path):
