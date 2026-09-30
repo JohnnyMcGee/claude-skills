@@ -52,6 +52,7 @@ class AfkTestCase(unittest.TestCase):
                 ("tmux", "show-options"): "widgets\n",
                 ("git", "-C"): "",
                 ("tmux", "new-window"): "%5\n",
+                ("tmux", "display-message", "-p", "-t"): "claude\n",  # the pane's foreground command
             }
         )
         self.env = {"XDG_STATE_HOME": str(self.state_home), "HOME": str(self.tmp)}
@@ -663,6 +664,33 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual(self.phase(), "verify")
         self.assertEqual(len(self.prompts_sent()), 1)
+
+    def test_next_phase_is_not_pasted_into_a_pane_where_claude_has_exited(self):
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = "bash\n"
+        self.report("done", "Implemented")
+        self.stop()
+
+        self.afk("tick")
+
+        self.assertEqual(self.prompts_sent(), [])
+        self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
+        [notification] = self.desktop_notifications()
+        self.assertIn("03", notification)
+        self.assertIn("claude", notification)
+
+    def test_a_killed_agent_pane_needs_attention_instead_of_failing_every_tick(self):
+        def pane_gone(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %5")
+
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = pane_gone
+        self.report("done", "Implemented")
+        self.stop()
+
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
+        self.assertEqual(len(self.desktop_notifications()), 1)
 
 
 if __name__ == "__main__":

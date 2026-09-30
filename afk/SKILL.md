@@ -37,6 +37,7 @@ Workers end every phase with `afk report <done|blocked|question> "<message>"`. T
 
 - `question` or `blocked`: the watcher notifies and does not advance. Tell the user which window needs them — do not answer on the worker's behalf.
 - A worker that stops without reporting since its last phase prompt is marked `attention` (window suffix `!`). It has stalled silently and needs the user.
+- A worker due its next phase whose pane no longer runs `claude` (it exited, or the pane was killed) is also marked `attention`; the watcher never pastes a prompt into a bare shell.
 
 ## Setup
 

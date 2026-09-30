@@ -158,6 +158,9 @@ class Afk:
             with locked(path.parent):
                 before = read_json(path)
                 status, effects = tick(path.parent.name, before, now)
+                if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
+                    # Pasting into a bare shell would run the prompt's markdown as commands.
+                    status, effects = tick(path.parent.name, before, now, agent_running=False)
                 try:
                     for effect in effects:
                         self.perform(*effect)
@@ -205,6 +208,12 @@ class Afk:
             ticket_path=ticket.path,
             base=self.config().get("base", "main"),
         )
+
+    def agent_running(self, pane):
+        try:
+            return self.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"]).strip() == "claude"
+        except subprocess.CalledProcessError:
+            return False
 
     def send_prompt(self, ticket_id, pane, text):
         """Paste as one bracketed paste, so the prompt's newlines don't submit it early, then submit."""
@@ -258,17 +267,23 @@ PHASES = ("implement", "verify", "prepr", "pr", "review")
 WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "review": "✓"}
 
 
-def tick(ticket, status, now):
-    """One watcher step for one worker, pure: its status and the time in; its updated status and effects out."""
-    status, effects = advance(ticket, status, now)
+def tick(ticket, status, now, agent_running=True):
+    """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
+
+    agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
+    """
+    status, effects = advance(ticket, status, now, agent_running)
     if status["state"] != status.get("shown"):
         status = {**status, "shown": status["state"]}
         effects.append(("window", status["pane"], status["window"], status["state"]))
     return status, effects
 
 
-def advance(ticket, status, now):
+def advance(ticket, status, now, agent_running):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
+    if state == "done" and status.get("idle") and not agent_running:
+        state, message = "attention", "claude is no longer running in its pane"
+        status = {**status, "state": state, "message": message, "reports": status.get("reports", 0) + 1}
     # Only act on done once the worker has also stopped: never type into a busy session.
     if state == "done" and status.get("idle"):
         if phase == "review":
