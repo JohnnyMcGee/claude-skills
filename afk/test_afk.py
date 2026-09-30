@@ -2391,6 +2391,17 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual((self.phase("04"), self.status("04")["state"]), ("hitl", "yours"))
 
+    def test_a_worker_whose_ticket_is_gone_is_still_cleaned_up_when_its_pr_closes(self):
+        self.start_hitl()
+        (self.scratch / "issues" / "04-spike.md").unlink()
+        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-04")] = pr_view("CLOSED")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%8")] = "bash\n"
+
+        self.afk("tick")
+
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%7"]])
+        self.assertFalse((self.project_dir / "workers" / "04").exists())
+
     def test_a_hitl_worker_whose_ticket_is_closed_without_a_pr_is_cleaned_up_once_safe(self):
         self.start_hitl()
 

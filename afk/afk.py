@@ -401,7 +401,8 @@ class Afk:
                     pr_ready = ticket_closed = False
                     if before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
                         pr_state, pr_url, pr_ready = self.pr_state(before)
-                        ticket_closed = self.ticket_closed(before["ticket"])
+                        ticket = self.find_ticket(before["ticket"])
+                        ticket_closed = bool(ticket and ticket.done)
                     given.update(pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
                     blocker = self.cleanup_blocker(before) if ending(before, pr_state, ticket_closed) else None
                     status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
@@ -485,15 +486,15 @@ class Afk:
         """Remove an ended worker's window, worktree, local branch and state; removing its dir frees its slot.
 
         A merged ticket is completed. One whose PR was closed unmerged is released, back onto the frontier. A closed
-        ticket is left as it is.
+        ticket is left as it is, as is one gone from the tracker.
         """
         project = self.current_project()
         repo = str(self.clone(read_json(self.workers_dir() / ticket_id / "status.json").get("repo")))
-        tracker = self.tracker()
-        if ended == "merged":
-            tracker.complete(tracker.get(ticket_id))
-        elif ended == "closed":
-            tracker.release(tracker.get(ticket_id))
+        tracker, ticket = self.tracker(), self.find_ticket(ticket_id)
+        if ticket and ended == "merged":
+            tracker.complete(ticket)
+        elif ticket and ended == "closed":
+            tracker.release(ticket)
         self.run(["tmux", "kill-window", "-t", pane])
         self.run(["git", "-C", repo, "worktree", "remove", str(self.worktree(ticket_id))])
         self.run(["git", "-C", repo, "branch", "-D", f"afk/{project}-{ticket_id}"])
@@ -552,12 +553,12 @@ class Afk:
             return "NONE", None, False
         return pr["state"], pr["url"], any(label["name"] == READY_LABEL for label in pr.get("labels", []))
 
-    def ticket_closed(self, ticket_id):
-        """Whether the tracker has the ticket closed. One gone from the tracker isn't, so it can't stop the watcher."""
+    def find_ticket(self, ticket_id):
+        """The worker's ticket, or None once it's gone from the tracker, so a missing ticket can't stop the watcher."""
         try:
-            return self.tracker().get(ticket_id).done
+            return self.tracker().get(ticket_id)
         except SystemExit:
-            return False
+            return None
 
     def agent_running(self, pane):
         return self.pane_command(pane) == "claude"
