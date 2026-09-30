@@ -148,10 +148,14 @@ class Afk:
         workers = worker_dir.parent
         workers.mkdir(parents=True, exist_ok=True)
         with locked(workers):
-            try:
-                worker_dir.mkdir()
-            except FileExistsError:
+            if worker_dir.exists():
                 raise SystemExit(f"afk: ticket {worker_dir.name} is already started; see `afk status`")
+            max_workers = {**LIMITS, **self.config().get("limits", {})}["max_workers"]
+            # Workers in review are parked on the human, so they don't count; one still starting has no status yet.
+            active = [d for d in workers.glob("*/slot") if not is_reviewing(d.parent / "status.json")]
+            if len(active) >= max_workers:
+                raise SystemExit(f"afk: {len(active)} workers already active (max_workers = {max_workers}); see `afk status`")
+            worker_dir.mkdir()
             taken = {int(p.read_text()) for p in workers.glob("*/slot")}
             slot = next(n for n in range(1, len(taken) + 2) if n not in taken)
             (worker_dir / "slot").write_text(f"{slot}\n")
@@ -204,6 +208,7 @@ class Afk:
 
     def tick_workers(self):
         now = self.clock()
+        limits = self.config().get("limits", {})
         shown, failures = [], []
         paths = sorted(self.workers_dir().glob("*/status.json"))
         # Only ticks change phases and ticks don't overlap, so a snapshot of them stays true for the whole tick.
@@ -213,11 +218,12 @@ class Afk:
         for path in paths:
             with locked(path.parent):
                 before = read_json(path)
-                may_verify = verify.may_start(before)
-                status, effects = tick(path.parent.name, before, now, may_verify=may_verify)
+                given = dict(may_verify=verify.may_start(before), limits=limits,
+                             last_activity=last_write(before.get("transcript_path")))
+                status, effects = tick(path.parent.name, before, now, **given)
                 if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
                     # Pasting into a bare shell would run the prompt's markdown as commands.
-                    status, effects = tick(path.parent.name, before, now, agent_running=False, may_verify=may_verify)
+                    status, effects = tick(path.parent.name, before, now, agent_running=False, **given)
                 try:
                     for effect in effects:
                         self.perform(*effect)
@@ -243,6 +249,9 @@ class Afk:
             pane, name, state = args
             self.best_effort(["tmux", "rename-window", "-t", pane, name + WINDOW_MARKS.get(state, "")])
             self.best_effort(["tmux", "set-option", "-w", "-t", pane, "@afk_state", state])
+        elif kind == "interrupt":
+            # Best-effort: the worker is marked stuck and the human notified even if its pane is gone.
+            self.best_effort(["tmux", "send-keys", "-t", args[0], "Escape"])
         elif kind == "notify":
             self.notify(*args)
 
@@ -341,26 +350,32 @@ REPORT_STATES = ("done", "blocked", "question")
 
 AGENTS = ("claude",)
 
+# Runaway limits; a project's config.toml [limits] table overrides any of them.
+LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
+
 PHASES = ("implement", "verify", "prepr", "pr", "review")
 
 # Appended to a worker's window name so its state shows even without afk's tmux status format.
-WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "review": "✓"}
+WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "stuck": "!", "review": "✓"}
 
 
-def tick(ticket, status, now, agent_running=True, may_verify=True):
+def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
     """
-    status, effects = advance(ticket, status, now, agent_running, may_verify)
+    limits = {**LIMITS, **(limits or {})}
+    status, effects = advance(ticket, status, now, agent_running, may_verify, limits)
+    if not effects:
+        status, effects = enforce(ticket, status, now, limits, last_activity)
     if status["state"] != status.get("shown"):
         status = {**status, "shown": status["state"]}
         effects.append(("window", status["pane"], status["window"], status["state"]))
     return status, effects
 
 
-def advance(ticket, status, now, agent_running, may_verify):
+def advance(ticket, status, now, agent_running, may_verify, limits):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
     if state == "queued" and may_verify:
         state = "done"  # its turn to verify: advance as if it had just finished
@@ -370,7 +385,14 @@ def advance(ticket, status, now, agent_running, may_verify):
     # Only act on done once the worker has also stopped: never type into a busy session.
     if state == "done" and status.get("idle"):
         if phase == "review":
-            return {**status, "state": "review"}, [("notify", f"{ticket} addressed review feedback: {message}")]
+            loops = status.get("fix_loops", 0) + 1
+            if loops > limits["fix_loops"]:
+                # The worker has already stopped, so there is nothing to interrupt. Counting restarts, so the
+                # human, having looked, gets another fix_loops rounds.
+                reason = f"over {limits['fix_loops']} PR fix loops"
+                return {**status, "state": "stuck", "message": reason, "fix_loops": 0}, [("notify", f"{ticket} stuck: {reason}")]
+            status = {**status, "state": "review", "fix_loops": loops}
+            return status, [("notify", f"{ticket} addressed review feedback: {message}")]
         phase = PHASES[PHASES.index(phase) + 1]
         if phase == "verify" and not may_verify:
             # Stays in its finished phase, so if it needs attention while queued, done still leads to verify.
@@ -386,6 +408,28 @@ def advance(ticket, status, now, agent_running, may_verify):
         label = "needs attention" if state == "attention" else state
         return {**status, "notified": status.get("reports")}, [("notify", f"{ticket} {label}: {message}")]
     return status, []
+
+
+def enforce(ticket, status, now, limits, last_activity):
+    """Trip a runaway limit: interrupt the worker, mark it stuck and notify. Never kill it.
+
+    last_activity is when the worker's session last wrote anything; a phase prompt counts as activity.
+    """
+    # A worker that reported done but hasn't stopped is still running. Review has no phase clock: it waits on the human.
+    running = status["state"] == "working" or (status["state"] == "done" and not status.get("idle"))
+    # A limit trips once per phase: after the human has looked, a recovered worker isn't interrupted again.
+    tripped = status.get("tripped") == status["phase_started_at"]
+    if not running or tripped or status["phase"] == "review":
+        return status, []
+    reason = None
+    if now - status["phase_started_at"] > limits["phase_minutes"] * 60:
+        reason = f"over {limits['phase_minutes']}m in {status['phase']}"
+    elif now - max(last_activity or 0, status["phase_started_at"]) > limits["idle_minutes"] * 60:
+        reason = f"idle for over {limits['idle_minutes']}m"
+    if reason is None:
+        return status, []
+    status = {**status, "state": "stuck", "message": reason, "tripped": status["phase_started_at"]}
+    return status, [("interrupt", status["pane"]), ("notify", f"{ticket} stuck: {reason}")]
 
 
 class VerifyQueue:
@@ -620,6 +664,21 @@ def locked(worker_dir):
     with open(worker_dir / "lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
+
+
+def is_reviewing(status_path):
+    try:
+        return read_json(status_path)["phase"] == "review"
+    except FileNotFoundError:
+        return False
+
+
+def last_write(path):
+    """When a file was last written, or None if there's no such file."""
+    try:
+        return os.path.getmtime(path) if path else None
+    except OSError:
+        return None
 
 
 def read_json(path):

@@ -2,7 +2,7 @@
 name: afk
 description: Orchestrate AFK agent workers for one project in this tmux session — find unblocked tickets, start workers in their own worktree and tmux window, and track their status.
 disable-model-invocation: true
-argument-hint: <init <spec> | frontier | start <ticket> [--type <type>] | watch | status>
+argument-hint: <init <spec> | frontier | start <ticket> [--type <type>] | watch | status | next>
 ---
 
 # AFK
@@ -23,6 +23,7 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 
 - `init <spec>`, `frontier`, `start <ticket> [--type <type>]`, `status`: run `afk $ARGUMENTS` and show the output.
 - `watch`: it runs forever, so don't run it yourself. Tell the user to run `afk watch` in the orchestrator window's right pane.
+- `next`: run `afk status` and triage every `stuck` worker: name its window, say which limit tripped (its message), and read the tail of its agent pane (`tmux capture-pane -p -t <pane>`, with `pane` from `${XDG_STATE_HOME:-~/.local/state}/afk/<project>/workers/<ticket>/status.json`; `-t <window>` would capture whichever pane is active) to judge why. Propose one of: nudge it in its pane, raise the limit in the project config, or leave it for the user to take over. Act only on what the user approves.
 - No argument: run `afk status`, then `afk frontier`, and ask which ticket to start.
 
 Never start a ticket the user has not named or approved.
@@ -38,6 +39,20 @@ Workers end every phase with `afk report <done|blocked|question> "<message>"`. T
 - `question` or `blocked`: the watcher notifies and does not advance. Tell the user which window needs them — do not answer on the worker's behalf.
 - A worker that stops without reporting since its last phase prompt is marked `attention` (window suffix `!`). It has stalled silently and needs the user.
 - A worker due its next phase whose pane no longer runs `claude` (it exited, or the pane was killed) is also marked `attention`; the watcher never pastes a prompt into a bare shell.
+
+## Limits
+
+The watcher contains runaway workers. Defaults, overridable in the project's `config.toml` under `[limits]`:
+
+```toml
+[limits]
+max_workers = 3     # `afk start` refuses beyond this; workers in review don't count
+phase_minutes = 90  # wall-clock in one phase while working
+idle_minutes = 20   # working, but its transcript hasn't changed
+fix_loops = 3       # review rounds (feedback → fix → done) before stopping to look
+```
+
+A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, where it has already stopped), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A limit trips at most once per phase, so a stuck worker that is nudged and later reports `done` moves on as usual.
 
 ## Setup
 
