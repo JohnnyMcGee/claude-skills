@@ -222,7 +222,7 @@ Restore the limit after.
 Re-open 02's ticket as `Status: ready-for-agent` again and start it.
 
 - [ ] Once it has a PR, close the PR on GitHub without merging. Within about a minute 02 is cleaned up, you're notified "02 closed and cleaned up", its ticket still reads `Status: ready-for-agent`, and `afk frontier` lists it.
-- [ ] Start 02 once more. With no PR, set its ticket to `Status: closed`. Within about a minute it's cleaned up, you're notified "02 ticket closed and cleaned up", and its ticket still reads `Status: closed`.
+- [ ] Start 02 once more as a guide-mode worker (`afk start 02 --type hitl`), since only a worker in `pr`, `review` or `hitl` is polled. It isn't cleaned up for the PR the last attempt closed. With no PR, set its ticket to `Status: closed`. Within about a minute it's cleaned up, you're notified "02 ticket closed and cleaned up", and its ticket still reads `Status: closed`.
 
 ## 11. Tear down
 
