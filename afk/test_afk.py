@@ -429,6 +429,11 @@ class TaskTypeTest(AfkTestCase):
         self.assertIn("infra", out)
         self.assertIn("backend, frontend", out)
 
+    def test_malformed_options_fail_with_usage_before_creating_anything(self):
+        for options in (["--type"], ["--typ", "backend"], ["--type", "backend", "extra"]):
+            with self.subTest(options=options):
+                self.assertIn("usage: afk start <ticket> [--type <type>]", self.start_fails("03", *options))
+
     def test_unsupported_agent_fails_before_creating_anything(self):
         self.repo_config('[task_types.frontend]\nagent = "grok"', name="afk.local.md")
 

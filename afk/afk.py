@@ -68,8 +68,10 @@ class Afk:
     def cmd_start(self, ticket_id, *options):
         project = self.current_project()
         config = self.config()
+        if options and (len(options) != 2 or options[0] != "--type"):
+            raise SystemExit("afk: usage: afk start <ticket> [--type <type>]")
         ticket = self.tracker().get(ticket_id)
-        type_name = options[1] if options[:1] == ("--type",) else ticket.type
+        type_name = options[1] if options else ticket.type
         pdir = self.project_dir(project)
         worktree = pdir / "worktrees" / ticket.id
         worker_dir = pdir / "workers" / ticket.id
