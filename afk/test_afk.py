@@ -180,6 +180,63 @@ class GithubInitTest(GithubTestCase):
         )
 
 
+class InitReposTest(GithubTestCase):
+    """init finds the clones of the repos the sub-issues live in, and re-running it refreshes the project."""
+
+    def clone(self, path, remote):
+        (path / ".git").mkdir(parents=True)
+        self.run_fake.responses[("git", "-C", str(path), "remote", "-v")] = f"origin\t{remote} (fetch)\norigin\t{remote} (push)\n"
+        return path
+
+    def config(self):
+        return tomllib.loads((self.project_dir / "config.toml").read_text())
+
+    def test_clones_are_found_among_submodules_subdirectories_and_siblings_by_remote(self):
+        self.repo.mkdir(exist_ok=True)
+        (self.repo / ".gitmodules").write_text('[submodule "web"]\n\tpath = apps/web\n\turl = git@github.com:acme/web.git\n')
+        web = self.clone(self.repo / "apps" / "web", "git@github.com:ACME/web.git")
+        api = self.clone(self.repo / "api", "https://github.com/acme/api")
+        docs = self.clone(self.tmp / "docs-checkout", "git@github.com:acme/docs.git")
+        self.clone(self.tmp / "unrelated", "git@github.com:acme/unrelated.git")
+        self.issue(4, "Widget page", repo="acme/web")
+        self.issue(5, "Widget endpoints", repo="acme/api")
+        self.issue(6, "Widget docs", body="Repo: acme/docs\n")
+
+        output = self.afk("init", self.SPEC)
+
+        self.assertEqual(self.config()["repos"], {"acme/web": str(web), "acme/api": str(api), "acme/docs": str(docs)})
+        self.assertNotIn("no local clone", output)
+        self.afk("start", "web#4")
+        [add] = [c for c in self.run_fake.find("git", "-C") if c[3:5] == ["worktree", "add"]]
+        self.assertEqual(add[2], str(web))
+
+    def test_a_repo_without_a_clone_is_named_so_the_user_can_add_it(self):
+        self.issue(4, "Widget page", repo="acme/web")
+
+        output = self.afk("init", self.SPEC)
+
+        self.assertNotIn("repos", self.config())
+        self.assertIn("no local clone of acme/web", output)
+
+    def test_reinit_without_a_spec_refreshes_repos_and_keeps_limits_overrides_and_hand_added_repos(self):
+        self.afk("init", self.SPEC)
+        mine = self.tmp / "mine"
+        mine.mkdir()
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write(f'\n[limits]\nmax_workers = 5\n\n[overrides.task_types.frontend]\nmodel = "haiku"\n'
+                         f'\n[repos]\n"acme/mine" = "{mine}"\n"acme/gone" = "{self.tmp / 'gone'}"\n')
+        web = self.clone(self.tmp / "web", "git@github.com:acme/web.git")
+        self.issue(4, "Widget page", repo="acme/web")
+
+        self.afk("init")
+
+        config = self.config()
+        self.assertEqual(config["spec"], self.SPEC)
+        self.assertEqual(config["limits"], {"max_workers": 5})
+        self.assertEqual(config["overrides"], {"task_types": {"frontend": {"model": "haiku"}}})
+        self.assertEqual(config["repos"], {"acme/mine": str(mine), "acme/web": str(web)})
+
+
 class GithubFrontierTest(GithubTestCase):
     def test_frontier_lists_open_sub_issues_nobody_has_claimed(self):
         self.issue(3, "Widget schema", state="closed")

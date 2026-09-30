@@ -92,11 +92,11 @@ Later layers win, key by key, so an override only needs the fields it changes:
 
 ## Repos
 
-A project can span repos. The `[repos]` table in the project's `config.toml` lists their clones:
+A project can span repos. The `[repos]` table in the project's `config.toml` lists their clones. `afk init` fills it in, finding each repo the tickets need by its git remotes among the spec clone's submodules, subdirectories and siblings; re-running `afk init` refreshes it. Add a clone it can't find by hand:
 
 ```toml
 [repos]
 "acme/widgets-api" = "/home/me/code/widgets-api"
 ```
 
-`[repos]` maps a ticket's `Repo: owner/name` to its local clone; each clone brings its own `docs/agents/afk.md`. A ticket without a `Repo:` line, or naming the spec's own repo, uses the clone the project was created from.
+`[repos]` maps a ticket's `Repo: owner/name` (in any case) to its local clone; each clone brings its own `docs/agents/afk.md`. A ticket without a `Repo:` line, or naming the spec's own repo, uses the clone the project was created from.
