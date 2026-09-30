@@ -165,7 +165,7 @@ class StartTest(AfkTestCase):
         self.assertEqual(window[window.index("-c") + 1], worktree)
         self.assertEqual(
             self.run_fake.find("tmux", "split-window"),
-            [["tmux", "split-window", "-h", "-d", "-t", "%5", "-c", worktree]],
+            [["tmux", "split-window", "-h", "-d", "-t", "%5", "-c", worktree, "-P", "-F", "#{pane_id}"]],
         )
 
     def test_start_launches_interactive_claude_in_auto_mode_with_generated_settings(self):
@@ -704,6 +704,7 @@ class WatchTest(AfkTestCase):
         super().setUp()
         self.ticket("03-ui", "Widget UI")
         self.afk("init", str(self.scratch))
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"  # the worker's shell pane
         self.afk("start", "03")
         self.calls_before = len(self.run_fake.calls)
 
@@ -1060,6 +1061,159 @@ class WatchTest(AfkTestCase):
         self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
         self.assertEqual(len(self.desktop_notifications()), 1)
 
+
+    # Merge detection and cleanup
+
+    def pr_polls(self):
+        return self.run_fake.find("gh", "pr", "view")
+
+    def test_an_open_pr_in_review_is_polled_with_gh_and_stays_in_review(self):
+        self.reach_review()
+        self.run_fake.responses[("gh", "pr", "view")] = "OPEN\n"
+
+        self.afk("tick")
+
+        self.assertEqual(self.pr_polls(), [["gh", "pr", "view", "https://github.com/acme/widgets/pull/42", "--json", "state", "-q", ".state"]])
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+
+    def test_a_pr_is_polled_at_most_once_a_minute(self):
+        self.reach_review()
+
+        self.afk("tick")
+        self.now += 30
+        self.afk("tick")
+        self.assertEqual(len(self.pr_polls()), 1)
+
+        self.now += 30
+        self.afk("tick")
+        self.assertEqual(len(self.pr_polls()), 2)
+
+    def merge(self, shell="bash", worktree_status=""):
+        """GitHub reports the PR merged; the shell pane runs `shell` and the worktree has `worktree_status` changes."""
+        worktree = str(self.project_dir / "worktrees" / "03")
+        self.run_fake.responses[("gh", "pr", "view")] = "MERGED\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = shell + "\n"
+        self.run_fake.responses[("git", "-C", worktree, "status")] = worktree_status
+        self.now += 60
+
+    def cleanup_commands(self):
+        worktree = str(self.project_dir / "worktrees" / "03")
+        return (
+            self.run_fake.find("tmux", "kill-window"),
+            self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"),
+            self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
+        )
+
+    def test_merged_pr_with_idle_shell_and_clean_worktree_removes_window_worktree_and_branch(self):
+        self.reach_review()
+        self.merge()
+
+        dashboard = self.afk("tick").splitlines()
+
+        worktree = str(self.project_dir / "worktrees" / "03")
+        self.assertEqual(
+            self.cleanup_commands(),
+            (
+                [["tmux", "kill-window", "-t", "%5"]],
+                [["git", "-C", str(self.repo), "worktree", "remove", worktree]],
+                [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-03"]],
+            ),
+        )
+        self.assertEqual(dashboard[1:], [])
+        self.assertEqual(self.afk("status").splitlines()[1:], [])
+        # afk only reads PRs: it never merges, requests reviewers or otherwise acts on GitHub.
+        self.assertEqual({tuple(c[:3]) for c in self.run_fake.find("gh")}, {("gh", "pr", "view")})
+
+    def test_cleaning_up_frees_the_workers_slot_for_the_next_ticket(self):
+        self.reach_review()
+        self.merge()
+        self.afk("tick")
+        self.ticket("05-export", "Widget export")
+
+        self.afk("start", "05")
+
+        launch = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])
+        self.assertIn("AFK_SLOT=1", launch)
+
+    def test_merged_pr_with_a_busy_shell_pane_is_left_cleanup_pending_and_notifies_once(self):
+        self.reach_review()
+        self.merge(shell="vim")
+
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual(self.cleanup_commands(), ([], [], []))
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        notification = self.desktop_notifications()[-1]
+        self.assertIn("03", notification)
+        self.assertIn("vim", notification)
+        self.assertEqual(len(self.desktop_notifications()), 2)  # PR ready, then cleanup pending
+
+    def test_merged_pr_with_uncommitted_changes_is_left_cleanup_pending_and_notifies(self):
+        self.reach_review()
+        self.merge(worktree_status=" M src/widget.py\n")
+
+        self.afk("tick")
+
+        self.assertEqual(self.cleanup_commands(), ([], [], []))
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertIn("uncommitted", self.desktop_notifications()[-1])
+
+    def test_merged_pr_whose_shell_pane_is_gone_is_left_cleanup_pending(self):
+        self.reach_review()
+        self.merge()
+
+        def pane_gone(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %6")
+
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = pane_gone
+
+        self.afk("tick")
+
+        self.assertEqual(self.cleanup_commands(), ([], [], []))
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertIn("shell pane is gone", self.desktop_notifications()[-1])
+
+    def test_cleanup_pending_worker_is_cleaned_up_once_the_shell_is_idle_again(self):
+        self.reach_review()
+        self.merge(shell="vim")
+        self.afk("tick")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+
+        self.afk("tick")
+
+        self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
+        self.assertEqual(self.afk("status").splitlines()[1:], [])
+
+    def test_cleaning_up_a_merged_worker_prompts_for_the_next_batch(self):
+        self.reach_review()
+        self.merge()
+
+        self.afk("tick")
+
+        notification = self.desktop_notifications()[-1]
+        self.assertIn("03 merged", notification)
+        self.assertIn("/afk next", notification)
+
+    def test_a_failing_pr_poll_does_not_hold_up_the_other_workers(self):
+        self.reach_review()
+        self.ticket("05-export", "Widget export")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.afk("start", "05")
+        self.report("done", "Implemented", ticket="05")
+        self.stop(ticket="05")
+
+        def offline(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="error connecting to api.github.com")
+
+        self.run_fake.responses[("gh", "pr", "view")] = offline
+        self.now += 60
+        out = io.StringIO()
+        code = afk.main(["tick"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("api.github.com", out.getvalue())
+        self.assertEqual((self.phase("03"), self.phase("05")), ("review", "verify"))
 
 if __name__ == "__main__":
     unittest.main()
