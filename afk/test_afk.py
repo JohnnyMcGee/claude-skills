@@ -106,5 +106,54 @@ class FrontierTest(AfkTestCase):
         self.assertEqual(output.splitlines(), ["03  Widget UI", "05  Widget export"])
 
 
+class StartTest(AfkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI")
+        self.afk("init", str(self.scratch))
+
+    def launch_command(self):
+        [send] = self.run_fake.find("tmux", "send-keys")
+        self.assertEqual(send[:4], ["tmux", "send-keys", "-t", "%5"])
+        self.assertEqual(send[-1], "Enter")
+        return shlex.split(send[4])
+
+    def test_start_creates_worktree_and_branch_named_from_ticket(self):
+        self.afk("start", "03")
+
+        [add] = self.run_fake.find("git", "-C", str(self.repo), "worktree", "add")
+        self.assertEqual(add[5:7], ["-b", "afk/widgets-03"])
+        self.assertEqual(add[7], str(self.project_dir / "worktrees" / "03"))
+
+    def test_start_opens_named_window_split_agent_left_shell_right(self):
+        self.afk("start", "03")
+
+        worktree = str(self.project_dir / "worktrees" / "03")
+        [window] = self.run_fake.find("tmux", "new-window")
+        self.assertIn("-d", window)
+        self.assertEqual(window[window.index("-t") + 1], "work:")
+        self.assertEqual(window[window.index("-n") + 1], "03-widget-ui")
+        self.assertEqual(window[window.index("-c") + 1], worktree)
+        self.assertEqual(
+            self.run_fake.find("tmux", "split-window"),
+            [["tmux", "split-window", "-h", "-d", "-t", "%5", "-c", worktree]],
+        )
+
+    def test_start_launches_interactive_claude_in_auto_mode_with_generated_settings(self):
+        self.afk("start", "03")
+
+        launch = self.launch_command()
+        self.assertIn("AFK_PROJECT=widgets", launch)
+        self.assertIn("AFK_TICKET=03", launch)
+        claude = launch[launch.index("claude") :]
+        self.assertEqual(claude[1:3], ["--permission-mode", "auto"])
+        self.assertEqual(claude[3], "--settings")
+        self.assertTrue(Path(claude[4]).is_file())
+        self.assertNotIn("--dangerously-skip-permissions", claude)
+        self.assertNotIn("-p", claude)
+        self.assertIn(str(self.scratch / "issues" / "03-ui.md"), claude[-1])
+        self.assertIn('afk report', claude[-1])
+
+
 if __name__ == "__main__":
     unittest.main()

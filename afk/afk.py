@@ -6,6 +6,7 @@ stdlib only. Every external command (tmux, git, gh, claude) goes through run().
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -51,6 +52,34 @@ class Afk:
     def cmd_frontier(self):
         for ticket in self.tracker().frontier():
             self.out(f"{ticket.id}  {ticket.title}")
+
+    def cmd_start(self, ticket_id):
+        project = self.current_project()
+        config = self.config()
+        ticket = self.tracker().get(ticket_id)
+        pdir = self.project_dir(project)
+        worktree = pdir / "worktrees" / ticket.id
+        worker_dir = pdir / "workers" / ticket.id
+        worker_dir.mkdir(parents=True, exist_ok=True)
+
+        branch = f"afk/{project}-{ticket.id}"
+        self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree)])
+
+        pane = self.run(
+            ["tmux", "new-window", "-d", "-t", config["session"] + ":", "-n", window_name(ticket),
+             "-c", str(worktree), "-P", "-F", "#{pane_id}"]
+        ).strip()
+        self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree)])
+
+        settings = worker_dir / "settings.json"
+        settings.write_text("{}\n")
+        launch = [
+            "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}",
+            "claude", "--permission-mode", "auto", "--settings", str(settings),
+            worker_prompt(ticket),
+        ]
+        self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
+        self.out(f"started {ticket.id} in {worktree} on {branch}")
 
     def current_project(self):
         project = self.env.get("AFK_PROJECT") or self.run(
@@ -121,6 +150,18 @@ def parse_ticket(path):
         status=field(text, "Status").lower(),
         blocked_by=[n.zfill(len(number)) for n in re.findall(r"\b(\d+)\b", field(text, "Blocked by"))],
         path=path,
+    )
+
+
+def window_name(ticket):
+    abbrev = re.sub(r"[^a-z0-9]+", "-", ticket.title.lower()).strip("-")[:10].rstrip("-")
+    return f"{ticket.id}-{abbrev}"
+
+
+def worker_prompt(ticket):
+    return (
+        f"You are an AFK worker. Implement the ticket at {ticket.path}. "
+        'When you finish, or need the human, end by running `afk report <done|blocked|question> "<message>"`.'
     )
 
 
