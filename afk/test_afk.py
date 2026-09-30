@@ -216,6 +216,19 @@ class GithubStartTest(GithubTestCase):
         [add] = self.run_fake.find("git", "-C", str(self.repo), "worktree", "add")
         self.assertLess(self.run_fake.calls.index(claim), self.run_fake.calls.index(add))
 
+    def test_a_claimed_or_closed_ticket_cannot_be_started(self):
+        self.issue(5, "Widget UI", assignees=["someone-else"])
+        self.issue(6, "Widget export", state="closed")
+
+        for number in ("5", "6"):
+            out = io.StringIO()
+            code = afk.main(["start", number], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+            self.assertNotEqual(code, 0)
+            self.assertIn("not open", out.getvalue())
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "add"), [])
+
     def test_failed_start_releases_the_claim(self):
         def split_fails(cmd):
             raise subprocess.CalledProcessError(1, cmd, stderr="no space for new pane")

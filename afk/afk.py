@@ -78,6 +78,8 @@ class Afk:
         worker_dir = pdir / "workers" / ticket.id
         if worker_dir.exists():
             raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
+        if not ticket.open:
+            raise SystemExit(f"afk: ticket {ticket.id} is not open (it is {ticket.status})")
         branch = f"afk/{project}-{ticket.id}"
         undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
         try:
