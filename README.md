@@ -6,9 +6,9 @@ A small collection of [Claude Code skills](https://code.claude.com/docs/en/skill
 
 ### afk
 
-An orchestrator for AFK agent workers, one project per tmux session. A stdlib-only Python CLI (`afk`) finds the ticket frontier in a local `.scratch` spec, starts each ticket in its own worktree, branch and split tmux window with an interactive `claude` worker (auto permission mode, per-session status hooks, and a deny list against force-push, pushing to base, `gh pr merge` and worktree removal), and tracks every worker's reported status.
+An orchestrator for AFK agent workers, one project per tmux session. A stdlib-only Python CLI (`afk`) finds the ticket frontier in a local `.scratch` spec, starts each ticket in its own worktree, branch and split tmux window with an interactive `claude` worker (auto permission mode, per-session status hooks, and a deny list against force-push, pushing to base, `gh pr merge` and worktree removal), and tracks every worker's reported status. `afk watch` then drives each worker through implement → verify → prepr → pr → review by pasting phase prompts into its pane, shows a dashboard, marks tmux windows with each worker's state, and notifies you when a worker has a question, is blocked, stalls, or has a PR Ready.
 
-Invoke with `/afk <init <spec> | frontier | start <ticket> | status>`. The `afk` CLI must be on your PATH (see below).
+Invoke with `/afk <init <spec> | frontier | start <ticket> | watch | status>`. The `afk` CLI must be on your PATH (see below).
 
 ### atomic-commits
 
