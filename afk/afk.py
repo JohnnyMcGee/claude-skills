@@ -72,6 +72,11 @@ class Afk:
         worker_dir = pdir / "workers" / ticket.id
         if worker_dir.exists():
             raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
+        max_workers = {**LIMITS, **config.get("limits", {})}["max_workers"]
+        # Workers in review are parked on the human, so they don't count.
+        active = [s for s in map(read_json, (pdir / "workers").glob("*/status.json")) if s["phase"] != "review"]
+        if len(active) >= max_workers:
+            raise SystemExit(f"afk: {len(active)} workers already active (max_workers = {max_workers}); see `afk status`")
         branch = f"afk/{project}-{ticket.id}"
         undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
         try:
@@ -151,16 +156,20 @@ class Afk:
 
     def cmd_tick(self):
         now = self.clock()
+        limits = self.config().get("limits", {})
         shown, failures = [], []
         # Each worker is read, acted on and persisted under its lock, so a report or hook can't land in between,
         # a failure can't make a later tick repeat another worker's effects, and one failing worker fails alone.
         for path in sorted(self.workers_dir().glob("*/status.json")):
             with locked(path.parent):
                 before = read_json(path)
-                status, effects = tick(path.parent.name, before, now)
+                activity = last_write(before.get("transcript_path"))
+                status, effects = tick(path.parent.name, before, now, limits=limits, last_activity=activity)
                 if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
                     # Pasting into a bare shell would run the prompt's markdown as commands.
-                    status, effects = tick(path.parent.name, before, now, agent_running=False)
+                    status, effects = tick(
+                        path.parent.name, before, now, agent_running=False, limits=limits, last_activity=activity
+                    )
                 try:
                     for effect in effects:
                         self.perform(*effect)
@@ -185,6 +194,9 @@ class Afk:
             pane, name, state = args
             self.best_effort(["tmux", "rename-window", "-t", pane, name + WINDOW_MARKS.get(state, "")])
             self.best_effort(["tmux", "set-option", "-w", "-t", pane, "@afk_state", state])
+        elif kind == "interrupt":
+            # Best-effort: the worker is marked stuck and the human notified even if its pane is gone.
+            self.best_effort(["tmux", "send-keys", "-t", args[0], "Escape"])
         elif kind == "notify":
             self.notify(*args)
 
@@ -261,25 +273,31 @@ class Afk:
 
 REPORT_STATES = ("done", "blocked", "question")
 
+# Runaway limits; a project's config.toml [limits] table overrides any of them.
+LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
+
 PHASES = ("implement", "verify", "prepr", "pr", "review")
 
 # Appended to a worker's window name so its state shows even without afk's tmux status format.
-WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "review": "✓"}
+WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "stuck": "!", "review": "✓"}
 
 
-def tick(ticket, status, now, agent_running=True):
+def tick(ticket, status, now, agent_running=True, limits=None, last_activity=None):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     """
-    status, effects = advance(ticket, status, now, agent_running)
+    limits = {**LIMITS, **(limits or {})}
+    status, effects = advance(ticket, status, now, agent_running, limits)
+    if not effects:
+        status, effects = enforce(ticket, status, now, limits, last_activity)
     if status["state"] != status.get("shown"):
         status = {**status, "shown": status["state"]}
         effects.append(("window", status["pane"], status["window"], status["state"]))
     return status, effects
 
 
-def advance(ticket, status, now, agent_running):
+def advance(ticket, status, now, agent_running, limits):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
     if state == "done" and status.get("idle") and not agent_running:
         state, message = "attention", "claude is no longer running in its pane"
@@ -287,7 +305,14 @@ def advance(ticket, status, now, agent_running):
     # Only act on done once the worker has also stopped: never type into a busy session.
     if state == "done" and status.get("idle"):
         if phase == "review":
-            return {**status, "state": "review"}, [("notify", f"{ticket} addressed review feedback: {message}")]
+            loops = status.get("fix_loops", 0) + 1
+            if loops > limits["fix_loops"]:
+                # The worker has already stopped, so there is nothing to interrupt. Counting restarts, so the
+                # human, having looked, gets another fix_loops rounds.
+                reason = f"over {limits['fix_loops']} PR fix loops"
+                return {**status, "state": "stuck", "message": reason, "fix_loops": 0}, [("notify", f"{ticket} stuck: {reason}")]
+            status = {**status, "state": "review", "fix_loops": loops}
+            return status, [("notify", f"{ticket} addressed review feedback: {message}")]
         phase = PHASES[PHASES.index(phase) + 1]
         status = {**status, "phase": phase, "state": "working", "message": "", "idle": False, "phase_started_at": now}
         effects = [("prompt", ticket, status["pane"], phase)]
@@ -300,6 +325,24 @@ def advance(ticket, status, now, agent_running):
         label = "needs attention" if state == "attention" else state
         return {**status, "notified": status.get("reports")}, [("notify", f"{ticket} {label}: {message}")]
     return status, []
+
+
+def enforce(ticket, status, now, limits, last_activity):
+    """Trip a runaway limit: interrupt the worker, mark it stuck and notify. Never kill it.
+
+    last_activity is when the worker's session last wrote anything; a phase prompt counts as activity.
+    """
+    if status["state"] != "working":
+        return status, []
+    reason = None
+    if now - status["phase_started_at"] > limits["phase_minutes"] * 60:
+        reason = f"over {limits['phase_minutes']}m in {status['phase']}"
+    elif now - max(last_activity or 0, status["phase_started_at"]) > limits["idle_minutes"] * 60:
+        reason = f"idle for over {limits['idle_minutes']}m"
+    if reason is None:
+        return status, []
+    status = {**status, "state": "stuck", "message": reason}
+    return status, [("interrupt", status["pane"]), ("notify", f"{ticket} stuck: {reason}")]
 
 
 DONE_STATUSES = {"resolved", "done", "closed"}
@@ -423,6 +466,14 @@ def locked(worker_dir):
     with open(worker_dir / "lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
+
+
+def last_write(path):
+    """When a file was last written, or None if there's no such file."""
+    try:
+        return os.path.getmtime(path) if path else None
+    except OSError:
+        return None
 
 
 def read_json(path):

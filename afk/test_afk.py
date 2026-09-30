@@ -238,6 +238,28 @@ class StartTest(AfkTestCase):
         self.assertFalse([c for c in later if c[0] == "git" or c[:2] in (["tmux", "new-window"], ["tmux", "kill-window"])])
         self.assertTrue((self.project_dir / "workers" / "03" / "status.json").is_file())
 
+    def test_start_refuses_a_worker_beyond_the_configured_max_until_one_reaches_review(self):
+        for number, title in [("05-export", "Widget export"), ("07-import", "Widget import")]:
+            self.ticket(number, title)
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write("\n[limits]\nmax_workers = 2\n")
+        self.afk("start", "03")
+        self.afk("start", "05")
+
+        out = io.StringIO()
+        code = afk.main(["start", "07"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("max_workers", out.getvalue())
+        self.assertFalse((self.project_dir / "workers" / "07").exists())
+        self.assertEqual(len(self.run_fake.find("tmux", "new-window")), 2)
+
+        status_path = self.project_dir / "workers" / "03" / "status.json"
+        status = json.loads(status_path.read_text())
+        status_path.write_text(json.dumps({**status, "phase": "review", "state": "review"}))
+        self.afk("start", "07")
+        self.assertEqual(self.worker_state("07"), "working")
+
     def settings(self):
         self.afk("start", "03")
         launch = self.launch_command()
@@ -346,8 +368,19 @@ class WatchTest(AfkTestCase):
         self.afk("report", state, message, env=self.worker_env(ticket))
 
     def stop(self, ticket="03"):
-        payload = {"session_id": "s", "transcript_path": "/t", "hook_event_name": "Stop"}
+        payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "Stop"}
         self.afk("hook", "stop", stdin=json.dumps(payload), env=self.worker_env(ticket))
+
+    def transcript(self, ticket="03"):
+        return self.tmp / f"{ticket}.jsonl"
+
+    def active(self, ticket="03"):
+        """The worker's session writes to its transcript now, as a busy agent does."""
+        path = self.transcript(ticket)
+        path.touch()
+        os.utime(path, (self.now, self.now))
+        payload = {"session_id": "s", "transcript_path": str(path), "hook_event_name": "SessionStart"}
+        self.afk("hook", "session-start", stdin=json.dumps(payload), env=self.worker_env(ticket))
 
     def prompts_sent(self, pane="%5"):
         """Prompts pasted into a pane and submitted since setUp, in order."""
@@ -505,6 +538,7 @@ class WatchTest(AfkTestCase):
         self.now += 60
         self.reach_review()
         self.now += 3600 + 300
+        self.active("05")
 
         dashboard = self.afk("tick").splitlines()
 
@@ -678,6 +712,63 @@ class WatchTest(AfkTestCase):
         self.assertIn("03", notification)
         self.assertIn("claude", notification)
 
+    def limit(self, **limits):
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write("\n[limits]\n" + "".join(f"{k} = {v}\n" for k, v in limits.items()))
+
+    def interrupts(self, pane="%5"):
+        return [c for c in self.run_fake.find("tmux", "send-keys")[1:] if c[c.index("-t") + 1] == pane and c[-1] == "Escape"]
+
+    def test_a_worker_over_the_configured_phase_limit_is_interrupted_and_stuck(self):
+        self.limit(phase_minutes=5)
+        self.now += 6 * 60
+
+        dashboard = self.afk("tick").splitlines()
+
+        self.assertEqual(len(self.interrupts()), 1)
+        self.assertEqual(self.status()["state"], "stuck")
+        self.assertEqual(dashboard[1].split()[:3], ["03", "implement", "stuck"])
+        [notification] = self.desktop_notifications()
+        self.assertIn("stuck", notification)
+        self.assertEqual(self.window(), ("03-widget-ui!", "stuck"))
+
+    def test_the_default_phase_limit_applies_without_config(self):
+        self.now += 89 * 60
+        self.active()
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "working")
+
+        self.now += 2 * 60
+        self.active()
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "stuck")
+        self.assertEqual(len(self.interrupts()), 1)
+
+    def test_a_worker_whose_transcript_goes_quiet_past_the_idle_limit_is_interrupted_and_stuck(self):
+        self.limit(idle_minutes=10)
+        self.active()
+        self.now += 9 * 60
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "working")
+
+        self.now += 2 * 60
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "stuck")
+        self.assertIn("idle", self.status()["message"])
+        self.assertEqual(len(self.interrupts()), 1)
+
+    def test_a_worker_writing_to_its_transcript_is_not_idle(self):
+        self.limit(idle_minutes=10)
+        for _ in range(3):
+            self.now += 9 * 60
+            self.active()
+            self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "working")
+
     def test_a_killed_agent_pane_needs_attention_instead_of_failing_every_tick(self):
         def pane_gone(cmd):
             raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %5")
@@ -692,6 +783,73 @@ class WatchTest(AfkTestCase):
         self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
         self.assertEqual(len(self.desktop_notifications()), 1)
 
+
+class LimitsTest(unittest.TestCase):
+    """Runaway limits, one pure tick() at a time with an injected clock."""
+
+    limits = {"phase_minutes": 60, "idle_minutes": 15, "fix_loops": 2}
+
+    def worker(self, **changes):
+        return {"ticket": "03", "phase": "implement", "state": "working", "message": "", "pane": "%5",
+                "window": "03-widget-ui", "shown": "working", "phase_started_at": 0.0, **changes}
+
+    def test_a_worker_working_past_the_phase_limit_is_interrupted_marked_stuck_and_notified(self):
+        status, effects = afk.tick("03", self.worker(), 61 * 60, limits=self.limits, last_activity=61 * 60)
+
+        self.assertEqual(status["state"], "stuck")
+        self.assertIn(("interrupt", "%5"), effects)
+        [(_, notification)] = [e for e in effects if e[0] == "notify"]
+        self.assertIn("03", notification)
+        self.assertIn("stuck", notification)
+        self.assertIn("60m", notification)
+
+    def test_a_worker_within_the_phase_limit_keeps_working(self):
+        status, effects = afk.tick("03", self.worker(), 59 * 60, limits=self.limits, last_activity=59 * 60)
+
+        self.assertEqual(status["state"], "working")
+        self.assertEqual(effects, [])
+
+
+    def test_a_worker_with_no_activity_past_the_idle_limit_is_interrupted_and_stuck(self):
+        status, effects = afk.tick("03", self.worker(), 30 * 60, limits=self.limits, last_activity=14 * 60)
+
+        self.assertEqual(status["state"], "stuck")
+        self.assertIn("idle", status["message"])
+        self.assertIn(("interrupt", "%5"), effects)
+        self.assertEqual(len([e for e in effects if e[0] == "notify"]), 1)
+
+    def test_recent_activity_keeps_the_worker_working(self):
+        status, effects = afk.tick("03", self.worker(), 30 * 60, limits=self.limits, last_activity=16 * 60)
+
+        self.assertEqual((status["state"], effects), ("working", []))
+
+    def review_round(self, status, now):
+        """The human gives feedback in the pane; the worker fixes it, reports done and stops."""
+        return afk.tick("03", {**status, "state": "done", "message": "Fixed", "idle": True}, now, limits=self.limits)
+
+    def test_review_rounds_past_the_fix_loop_limit_are_marked_stuck_and_notified(self):
+        status = self.worker(phase="review", state="review", shown="review")
+        for round in range(2):
+            status, _ = self.review_round(status, now=round)
+            self.assertEqual(status["state"], "review")
+
+        status, effects = self.review_round(status, now=3)
+
+        self.assertEqual(status["state"], "stuck")
+        self.assertIn("2", status["message"])
+        [(_, notification)] = [e for e in effects if e[0] == "notify"]
+        self.assertIn("stuck", notification)
+        self.assertFalse([e for e in effects if e[0] == "prompt"])
+
+    def test_a_worker_stuck_on_fix_loops_returns_to_review_after_the_humans_next_round(self):
+        status = self.worker(phase="review", state="review", shown="review")
+        for round in range(3):
+            status, _ = self.review_round(status, now=round)
+        self.assertEqual(status["state"], "stuck")
+
+        status, _ = self.review_round(status, now=4)
+
+        self.assertEqual(status["state"], "review")
 
 if __name__ == "__main__":
     unittest.main()
