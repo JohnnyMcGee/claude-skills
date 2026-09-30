@@ -942,8 +942,8 @@ class GithubTracker:
             body = dependent.get("body") or ""
             blockers = section(body, "Blocked by")
             own = self.repo_of(dependent)
-            parts = ", ".join(self.ref(issue, own) for issue in created)
-            rewired = BLOCKER_REF.sub(lambda ref: parts if (ref[1] or own, ref[2]) == (repo, number) else ref[0], blockers)
+            replacement = ", ".join(self.ref(issue, own) for issue in created)
+            rewired = BLOCKER_REF.sub(lambda ref: replacement if (ref[1] or own, ref[2]) == (repo, number) else ref[0], blockers)
             if rewired != blockers:
                 self.run(["gh", "api", f"repos/{own}/issues/{dependent['number']}", "-X", "PATCH",
                           "-f", f"body={body.replace(blockers, rewired, 1)}"])
