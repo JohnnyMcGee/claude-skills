@@ -132,7 +132,7 @@ class GithubTestCase(AfkTestCase):
     @staticmethod
     def key(repo, number):
         """How the fake files an issue: by number in the spec's repo, else by `name#number`, as afk names tickets."""
-        number = int(number)
+        number, repo = int(number), repo.lower()  # GitHub matches owner and repo names in any case
         return number if repo == "acme/widgets" else f"{repo.split('/')[1]}#{number}"
 
     def key_of(self, path):
@@ -140,7 +140,7 @@ class GithubTestCase(AfkTestCase):
         return self.key(f"{owner}/{name}", number)
 
     def gh_api(self, cmd):
-        path = next(arg for arg in cmd[2:] if arg.startswith("repos/"))
+        path = next(arg for arg in cmd[2:] if arg.startswith("repos/")).lower()
         if path == "repos/acme/widgets/issues/2/sub_issues":
             result = list(self.issues.values())
         elif path.endswith("/dependencies/blocked_by"):
@@ -214,6 +214,15 @@ class GithubFrontierTest(GithubTestCase):
         output = self.afk("frontier")
 
         self.assertEqual(output.splitlines(), ["4  Widget API", "6  Widget export"])
+
+    def test_the_spec_urls_casing_of_owner_and_repo_does_not_matter(self):
+        self.issue(4, "Widget API")
+        self.issue(4, "Widget page", repo="acme/web")
+        self.afk("init", "https://github.com/ACME/widgets/issues/2")
+
+        output = self.afk("frontier")
+
+        self.assertEqual(output.splitlines(), ["4  Widget API", "web#4  Widget page  (acme/web)"])
 
     def test_a_sub_issue_from_another_owner_is_refused(self):
         self.issue(4, "Widget API")
@@ -308,7 +317,7 @@ class GithubSplitTest(GithubTestCase):
         self.afk("init", self.SPEC)
 
     def gh_api(self, cmd):
-        path = next(arg for arg in cmd[2:] if arg.startswith("repos/"))
+        path = next(arg for arg in cmd[2:] if arg.startswith("repos/")).lower()
         method = cmd[cmd.index("-X") + 1] if "-X" in cmd else "GET"
         fields = dict(cmd[i + 1].split("=", 1) for i, arg in enumerate(cmd) if arg in ("-f", "-F"))
         by_id = lambda id: next(n for n, issue in self.issues.items() if issue["id"] == int(id))
@@ -360,6 +369,14 @@ class GithubSplitTest(GithubTestCase):
         self.assertEqual(self.issues["web#6"]["body"], "## Blocked by\n\n- acme/widgets#9, acme/widgets#10\n")
         self.assertEqual(self.issues[8]["body"], "## Blocked by\n\n- #9, #10\n")
         self.assertEqual(self.issues[7]["body"], "## Blocked by\n\n- #5\n")  # the spec repo's own #5
+
+    def test_a_blocked_by_ref_names_the_split_sub_issue_in_any_casing(self):
+        self.issue(5, "Widget page", repo="acme/web")
+        self.issue(8, "Widget onboarding", body="## Blocked by\n\n- ACME/Web#5\n")
+
+        self.afk("split", "web#5", stdin=json.dumps(SPLIT_PARTS))
+
+        self.assertEqual(self.issues[8]["body"], "## Blocked by\n\n- #9, #10\n")
 
     def test_repo_and_blocked_by_in_a_parts_body_do_not_override_its_own(self):
         self.issue(4, "Widget config")

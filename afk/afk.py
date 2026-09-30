@@ -760,6 +760,11 @@ DONE_STATUSES = {"resolved", "done", "closed"}
 # `#<number>` links an issue in the body's own repo, `<owner>/<name>#<number>` one in any repo.
 BLOCKER_REF = re.compile(r"(?<![\w/.-])((?:[\w.-]+/[\w.-]+)?)#(\d+)\b")
 
+def same(a, b):
+    """GitHub owner and repo names match in any case."""
+    return a.lower() == b.lower()
+
+
 GITHUB_ISSUE = re.compile(r"https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)/?$")
 
 
@@ -850,10 +855,10 @@ class GithubTracker:
     def name(self, issue):
         """A ticket's id: its number in the spec's repo, `<repo>#<number>` for a sub-issue in another of the owner's repos."""
         repo = self.repo_of(issue)
-        if repo == self.repo:
+        if same(repo, self.repo):
             return str(issue["number"])
         owner, name = repo.split("/")
-        if owner != self.owner:
+        if not same(owner, self.owner):
             raise SystemExit(f"afk: sub-issue {repo}#{issue['number']} is outside {self.owner}; move it to one of {self.owner}'s repos")
         return f"{name}#{issue['number']}"
 
@@ -864,7 +869,7 @@ class GithubTracker:
     def ref(self, issue, repo=None):
         """How a body in `repo` (the spec's by default) links to the issue: `#<number>` within its own repo."""
         own = self.repo_of(issue)
-        return f"{'' if own == (repo or self.repo) else own}#{issue['number']}"
+        return f"{'' if same(own, repo or self.repo) else own}#{issue['number']}"
 
     def locate(self, ticket_id):
         """The repo and number a ticket id names."""
@@ -885,10 +890,10 @@ class GithubTracker:
         id = self.name(issue)
         blocked_by = [f"{repo or self.repo_of(issue)}#{n}" for repo, n in BLOCKER_REF.findall(section(body, "Blocked by"))]
         repo = re.fullmatch(r"[\w.-]+/[\w.-]+", field(body, "Repo"))
-        own = self.locate(id)[0]
+        own = self.repo_of(issue)
         return Ticket(
             id=id, title=issue["title"], status=status, blocked_by=blocked_by, path=issue["html_url"],
-            type=field(body, "Type"), repo=repo.group(0) if repo else own if own != self.repo else None,
+            type=field(body, "Type"), repo=repo.group(0) if repo else None if same(own, self.repo) else own,
         )
 
     def get(self, ticket_id):
@@ -943,7 +948,8 @@ class GithubTracker:
             blockers = section(body, "Blocked by")
             own = self.repo_of(dependent)
             replacement = ", ".join(self.ref(issue, own) for issue in created)
-            rewired = BLOCKER_REF.sub(lambda ref: replacement if (ref[1] or own, ref[2]) == (repo, number) else ref[0], blockers)
+            names_ticket = lambda ref: same(ref[1] or own, repo) and ref[2] == number
+            rewired = BLOCKER_REF.sub(lambda ref: replacement if names_ticket(ref) else ref[0], blockers)
             if rewired != blockers:
                 self.run(["gh", "api", f"repos/{own}/issues/{dependent['number']}", "-X", "PATCH",
                           "-f", f"body={body.replace(blockers, rewired, 1)}"])
