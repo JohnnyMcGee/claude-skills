@@ -180,5 +180,48 @@ class StartTest(AfkTestCase):
             self.assertTrue(os.access(command[0], os.X_OK), command[0])
 
 
+class WorkerStatusTest(AfkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI")
+        self.ticket("05-export", "Widget export")
+        self.afk("init", str(self.scratch))
+        self.afk("start", "03")
+        self.afk("start", "05")
+
+    def worker_env(self, ticket):
+        return {"AFK_PROJECT": "widgets", "AFK_TICKET": ticket}
+
+    def status_rows(self):
+        return [line.split(None, 3) for line in self.afk("status").splitlines()[1:]]
+
+    def test_status_shows_each_started_worker_implementing(self):
+        self.assertEqual(
+            self.status_rows(),
+            [["03", "implement", "working"], ["05", "implement", "working"]],
+        )
+
+    def test_report_from_worker_shows_in_status(self):
+        self.afk("report", "question", "Which database?", env=self.worker_env("03"))
+        self.afk("report", "done", "Export works", env=self.worker_env("05"))
+
+        self.assertEqual(
+            self.status_rows(),
+            [["03", "implement", "question", "Which database?"], ["05", "implement", "done", "Export works"]],
+        )
+
+    def test_report_rejects_unknown_state(self):
+        out = io.StringIO()
+        code = afk.main(
+            ["report", "finished", "hi"],
+            run=self.run_fake,
+            env={**self.env, **self.worker_env("03")},
+            stdin=io.StringIO(),
+            stdout=out,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.status_rows()[0], ["03", "implement", "working"])
+
+
 if __name__ == "__main__":
     unittest.main()

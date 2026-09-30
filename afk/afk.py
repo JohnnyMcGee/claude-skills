@@ -83,7 +83,30 @@ class Afk:
             worker_prompt(ticket),
         ]
         self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
+        write_json(worker_dir / "status.json", {"ticket": ticket.id, "phase": "implement", "state": "working", "message": ""})
         self.out(f"started {ticket.id} in {worktree} on {branch}")
+
+    def cmd_report(self, state, message=""):
+        if state not in REPORT_STATES:
+            self.out(f"afk: report state must be one of {', '.join(REPORT_STATES)}")
+            return 2
+        self.update_status(state=state, message=message)
+
+    def cmd_status(self):
+        rows = [read_json(p) for p in sorted((self.project_dir(self.current_project()) / "workers").glob("*/status.json"))]
+        self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<10}MESSAGE")
+        for s in rows:
+            self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<10}{s.get('message', '')}".rstrip())
+
+    def worker_status_path(self):
+        ticket = self.env.get("AFK_TICKET")
+        if not ticket:
+            raise SystemExit("afk: AFK_TICKET is not set; run this from an afk worker")
+        return self.project_dir(self.current_project()) / "workers" / ticket / "status.json"
+
+    def update_status(self, **changes):
+        path = self.worker_status_path()
+        write_json(path, {**read_json(path), **changes})
 
     def current_project(self):
         project = self.env.get("AFK_PROJECT") or self.run(
@@ -99,6 +122,8 @@ class Afk:
     def tracker(self):
         return LocalTracker(Path(self.config()["spec"]))
 
+
+REPORT_STATES = ("done", "blocked", "question")
 
 DONE_STATUSES = {"resolved", "done", "closed"}
 
@@ -201,6 +226,16 @@ def field(text, name):
     return match.group(1).strip() if match else ""
 
 
+def read_json(path):
+    return json.loads(path.read_text())
+
+
+def write_json(path, data):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
 def to_toml(flat):
     return "".join(f"{k} = {toml_string(v)}\n" for k, v in flat.items())
 
@@ -224,7 +259,13 @@ def main(argv, run=None, env=None, stdin=None, stdout=None):
     if handler is None:
         app.out(f"afk: unknown command '{command}'")
         return 2
-    return handler(*args) or 0
+    try:
+        return handler(*args) or 0
+    except SystemExit as exit:
+        if isinstance(exit.code, str):
+            app.out(exit.code)
+            return 1
+        raise
 
 
 if __name__ == "__main__":
