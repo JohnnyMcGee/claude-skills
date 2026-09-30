@@ -23,7 +23,10 @@ class FakeRun:
     def __call__(self, cmd, input=None):
         self.calls.append(list(cmd))
         matches = [p for p in self.responses if tuple(cmd[: len(p)]) == p]
-        return self.responses[max(matches, key=len)] if matches else ""
+        if not matches:
+            return ""
+        response = self.responses[max(matches, key=len)]
+        return response(cmd) if callable(response) else response
 
     def find(self, *prefix):
         return [c for c in self.calls if tuple(c[: len(prefix)]) == prefix]
@@ -153,6 +156,19 @@ class StartTest(AfkTestCase):
         self.assertNotIn("-p", claude)
         self.assertIn(str(self.scratch / "issues" / "03-ui.md"), claude[-1])
         self.assertIn('afk report', claude[-1])
+
+    def test_worker_session_start_hook_firing_immediately_on_launch_is_recorded(self):
+        def worker_starts(cmd):
+            payload = {"session_id": "early", "transcript_path": "/t.jsonl", "hook_event_name": "SessionStart"}
+            self.afk("hook", "session-start", stdin=json.dumps(payload), env={"AFK_PROJECT": "widgets", "AFK_TICKET": "03"})
+            return ""
+
+        self.run_fake.responses[("tmux", "send-keys")] = worker_starts
+        self.afk("start", "03")
+
+        status = json.loads((self.project_dir / "workers" / "03" / "status.json").read_text())
+        self.assertEqual(status["session_id"], "early")
+        self.assertEqual(status["state"], "working")
 
     def settings(self):
         self.afk("start", "03")

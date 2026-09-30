@@ -82,8 +82,8 @@ class Afk:
             "claude", "--permission-mode", "auto", "--settings", str(settings),
             worker_prompt(ticket),
         ]
-        self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         write_json(worker_dir / "status.json", {"ticket": ticket.id, "phase": "implement", "state": "working", "message": ""})
+        self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         self.out(f"started {ticket.id} in {worktree} on {branch}")
 
     def cmd_report(self, state, message=""):
