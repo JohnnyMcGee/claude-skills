@@ -61,7 +61,7 @@ A task type's keys:
 | `skill` | none | Skill invoked with the first prompt, such as `/tdd`. |
 | `prompt` | none | Repo-relative template appended to the implement prompt. `{{ticket}}` and `{{ticket_path}}` are filled in, so it can point at links in the ticket, such as Figma designs. |
 
-A ticket's type is its `Type:` line, else `default_type`. Override it at start time with `afk start <ticket> --type <name>`. An unknown type or agent fails the start before anything is created.
+A ticket's type is its `Type:` line, else `default_type`. Override it at Gate 1, or with `afk start <ticket> --type <name>`. An unknown type or agent fails the start before anything is created.
 
 ## Prose
 
@@ -87,3 +87,14 @@ Later layers win, key by key, so an override only needs the fields it changes:
    [overrides.task_types.frontend]
    model = "haiku"
    ```
+
+## Repos
+
+A project can span repos. The `[repos]` table in the project's `config.toml` lists their clones:
+
+```toml
+[repos]
+"acme/widgets-api" = "/home/me/code/widgets-api"
+```
+
+`[repos]` maps a ticket's `Repo: owner/name` to its local clone; each clone brings its own `docs/agents/afk.md`. A ticket without a `Repo:` line, or naming the spec's own repo, uses the clone the project was created from.
