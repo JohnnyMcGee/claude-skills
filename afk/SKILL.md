@@ -52,7 +52,7 @@ idle_minutes = 20   # working, but its transcript hasn't changed
 fix_loops = 3       # review rounds (feedback → fix → done) before stopping to look
 ```
 
-A tripped limit interrupts the worker (Escape in its pane), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A stuck worker that later reports `done` moves on as usual.
+A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, where it has already stopped), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A stuck worker that later reports `done` moves on as usual.
 
 ## Setup
 
