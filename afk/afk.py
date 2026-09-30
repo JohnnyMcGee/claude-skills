@@ -81,9 +81,12 @@ class Afk:
         if not ticket.open:
             raise SystemExit(f"afk: ticket {ticket.id} is not open (it is {ticket.status})")
         branch = f"afk/{project}-{ticket.id}"
+        try:
+            worker_dir.mkdir(parents=True)  # atomic: of two racing starts, only one owns the worker
+        except FileExistsError:
+            raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
         undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
         try:
-            worker_dir.mkdir(parents=True, exist_ok=True)
             tracker.claim(ticket)
             undo.append(lambda: tracker.release(ticket))
             self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree)])
