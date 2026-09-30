@@ -22,10 +22,12 @@ class FakeRun:
         self.responses = responses or {}
         self.calls = []
         self.inputs = []
+        self.cwds = []
 
-    def __call__(self, cmd, input=None):
+    def __call__(self, cmd, input=None, cwd=None):
         self.calls.append(list(cmd))
         self.inputs.append(input)
+        self.cwds.append(cwd and str(cwd))
         matches = [p for p in self.responses if tuple(cmd[: len(p)]) == p]
         if not matches:
             return ""
@@ -71,19 +73,26 @@ class AfkTestCase(unittest.TestCase):
         self.assertEqual(code, 0, out.getvalue())
         return out.getvalue()
 
-    def ticket(self, name, title, status="ready-for-agent", blocked_by="None — can start immediately"):
+    def ticket(self, name, title, status="ready-for-agent", blocked_by="None — can start immediately", type=None):
         number = name.split("-", 1)[0]
         (self.scratch / "issues" / f"{name}.md").write_text(
             f"# {number} — {title}\n\n"
             f"**What to build:** {title}.\n\n"
             f"**Blocked by:** {blocked_by}\n\n"
             f"**Status:** {status}\n\n"
-            "- [ ] It works\n"
+            + (f"**Type:** {type}\n\n" if type else "")
+            + "- [ ] It works\n"
         )
 
     @property
     def project_dir(self):
         return self.state_home / "afk" / "widgets"
+
+    def repo_config(self, frontmatter, name="afk.md", body="# AFK\n\nRun `npm run dev`.\n"):
+        """Write the repo's AFK config doc: TOML frontmatter between +++ lines, then prose."""
+        path = self.repo / "docs" / "agents" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"+++\n{frontmatter.strip()}\n+++\n\n{body}")
 
 
 class InitTest(AfkTestCase):
@@ -309,6 +318,365 @@ class StartTest(AfkTestCase):
             command = shlex.split(hooks[event][0]["hooks"][0]["command"])
             self.assertEqual(command[-2:], ["hook", arg])
             self.assertTrue(os.access(command[0], os.X_OK), command[0])
+
+
+class RepoConfigStartTest(AfkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI")
+        self.afk("init", str(self.scratch))
+        self.worktree = self.project_dir / "worktrees" / "03"
+
+    def test_start_copies_configured_gitignored_files_into_the_worktree(self):
+        (self.repo / ".env").write_text("SECRET=1\n")
+        (self.repo / "config").mkdir()
+        (self.repo / "config" / "local.yml").write_text("db: dev\n")
+        self.repo_config('copy = [".env", "config/local.yml"]')
+
+        self.afk("start", "03")
+
+        self.assertEqual((self.worktree / ".env").read_text(), "SECRET=1\n")
+        self.assertEqual((self.worktree / "config" / "local.yml").read_text(), "db: dev\n")
+
+    def test_worktree_branches_from_the_repos_base_branch_which_workers_may_not_push_to(self):
+        self.repo_config('base = "develop"')
+
+        self.afk("start", "03")
+
+        [add] = self.run_fake.find("git", "-C", str(self.repo), "worktree", "add")
+        self.assertEqual(add[-1], "develop")
+        [send] = self.run_fake.find("tmux", "send-keys")
+        launch = shlex.split(send[4])
+        deny = json.loads(Path(launch[launch.index("--settings") + 1]).read_text())["permissions"]["deny"]
+        self.assertIn("Bash(git push * develop)", deny)
+        self.assertNotIn("Bash(git push * main)", deny)
+
+    def bootstraps(self):
+        """(shell command, cwd) of each bootstrap command run so far."""
+        return [(cmd[-1], cwd) for cmd, cwd in zip(self.run_fake.calls, self.run_fake.cwds) if cmd[-3:-1] == ["sh", "-c"]]
+
+    def test_start_runs_bootstrap_commands_in_order_in_the_worktree(self):
+        self.repo_config('bootstrap = ["npm ci", "make db"]')
+
+        self.afk("start", "03")
+
+        self.assertEqual(self.bootstraps(), [("npm ci", str(self.worktree)), ("make db", str(self.worktree))])
+
+    def test_failed_bootstrap_rolls_back_the_start(self):
+        def npm_fails(cmd):
+            if cmd[-1] == "npm ci":
+                raise subprocess.CalledProcessError(1, cmd, stderr="npm ERR! missing lockfile")
+            return ""
+
+        self.run_fake.responses[("sh",)] = npm_fails
+        self.run_fake.responses[("env",)] = npm_fails
+        self.repo_config('bootstrap = ["npm ci"]')
+        out = io.StringIO()
+
+        code = afk.main(["start", "03"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("missing lockfile", out.getvalue())
+        self.assertEqual(len(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove")), 1)
+        self.assertEqual(self.run_fake.find("tmux", "send-keys"), [])
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+
+TASK_TYPES = """
+default_type = "backend"
+
+[task_types.backend]
+agent = "claude"
+model = "opus"
+effort = "high"
+skill = "/tdd"
+
+[task_types.frontend]
+agent = "claude"
+model = "sonnet"
+effort = "medium"
+prompt = "docs/agents/prompts/frontend.md"
+"""
+
+
+class TaskTypeTest(AfkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI", type="frontend")
+        self.ticket("05-export", "Widget export")
+        self.afk("init", str(self.scratch))
+        self.repo_config(TASK_TYPES)
+        prompts = self.repo / "docs" / "agents" / "prompts"
+        prompts.mkdir()
+        (prompts / "frontend.md").write_text("Match the Figma design linked in {{ticket_path}}.\n")
+
+    def claude(self):
+        [send] = self.run_fake.find("tmux", "send-keys")
+        launch = shlex.split(send[4])
+        return launch[launch.index("claude") :]
+
+    def flag(self, claude, name):
+        return claude[claude.index(name) + 1]
+
+    def test_tickets_type_selects_model_effort_and_prompt_template(self):
+        self.afk("start", "03")
+
+        claude = self.claude()
+        self.assertEqual(self.flag(claude, "--model"), "sonnet")
+        self.assertEqual(self.flag(claude, "--effort"), "medium")
+        prompt = claude[-1]
+        self.assertTrue(prompt.startswith("AFK phase: implement"), prompt)
+        self.assertIn(f"Match the Figma design linked in {self.scratch / 'issues' / '03-ui.md'}.", prompt)
+
+    def test_untyped_ticket_uses_the_default_type_and_invokes_its_skill(self):
+        self.afk("start", "05")
+
+        claude = self.claude()
+        self.assertEqual(self.flag(claude, "--model"), "opus")
+        self.assertEqual(self.flag(claude, "--effort"), "high")
+        self.assertTrue(claude[-1].startswith("/tdd AFK phase: implement"), claude[-1])
+
+    def test_type_flag_overrides_the_tickets_type(self):
+        self.afk("start", "03", "--type", "backend")
+
+        self.assertEqual(self.flag(self.claude(), "--model"), "opus")
+
+    def test_local_override_file_replaces_just_the_fields_it_sets(self):
+        self.repo_config('[task_types.frontend]\nmodel = "opus"', name="afk.local.md")
+
+        self.afk("start", "03")
+
+        claude = self.claude()
+        self.assertEqual(self.flag(claude, "--model"), "opus")
+        self.assertEqual(self.flag(claude, "--effort"), "medium")
+
+    def test_project_config_overrides_win_over_the_local_override_file(self):
+        self.repo_config('[task_types.frontend]\nmodel = "opus"\neffort = "low"', name="afk.local.md")
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write('\n[overrides.task_types.frontend]\nmodel = "haiku"\n')
+
+        self.afk("start", "03")
+
+        claude = self.claude()
+        self.assertEqual(self.flag(claude, "--model"), "haiku")
+        self.assertEqual(self.flag(claude, "--effort"), "low")
+
+    def start_fails(self, *argv):
+        out = io.StringIO()
+        code = afk.main(["start", *argv], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.run_fake.find("git"), [])
+        self.assertEqual(self.run_fake.find("tmux", "new-window"), [])
+        self.assertFalse((self.project_dir / "workers" / argv[0]).exists())
+        return out.getvalue()
+
+    def test_unknown_task_type_fails_before_creating_anything(self):
+        out = self.start_fails("03", "--type", "infra")
+
+        self.assertIn("infra", out)
+        self.assertIn("backend, frontend", out)
+
+    def test_malformed_options_fail_with_usage_before_creating_anything(self):
+        for options in (["--type"], ["--typ", "backend"], ["--type", "backend", "extra"]):
+            with self.subTest(options=options):
+                self.assertIn("usage: afk start <ticket> [--type <type>]", self.start_fails("03", *options))
+
+    def test_unsupported_agent_fails_before_creating_anything(self):
+        self.repo_config('[task_types.frontend]\nagent = "grok"', name="afk.local.md")
+
+        out = self.start_fails("03")
+
+        self.assertIn("grok", out)
+
+    def test_without_task_types_claude_launches_with_its_own_defaults(self):
+        self.repo_config("")
+
+        self.afk("start", "05")
+
+        claude = self.claude()
+        self.assertNotIn("--model", claude)
+        self.assertNotIn("--effort", claude)
+        self.assertTrue(claude[-1].startswith("AFK phase: implement"))
+
+
+class SlotTest(AfkTestCase):
+    def setUp(self):
+        super().setUp()
+        for name, title in [("03-ui", "Widget UI"), ("05-export", "Widget export"), ("07-import", "Widget import")]:
+            self.ticket(name, title)
+        self.afk("init", str(self.scratch))
+        self.repo_config('port_base = 5000\nbootstrap = ["make db"]')
+        panes = iter(["%5", "%6", "%7", "%8"])
+        self.run_fake.responses[("tmux", "new-window")] = lambda cmd: next(panes) + "\n"
+
+    def slot_env(self, cmd):
+        return [arg for arg in cmd if arg.startswith(("AFK_SLOT=", "AFK_PORT_BASE="))]
+
+    def launches(self):
+        return [self.slot_env(shlex.split(c[4])) for c in self.run_fake.find("tmux", "send-keys") if len(c) > 5]
+
+    def test_each_worker_gets_its_own_slot_and_port_base(self):
+        self.afk("start", "03")
+        self.afk("start", "05")
+
+        self.assertEqual(
+            self.launches(),
+            [["AFK_SLOT=1", "AFK_PORT_BASE=5100"], ["AFK_SLOT=2", "AFK_PORT_BASE=5200"]],
+        )
+
+    def test_bootstrap_sees_the_workers_slot(self):
+        self.afk("start", "03")
+
+        [bootstrap] = [c for c in self.run_fake.calls if c[-1] == "make db"]
+        self.assertEqual(self.slot_env(bootstrap), ["AFK_SLOT=1", "AFK_PORT_BASE=5100"])
+
+    def test_slot_of_a_rolled_back_start_is_reused(self):
+        self.afk("start", "03")
+        self.run_fake.responses[("tmux", "split-window")] = lambda cmd: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(1, cmd, stderr="no space for new pane")
+        )
+        afk.main(["start", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=io.StringIO())
+        del self.run_fake.responses[("tmux", "split-window")]
+
+        self.afk("start", "07")
+
+        self.assertEqual(self.launches()[-1], ["AFK_SLOT=2", "AFK_PORT_BASE=5200"])
+
+    def test_port_base_defaults_to_4000(self):
+        self.repo_config("")
+
+        self.afk("start", "03")
+
+        self.assertEqual(self.launches(), [["AFK_SLOT=1", "AFK_PORT_BASE=4100"]])
+
+
+class VerifyQueueTest(AfkTestCase):
+    PANES = {"03": "%5", "05": "%6", "07": "%7"}
+
+    def setUp(self):
+        super().setUp()
+        for name, title in [("03-ui", "Widget UI"), ("05-export", "Widget export"), ("07-import", "Widget import")]:
+            self.ticket(name, title)
+        self.afk("init", str(self.scratch))
+        self.repo_config("verify_concurrency = 1")
+        panes = iter(self.PANES.values())
+        self.run_fake.responses[("tmux", "new-window")] = lambda cmd: next(panes) + "\n"
+        for ticket in self.PANES:
+            self.afk("start", ticket)
+
+    def finish(self, ticket):
+        env = {"AFK_PROJECT": "widgets", "AFK_TICKET": ticket}
+        self.afk("report", "done", "Done", env=env)
+        self.afk("hook", "stop", stdin=json.dumps({"hook_event_name": "Stop"}), env=env)
+        self.now += 60
+
+    def state(self, ticket):
+        status = json.loads((self.project_dir / "workers" / ticket / "status.json").read_text())
+        return status["phase"], status["state"]
+
+    def verify_prompted(self, ticket):
+        pane = self.PANES[ticket]
+        pastes = [c for c in self.run_fake.find("tmux", "paste-buffer") if c[c.index("-t") + 1] == pane]
+        buffers = [i for c, i in zip(self.run_fake.calls, self.run_fake.inputs) if c[:2] == ["tmux", "load-buffer"]]
+        return len(pastes) > 0 and any(b.startswith(f"AFK phase: verify — ticket {ticket}") for b in buffers)
+
+    def test_second_worker_is_queued_while_another_verifies(self):
+        self.finish("03")
+        self.afk("tick")
+        self.finish("05")
+
+        self.afk("tick")
+
+        self.assertEqual(self.state("03"), ("verify", "working"))
+        self.assertEqual(self.state("05"), ("implement", "queued"))
+        self.assertFalse(self.verify_prompted("05"))
+
+    def test_queued_worker_starts_verifying_once_the_slot_frees(self):
+        self.finish("03")
+        self.afk("tick")
+        self.finish("05")
+        self.afk("tick")
+
+        self.finish("03")
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual(self.state("03"), ("prepr", "working"))
+        self.assertEqual(self.state("05"), ("verify", "working"))
+        self.assertTrue(self.verify_prompted("05"))
+
+    def test_workers_finishing_in_the_same_tick_verify_one_at_a_time(self):
+        self.finish("03")
+        self.finish("05")
+
+        self.afk("tick")
+
+        self.assertEqual([self.state("03")[1], self.state("05")[1]], ["working", "queued"])
+
+    def test_queue_is_first_come_first_served(self):
+        self.finish("03")
+        self.afk("tick")
+        self.finish("07")
+        self.afk("tick")
+        self.finish("05")
+        self.afk("tick")
+
+        self.finish("03")
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual(self.state("07"), ("verify", "working"))
+        self.assertEqual(self.state("05"), ("implement", "queued"))
+
+    def test_queued_worker_whose_agent_exited_needs_attention_without_skipping_verify(self):
+        self.finish("03")
+        self.afk("tick")
+        self.finish("05")
+        self.afk("tick")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = lambda cmd: "claude\n" if cmd[4] == "%5" else "bash\n"
+
+        self.finish("03")
+        self.afk("tick")
+
+        self.assertEqual(self.state("05"), ("implement", "attention"))
+        self.assertFalse(self.verify_prompted("05"))
+
+    def test_overlapping_ticks_still_admit_one_verifier(self):
+        self.finish("05")
+        self.finish("07")
+        results = []
+
+        def second_tick():
+            out = io.StringIO()
+            try:
+                results.append(afk.main(["tick"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out, clock=lambda: self.now))
+            except Exception as error:
+                results.append(error)
+
+        other = threading.Thread(target=second_tick)
+
+        def another_tick_starts_mid_paste(cmd):
+            if cmd[cmd.index("-t") + 1] == "%6" and not other.is_alive() and not results:
+                other.start()
+                other.join(timeout=0.2)  # without a tick-wide lock it snapshots the state before this tick writes it
+            return ""
+
+        self.run_fake.responses[("tmux", "paste-buffer")] = another_tick_starts_mid_paste
+        self.afk("tick")
+        other.join()
+
+        self.assertEqual(results, [0])
+        self.assertEqual([self.state("05"), self.state("07")], [("verify", "working"), ("implement", "queued")])
+        self.assertFalse(self.verify_prompted("07"))
+
+    def test_without_verify_concurrency_workers_verify_in_parallel(self):
+        self.repo_config("")
+        self.finish("03")
+        self.finish("05")
+
+        self.afk("tick")
+
+        self.assertEqual([self.state("03"), self.state("05")], [("verify", "working")] * 2)
 
 
 class WorkerStatusTest(AfkTestCase):
