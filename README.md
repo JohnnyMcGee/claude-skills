@@ -4,6 +4,12 @@ A small collection of [Claude Code skills](https://code.claude.com/docs/en/skill
 
 ## Skills
 
+### afk
+
+An orchestrator for AFK agent workers, one project per tmux session. A stdlib-only Python CLI (`afk`) finds the ticket frontier in a local `.scratch` spec, starts each ticket in its own worktree, branch and split tmux window with an interactive `claude` worker (auto permission mode, per-session status hooks, and a deny list against force-push, pushing to base, `gh pr merge` and worktree removal), and tracks every worker's reported status.
+
+Invoke with `/afk <init <spec> | frontier | start <ticket> | status>`. The `afk` CLI must be on your PATH (see below).
+
 ### atomic-commits
 
 A turn-based coding loop: plan a feature as a checklist of atomic commits, then build, stage, and land them one at a time with user review between each. The user is the gate — the agent stops only when there's something to review, and starts the next item the moment it's approved.
@@ -28,10 +34,22 @@ Copy the skill folders into your skills directory:
 
 ```bash
 # Personal (all projects)
-cp -r atomic-commits brief-me open-pr ~/.claude/skills/
+cp -r afk atomic-commits brief-me open-pr ~/.claude/skills/
 
 # Or per-project
-cp -r atomic-commits brief-me open-pr <project>/.claude/skills/
+cp -r afk atomic-commits brief-me open-pr <project>/.claude/skills/
 ```
 
 Each skill is a folder containing a `SKILL.md` (plus any supporting files) — see the [skills documentation](https://code.claude.com/docs/en/skills) for details.
+
+### Putting `afk` on PATH
+
+The `afk` skill drives a CLI that both you and its worker agents call. Symlink it onto your PATH (Python 3.11+, `tmux`, `git` required):
+
+```bash
+mkdir -p ~/.local/bin
+ln -sf ~/.claude/skills/afk/afk.py ~/.local/bin/afk
+afk   # prints usage
+```
+
+Its tests run with `python3 -m unittest` from the `afk/` folder.
