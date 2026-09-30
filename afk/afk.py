@@ -404,7 +404,8 @@ class Afk:
                         ticket = self.find_ticket(before["ticket"])
                         ticket_closed = bool(ticket and ticket.done)
                     given.update(pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
-                    blocker = self.cleanup_blocker(before) if ending(before, pr_state, ticket_closed) else None
+                    ended = ending(before, pr_state, ticket_closed)
+                    blocker = self.cleanup_blocker(before, ended) if ended else None
                     status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
                     if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
                         # Pasting into a bare shell would run the prompt's markdown as commands.
@@ -469,8 +470,11 @@ class Afk:
         elif kind == "cleanup":
             self.clean_up(*args)
 
-    def cleanup_blocker(self, status):
-        """Why cleaning up this worker could lose the human's work, or None if it's safe."""
+    def cleanup_blocker(self, status, ended):
+        """Why cleaning up this worker could lose the human's work, or None if it's safe.
+
+        Unless it merged, its branch may hold commits that were never pushed, which deleting the branch would lose.
+        """
         if "shell_pane" not in status:
             return "its shell pane is unknown (it was started by an older afk)"
         command = self.pane_command(status["shell_pane"])
@@ -478,8 +482,11 @@ class Afk:
             return "its shell pane is gone"
         if command not in SHELLS:
             return f"its shell pane is running {command}"
-        if self.run(["git", "-C", str(self.worktree(status["ticket"])), "status", "--porcelain"]).strip():
+        worktree = str(self.worktree(status["ticket"]))
+        if self.run(["git", "-C", worktree, "status", "--porcelain"]).strip():
             return "its worktree has uncommitted changes"
+        if ended != "merged" and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
+            return "its branch has unpushed commits"
         return None
 
     def clean_up(self, ticket_id, pane, ended):

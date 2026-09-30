@@ -2402,6 +2402,20 @@ class WatchTest(AfkTestCase):
         self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%7"]])
         self.assertFalse((self.project_dir / "workers" / "04").exists())
 
+    def test_a_worker_whose_ticket_is_closed_with_unpushed_commits_is_left_cleanup_pending(self):
+        self.start_hitl()
+        worktree = str(self.project_dir / "worktrees" / "04")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%8")] = "bash\n"
+        self.run_fake.responses[("git", "-C", worktree, "log")] = "abc1234 Try the spike\n"
+        path = self.scratch / "issues" / "04-spike.md"
+        path.write_text(path.read_text().replace("**Status:** ready-for-agent", "**Status:** closed"))
+
+        self.afk("tick")
+
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+        self.assertEqual(self.status("04")["state"], "cleanup-pending")
+        self.assertIn("unpushed commits", self.desktop_notifications()[-1])
+
     def test_a_hitl_worker_whose_ticket_is_closed_without_a_pr_is_cleaned_up_once_safe(self):
         self.start_hitl()
 
