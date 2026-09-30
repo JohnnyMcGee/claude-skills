@@ -1846,6 +1846,23 @@ class WatchTest(AfkTestCase):
         self.assertIn("AFK phase: review", self.prompts_sent()[-1])
         self.assertIn("03 PR ready for review: https://github.com/acme/widgets/pull/42", self.desktop_notifications()[-1])
 
+    def test_a_worker_that_reported_blocked_but_has_not_stopped_is_not_prompted_until_it_stops(self):
+        self.reach_pr()
+        self.report("blocked", "Couldn't run /open-pr")
+        self.now += 60
+        prompts = len(self.prompts_sent())
+
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("pr", "blocked"))
+        self.assertEqual(len(self.prompts_sent()), prompts)
+
+        self.stop()
+        self.now += 60
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+
     def test_a_worker_still_running_open_pr_stays_in_pr_while_its_pr_is_open(self):
         self.reach_pr()
         self.github("OPEN")

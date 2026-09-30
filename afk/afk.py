@@ -659,8 +659,9 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
 
 def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=None):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
-    if phase == "pr" and pr_state == "OPEN" and state in ("blocked", "attention", "stuck"):
+    if phase == "pr" and pr_state == "OPEN" and state in ("blocked", "attention", "stuck") and status.get("idle"):
         # The worker stopped short but its branch has a PR, most likely opened by the human: it's up for review.
+        # Like any phase prompt, the review prompt waits until the worker's session has stopped.
         effects = [("prompt", ticket, status["pane"], "review")] if agent_running else []
         return enter_review(ticket, status, now, effects)
     if phase == "review":
