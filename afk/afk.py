@@ -257,6 +257,8 @@ class Afk:
 
     def cleanup_blocker(self, status):
         """Why cleaning up this worker could lose the human's work, or None if it's safe."""
+        if "shell_pane" not in status:
+            return "its shell pane is unknown (it was started by an older afk)"
         command = self.pane_command(status["shell_pane"])
         if command is None:
             return "its shell pane is gone"

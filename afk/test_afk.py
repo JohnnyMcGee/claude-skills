@@ -1366,5 +1366,19 @@ class WatchTest(AfkTestCase):
         self.assertIn("api.github.com", out.getvalue())
         self.assertEqual((self.phase("03"), self.phase("05")), ("review", "verify"))
 
+    def test_merged_worker_started_before_shell_panes_were_recorded_is_left_cleanup_pending(self):
+        self.reach_review()
+        path = self.project_dir / "workers" / "03" / "status.json"
+        status = self.status()
+        del status["shell_pane"]
+        path.write_text(json.dumps(status))
+        self.merge()
+
+        self.afk("tick")
+
+        self.assertEqual(self.cleanup_commands(), ([], [], []))
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertIn("shell pane is unknown", self.desktop_notifications()[-1])
+
 if __name__ == "__main__":
     unittest.main()
