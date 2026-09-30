@@ -401,7 +401,9 @@ def enforce(ticket, status, now, limits, last_activity):
     """
     # A worker that reported done but hasn't stopped is still running. Review has no phase clock: it waits on the human.
     running = status["state"] == "working" or (status["state"] == "done" and not status.get("idle"))
-    if not running or status["phase"] == "review":
+    # A limit trips once per phase: after the human has looked, a recovered worker isn't interrupted again.
+    tripped = status.get("tripped") == status["phase_started_at"]
+    if not running or tripped or status["phase"] == "review":
         return status, []
     reason = None
     if now - status["phase_started_at"] > limits["phase_minutes"] * 60:
@@ -410,7 +412,7 @@ def enforce(ticket, status, now, limits, last_activity):
         reason = f"idle for over {limits['idle_minutes']}m"
     if reason is None:
         return status, []
-    status = {**status, "state": "stuck", "message": reason}
+    status = {**status, "state": "stuck", "message": reason, "tripped": status["phase_started_at"]}
     return status, [("interrupt", status["pane"]), ("notify", f"{ticket} stuck: {reason}")]
 
 

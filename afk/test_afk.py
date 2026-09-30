@@ -1139,6 +1139,21 @@ class WatchTest(AfkTestCase):
         self.assertEqual(self.status()["state"], "stuck")
         self.assertEqual(len(self.interrupts()), 1)
 
+    def test_a_stuck_worker_that_recovers_and_reports_done_advances_without_a_second_interrupt(self):
+        self.limit(phase_minutes=5)
+        self.now += 6 * 60
+        self.active()
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "stuck")
+
+        self.report("done", "Implemented after a nudge")
+        self.afk("tick")
+        self.stop()
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("verify", "working"))
+        self.assertEqual(len(self.interrupts()), 1)
+
     def test_a_worker_whose_transcript_goes_quiet_past_the_idle_limit_is_interrupted_and_stuck(self):
         self.limit(idle_minutes=10)
         self.active()
