@@ -1,7 +1,6 @@
 ---
 name: open-pr
-description: Open a pull request and drive it to a human-reviewable state — resolve conflicts, get checks green, and triage every AI reviewer comment.
-disable-model-invocation: true
+description: Open a pull request and drive it to a human-reviewable state — resolve conflicts, get checks green, and triage every AI reviewer comment. Use when the work on a branch is done and it needs a PR opened, or an existing PR needs its automated gates cleared.
 argument-hint: [base branch]
 ---
 
@@ -168,11 +167,11 @@ gh pr edit "$PR" --add-label "Ready for Review"
 
 **Blocked** — anything you could not clear. Report the same, naming what blocks it and what you tried.
 
-Report to the terminal only. Never post a summary comment to the PR. Four parts:
+Report to whoever invoked you — the user, or the calling agent as your final output. Never post a summary comment to the PR. Four parts:
 
 - PR URL and whether it carries the `Ready for Review` label.
 - Checks: `N passed`, plus any excused failure **with its evidence**.
 - Triage: a count per bucket, with the invalid and out-of-scope ones listed one line each so the human can spot a bad call.
 - Human activity, if any ("2 comments from a human reviewer — untouched").
 
-List deferred out-of-scope items and offer to file issues for them. Do not file them unprompted.
+List deferred out-of-scope items. Never file issues for them unprompted: a user gets an offer to file them; a calling agent just gets the list.

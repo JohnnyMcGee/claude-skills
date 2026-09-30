@@ -6,9 +6,11 @@ A small collection of [Claude Code skills](https://code.claude.com/docs/en/skill
 
 ### afk
 
-An orchestrator for AFK agent workers, one project per tmux session. A stdlib-only Python CLI (`afk`) finds the ticket frontier in a local `.scratch` spec or a GitHub spec issue's sub-issues (claiming GitHub tickets by assignment), starts each ticket in its own worktree (with the repo's gitignored files and bootstrap from `docs/agents/afk.md`), branch, port slot and split tmux window with an interactive `claude` worker (auto permission mode, per-session status hooks, and a deny list against force-push, pushing to base, `gh pr merge` and worktree removal), and tracks every worker's reported status. `afk watch` then drives each worker through implement → verify → prepr → pr → review by pasting phase prompts into its pane, shows a dashboard, marks tmux windows with each worker's state, and notifies you when a worker has a question, is blocked, stalls, or has a PR Ready. It polls GitHub for merges (it never merges itself) and then removes the worktree, branch and window, unless your shell pane is busy or the worktree is dirty. In that case it leaves them and tells you.
+An orchestrator for AFK agent workers: you choose the work, agents build it in parallel, and you merge. One project per tmux session. Tickets come from a local `.scratch` spec or a GitHub spec issue's sub-issues. `/afk next` proposes a batch of unblocked tickets that won't collide with each other or with running workers (Gate 1), and offers to split any ticket that spans repos. Each ticket you approve gets its own worktree, branch, port slot and tmux window with an interactive `claude` worker. The repo's `docs/agents/afk.md` sets these up, and a deny list keeps the worker from force-pushing, pushing to base or merging.
 
-Invoke with `/afk <init <spec> | frontier | start <ticket> | watch | status>`. The `afk` CLI must be on your PATH (see below).
+`afk watch` then drives each worker through implement → verify → prepr → pr → review. It shows a dashboard, colours windows by state, and notifies you when a worker has a question, is blocked, stalls, trips a runaway limit, or has a PR Ready. Merging is up to you. Once a PR merges, the watcher removes the worker's worktree, branch and window, but only if the shell pane is idle and the worktree is clean. It then prompts you for the next batch. A `hitl` ticket gets the same setup, but its worker runs in guide mode and helps you do the work yourself.
+
+Invoke with `/afk <init <spec> | next | frontier | start <ticket> | watch | status>`. The `afk` CLI must be on your PATH (see below).
 
 ### afk-setup
 
@@ -32,7 +34,7 @@ Invoke with `/brief-me <PR number, ticket id, or task description>`.
 
 Opens a pull request and drives it to a human-reviewable state: resolves merge conflicts, gets the checks green (or excuses a failure with named evidence), then waits for AI reviewers, triages each comment as valid / invalid / out-of-scope, and lands the valid fixes as atomic commits before resolving every thread. It never replies to human reviewers, never makes out-of-scope changes, and never merges — it just clears the automated gates. Hands off naturally from `atomic-commits`.
 
-Invoke with `/open-pr [base branch]`.
+Invoke with `/open-pr [base branch]`, or let an agent reach it by name (AFK workers use it in their pr phase).
 
 ## Installation
 
@@ -58,4 +60,4 @@ ln -sf ~/.claude/skills/afk/afk.py ~/.local/bin/afk
 afk   # prints usage
 ```
 
-Its tests run with `python3 -m unittest` from the `afk/` folder.
+Its tests run with `python3 -m unittest` from the `afk/` folder. [`afk/e2e-checklist.md`](afk/e2e-checklist.md) is a manual end-to-end run of the whole loop with real tmux and `claude`.
