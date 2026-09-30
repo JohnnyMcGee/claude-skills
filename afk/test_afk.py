@@ -260,6 +260,31 @@ class StartTest(AfkTestCase):
         self.afk("start", "07")
         self.assertEqual(self.worker_state("07"), "working")
 
+    def test_concurrent_starts_cannot_both_slip_under_the_max(self):
+        self.ticket("05-export", "Widget export")
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write("\n[limits]\nmax_workers = 1\n")
+        codes = []
+
+        def start_05():
+            out = io.StringIO()
+            codes.append(afk.main(["start", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out))
+
+        other = threading.Thread(target=start_05)
+
+        def other_start_arrives_mid_setup(cmd):
+            if not other.is_alive() and not codes:
+                other.start()
+                other.join(timeout=0.2)  # without a lock it passes the check now, before 03 is recorded
+            return ""
+
+        self.run_fake.responses[("git", "-C")] = other_start_arrives_mid_setup
+        self.afk("start", "03")
+        other.join()
+
+        self.assertEqual(codes, [1])
+        self.assertFalse((self.project_dir / "workers" / "05").exists())
+
     def settings(self):
         self.afk("start", "03")
         launch = self.launch_command()

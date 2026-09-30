@@ -70,49 +70,51 @@ class Afk:
         pdir = self.project_dir(project)
         worktree = pdir / "worktrees" / ticket.id
         worker_dir = pdir / "workers" / ticket.id
-        if worker_dir.exists():
-            raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
-        max_workers = {**LIMITS, **config.get("limits", {})}["max_workers"]
-        # Workers in review are parked on the human, so they don't count.
-        active = [s for s in map(read_json, (pdir / "workers").glob("*/status.json")) if s["phase"] != "review"]
-        if len(active) >= max_workers:
-            raise SystemExit(f"afk: {len(active)} workers already active (max_workers = {max_workers}); see `afk status`")
-        branch = f"afk/{project}-{ticket.id}"
-        undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
-        try:
-            worker_dir.mkdir(parents=True, exist_ok=True)
-            self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree)])
-            undo.append(lambda: self.run(["git", "-C", config["repo"], "branch", "-D", branch]))
-            undo.append(lambda: self.run(["git", "-C", config["repo"], "worktree", "remove", "--force", str(worktree)]))
+        # One start at a time per project, so concurrent starts can't both slip under max_workers.
+        with locked(pdir):
+            if worker_dir.exists():
+                raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
+            max_workers = {**LIMITS, **config.get("limits", {})}["max_workers"]
+            # Workers in review are parked on the human, so they don't count.
+            active = [s for s in map(read_json, (pdir / "workers").glob("*/status.json")) if s["phase"] != "review"]
+            if len(active) >= max_workers:
+                raise SystemExit(f"afk: {len(active)} workers already active (max_workers = {max_workers}); see `afk status`")
+            branch = f"afk/{project}-{ticket.id}"
+            undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
+            try:
+                worker_dir.mkdir(parents=True, exist_ok=True)
+                self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree)])
+                undo.append(lambda: self.run(["git", "-C", config["repo"], "branch", "-D", branch]))
+                undo.append(lambda: self.run(["git", "-C", config["repo"], "worktree", "remove", "--force", str(worktree)]))
 
-            pane = self.run(
-                ["tmux", "new-window", "-d", "-t", config["session"] + ":", "-n", window_name(ticket),
-                 "-c", str(worktree), "-P", "-F", "#{pane_id}"]
-            ).strip()
-            undo.append(lambda: self.run(["tmux", "kill-window", "-t", pane]))
-            self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree)])
+                pane = self.run(
+                    ["tmux", "new-window", "-d", "-t", config["session"] + ":", "-n", window_name(ticket),
+                     "-c", str(worktree), "-P", "-F", "#{pane_id}"]
+                ).strip()
+                undo.append(lambda: self.run(["tmux", "kill-window", "-t", pane]))
+                self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree)])
 
-            settings = worker_dir / "settings.json"
-            settings.write_text(json.dumps(worker_settings(config.get("base", "main")), indent=2) + "\n")
-            launch = [
-                "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}",
-                "claude", "--permission-mode", "auto", "--settings", str(settings),
-                self.phase_prompt(ticket.id, "implement"),
-            ]
-            write_json(
-                worker_dir / "status.json",
-                {"ticket": ticket.id, "phase": "implement", "state": "working", "message": "",
-                 "pane": pane, "window": window_name(ticket), "phase_started_at": self.clock()},
-            )
-            self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
-        except BaseException:
-            # Roll back, even on Ctrl-C, so a plain retry of `afk start` works.
-            for step in reversed(undo):
-                try:
-                    step()
-                except Exception:
-                    pass
-            raise
+                settings = worker_dir / "settings.json"
+                settings.write_text(json.dumps(worker_settings(config.get("base", "main")), indent=2) + "\n")
+                launch = [
+                    "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}",
+                    "claude", "--permission-mode", "auto", "--settings", str(settings),
+                    self.phase_prompt(ticket.id, "implement"),
+                ]
+                write_json(
+                    worker_dir / "status.json",
+                    {"ticket": ticket.id, "phase": "implement", "state": "working", "message": "",
+                     "pane": pane, "window": window_name(ticket), "phase_started_at": self.clock()},
+                )
+                self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
+            except BaseException:
+                # Roll back, even on Ctrl-C, so a plain retry of `afk start` works.
+                for step in reversed(undo):
+                    try:
+                        step()
+                    except Exception:
+                        pass
+                raise
         self.out(f"started {ticket.id} in {worktree} on {branch}")
 
     def cmd_report(self, state, message=""):
