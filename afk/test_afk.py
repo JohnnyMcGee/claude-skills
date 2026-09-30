@@ -1767,6 +1767,14 @@ class SplitTest(AfkTestCase):
         self.ticket("01-schema", "Widget schema")  # reopening the original's blocker blocks every part again
         self.assertEqual(self.afk("frontier").splitlines(), ["01  Widget schema", "03  Widget UI"])
 
+    def test_split_into_no_parts_fails_and_keeps_the_ticket(self):
+        out = io.StringIO()
+        code = afk.main(["split", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO("[]"), stdout=out)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("non-empty", out.getvalue())
+        self.assertEqual(self.afk("frontier").splitlines(), ["03  Widget UI", "05  Widget export"])
+
     def test_tickets_blocked_by_the_split_ticket_wait_for_every_part(self):
         self.ticket("04-report", "Widget report", blocked_by="03, 05")
         self.ticket("03-ui", "Widget UI", status="done")
