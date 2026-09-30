@@ -4,6 +4,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+import threading
 import tomllib
 import unittest
 from pathlib import Path
@@ -632,6 +633,22 @@ class WatchTest(AfkTestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("can't find pane: %5", out.getvalue())
         self.assertEqual((self.phase("03"), self.phase("05")), ("implement", "verify"))
+
+    def test_a_report_arriving_while_the_tick_prompts_that_worker_is_not_lost(self):
+        self.report("done", "Implemented")
+        self.stop()
+        reporter = threading.Thread(target=self.report, args=("question", "Which database?"))
+
+        def worker_reports_mid_paste(cmd):
+            reporter.start()
+            reporter.join(timeout=0.2)  # without a lock it lands now, and the tick's write would clobber it
+            return ""
+
+        self.run_fake.responses[("tmux", "paste-buffer")] = worker_reports_mid_paste
+        self.afk("tick")
+        reporter.join()
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("verify", "question"))
 
 
 if __name__ == "__main__":
