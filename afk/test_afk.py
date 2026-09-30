@@ -762,7 +762,8 @@ class StartTest(AfkTestCase):
     def test_settings_wire_status_hooks_to_afk_hook(self):
         hooks = self.settings()["hooks"]
 
-        for event, arg in [("SessionStart", "session-start"), ("Stop", "stop"), ("Notification", "notification")]:
+        for event, arg in [("SessionStart", "session-start"), ("PreToolUse", "activity"), ("Stop", "stop"),
+                           ("Notification", "notification")]:
             command = shlex.split(hooks[event][0]["hooks"][0]["command"])
             self.assertEqual(command[-2:], ["hook", arg])
             self.assertTrue(os.access(command[0], os.X_OK), command[0])
@@ -1404,6 +1405,11 @@ class WatchTest(AfkTestCase):
     def stop(self, ticket="03"):
         payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "Stop"}
         self.afk("hook", "stop", stdin=json.dumps(payload), env=self.worker_env(ticket))
+
+    def resume(self, ticket="03"):
+        """The stopped worker's session takes up a tool again, as when a background task it waited on lands."""
+        payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "PreToolUse"}
+        self.afk("hook", "activity", stdin=json.dumps(payload), env=self.worker_env(ticket))
 
     def transcript(self, ticket="03"):
         return self.tmp / f"{ticket}.jsonl"
@@ -2083,6 +2089,29 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
         self.assertIn("AFK phase: review", self.prompts_sent()[-1])
+
+    def test_a_worker_that_resumed_and_labelled_its_pr_is_not_prompted_until_it_stops_again(self):
+        # /open-pr stopped to wait on reviewers, resumed when they posted, and labelled the PR Ready before reporting.
+        self.reach_pr()
+        self.github("OPEN")
+        self.stop()
+        self.now += 60
+        self.afk("tick")
+        self.resume()
+        self.github("OPEN", ready=True)
+        self.now += 60
+        prompts = len(self.prompts_sent())
+
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("pr", "working"))
+        self.assertEqual(len(self.prompts_sent()), prompts)
+
+        self.stop()
+        self.now += 60
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
 
     def test_a_worker_still_running_open_pr_stays_in_pr_while_its_pr_is_open(self):
         self.reach_pr()

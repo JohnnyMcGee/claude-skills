@@ -352,6 +352,10 @@ class Afk:
                 # Not a stall by itself: a worker ends its turn to wait on a background task (a review subagent,
                 # CI checks) and resumes when it lands. The idle limit catches a worker that never resumes.
                 changes["idle"] = True
+            elif event == "activity":
+                # About to use a tool, so no longer stopped: it resumed, say when a background task it waited on
+                # landed. Nothing may be pasted into it until it stops again.
+                changes["idle"] = False
             return changes
 
         self.update_status(changes)
@@ -1089,6 +1093,7 @@ def worker_settings(base):
         },
         "hooks": {
             "SessionStart": hook("session-start"),
+            "PreToolUse": hook("activity"),
             "Stop": hook("stop"),
             "Notification": hook("notification"),
         },
