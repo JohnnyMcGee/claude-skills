@@ -38,6 +38,11 @@ class FakeRun:
         return [c for c in self.calls if tuple(c[: len(prefix)]) == prefix]
 
 
+def pr_view(state, url="https://github.com/acme/widgets/pull/42"):
+    """What `gh pr view <branch> --json state,url` prints for a PR in `state`."""
+    return json.dumps({"state": state, "url": url})
+
+
 class AfkTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -55,6 +60,7 @@ class AfkTestCase(unittest.TestCase):
                 ("git", "-C"): "",
                 ("tmux", "new-window"): "%5\n",
                 ("tmux", "display-message", "-p", "-t"): "claude\n",  # the pane's foreground command
+                ("gh", "pr", "view"): pr_view("OPEN"),  # the worker's branch has an open PR
             }
         )
         self.env = {"XDG_STATE_HOME": str(self.state_home), "HOME": str(self.tmp)}
@@ -1352,6 +1358,13 @@ class WatchTest(AfkTestCase):
         self.assertIn("03", notification)
         self.assertIn("https://github.com/acme/widgets/pull/42", notification)
 
+    def test_a_done_report_without_a_url_reaches_review_with_the_url_found_by_branch(self):
+        self.reach_review(pr="Checks green, no conflicts")
+
+        [notification] = self.desktop_notifications()
+        self.assertIn("https://github.com/acme/widgets/pull/42", notification)
+        self.assertEqual(self.status()["pr"], "https://github.com/acme/widgets/pull/42")
+
     def test_done_after_review_feedback_stays_in_review_and_notifies(self):
         self.reach_review()
         prompts = len(self.prompts_sent())
@@ -1671,14 +1684,27 @@ class WatchTest(AfkTestCase):
     def pr_polls(self):
         return self.run_fake.find("gh", "pr", "view")
 
-    def test_an_open_pr_in_review_is_polled_with_gh_and_stays_in_review(self):
-        self.reach_review()
-        self.run_fake.responses[("gh", "pr", "view")] = "OPEN\n"
+    def github(self, state, ticket="03", url="https://github.com/acme/widgets/pull/42"):
+        """GitHub has a PR in `state` for the worker's branch, or none at all for state None."""
+        def view(cmd):
+            if state is None:
+                raise subprocess.CalledProcessError(1, cmd, stderr=f'no pull requests found for branch "afk/widgets-{ticket}"')
+            return pr_view(state, url)
+
+        self.run_fake.responses[("gh", "pr", "view", f"afk/widgets-{ticket}")] = view
+
+    def test_a_review_workers_pr_is_found_by_its_branch_and_its_url_recorded(self):
+        self.reach_review(pr="Opened the PR")
+        self.github("OPEN")
+        self.now += 60
 
         self.afk("tick")
 
-        self.assertEqual(self.pr_polls(), [["gh", "pr", "view", "https://github.com/acme/widgets/pull/42", "--json", "state", "-q", ".state"]])
+        poll = self.pr_polls()[-1]
+        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-03", "--json", "state,url"])
+        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], str(self.project_dir / "worktrees" / "03"))
         self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+        self.assertEqual(self.status()["pr"], "https://github.com/acme/widgets/pull/42")
 
     def test_a_pr_is_polled_at_most_once_a_minute(self):
         self.reach_review()
@@ -1695,7 +1721,7 @@ class WatchTest(AfkTestCase):
     def merge(self, shell="bash", worktree_status=""):
         """GitHub reports the PR merged; the shell pane runs `shell` and the worktree has `worktree_status` changes."""
         worktree = str(self.project_dir / "worktrees" / "03")
-        self.run_fake.responses[("gh", "pr", "view")] = "MERGED\n"
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("MERGED")
         self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = shell + "\n"
         self.run_fake.responses[("git", "-C", worktree, "status")] = worktree_status
         self.now += 60
@@ -1788,6 +1814,66 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
         self.assertEqual(self.afk("status").splitlines()[1:], [])
+
+    def reach_pr(self):
+        for message in ["Implemented", "Verified", "Checks pass"]:
+            self.finish_phase(message)
+
+    def test_a_blocked_worker_whose_pr_the_human_opened_and_merged_is_cleaned_up(self):
+        self.reach_pr()
+        self.report("blocked", "Couldn't run /open-pr")
+        self.stop()
+        self.afk("tick")
+        self.merge()
+
+        self.afk("tick")
+
+        self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
+        self.assertIn("03 merged", self.desktop_notifications()[-1])
+
+    def test_a_blocked_worker_whose_pr_the_human_opened_moves_to_review_with_its_prompt(self):
+        self.reach_pr()
+        self.github(None)
+        self.report("blocked", "Couldn't run /open-pr")
+        self.stop()
+        self.afk("tick")
+        self.github("OPEN")
+        self.now += 60
+
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+        self.assertIn("AFK phase: review", self.prompts_sent()[-1])
+        self.assertIn("03 PR ready for review: https://github.com/acme/widgets/pull/42", self.desktop_notifications()[-1])
+
+    def test_a_worker_still_running_open_pr_stays_in_pr_while_its_pr_is_open(self):
+        self.reach_pr()
+        self.github("OPEN")
+        self.now += 60
+
+        self.afk("tick")
+
+        self.assertEqual(len(self.pr_polls()), 1)
+        self.assertEqual((self.phase(), self.status()["state"]), ("pr", "working"))
+
+    def test_a_review_worker_whose_branch_has_no_pr_needs_attention_until_one_is_found(self):
+        self.reach_review()
+        self.github(None)
+
+        for _ in range(2):
+            self.now += 60
+            self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "attention"))
+        self.assertEqual(len(self.desktop_notifications()), 2)  # PR ready, then no PR found
+        self.assertIn("03 needs attention: no PR found", self.desktop_notifications()[-1])
+
+        self.github("OPEN")
+        self.now += 60
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+        self.assertEqual(len(self.desktop_notifications()), 2)
 
     def test_cleaning_up_a_merged_worker_prompts_for_the_next_batch(self):
         self.reach_review()
@@ -1893,14 +1979,14 @@ class WatchTest(AfkTestCase):
     def test_a_merged_hitl_pr_is_found_by_its_branch_and_cleaned_up_once_safe(self):
         self.start_hitl()
         worktree = str(self.project_dir / "worktrees" / "04")
-        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-04")] = "MERGED\n"
+        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-04")] = pr_view("MERGED")
         self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%8")] = "vim\n"
         self.run_fake.responses[("git", "-C", worktree, "status")] = ""
 
         self.afk("tick")
 
         [poll] = self.pr_polls()
-        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-04", "--json", "state", "-q", ".state"])
+        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-04", "--json", "state,url"])
         self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], worktree)
         self.assertEqual(self.status("04")["state"], "cleanup-pending")
         self.assertIn("04 merged; cleanup pending", self.desktop_notifications()[-1])
@@ -2275,7 +2361,7 @@ class ApprovedStartTest(AfkTestCase):
         self.add_api_repo()
         self.run_fake.responses[("tmux", "split-window")] = "%9\n"
         self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%9")] = "bash\n"
-        self.run_fake.responses[("gh", "pr", "view")] = "MERGED\n"
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("MERGED")
         self.afk("start", "05", "--repo", "acme/api")
         worker = {"AFK_PROJECT": "widgets", "AFK_TICKET": "05"}
         for message in ["Implemented", "Verified", "Checks pass", "https://github.com/acme/api/pull/7"]:

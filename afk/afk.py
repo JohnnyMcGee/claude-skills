@@ -353,15 +353,16 @@ class Afk:
                 given = dict(may_verify=verify.may_start(before), limits=limits,
                              last_activity=last_write(before.get("transcript_path")))
                 try:
-                    pr_state = None
-                    if before["phase"] in ("review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
-                        pr_state = self.pr_state(before)
+                    pr_state = pr_url = None
+                    if before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
+                        pr_state, pr_url = self.pr_state(before)
+                    given.update(pr_state=pr_state, pr_url=pr_url)
                     merged = pr_state == "MERGED" or before["state"] == "cleanup-pending"
                     blocker = self.cleanup_blocker(before) if merged else None
-                    status, effects = tick(path.parent.name, before, now, pr_state=pr_state, cleanup_blocker=blocker, **given)
+                    status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
                     if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
                         # Pasting into a bare shell would run the prompt's markdown as commands.
-                        status, effects = tick(path.parent.name, before, now, agent_running=False, pr_state=pr_state, **given)
+                        status, effects = tick(path.parent.name, before, now, agent_running=False, **given)
                     for effect in effects:
                         self.perform(*effect)
                 except subprocess.CalledProcessError as error:
@@ -481,20 +482,19 @@ class Afk:
         return prompt
 
     def pr_state(self, status):
-        """GitHub's state for the worker's PR: OPEN, CLOSED or MERGED. afk only ever reads PRs; merging is the human's call.
+        """GitHub's state for the worker's PR, OPEN, CLOSED, MERGED or NONE, and its URL (None when there's no PR).
 
-        A hitl worker's PR is the human's and never reported, so it is looked up by the worker's branch: NONE until
-        the human opens one.
+        afk only ever reads PRs; merging is the human's call. Whoever opened the PR, the worker or the human, it is
+        found by the worker's branch, so afk never depends on a URL being reported.
         """
-        if status["phase"] == "hitl":
-            branch = f"afk/{self.current_project()}-{status['ticket']}"
-            try:
-                return self.run(["gh", "pr", "view", branch, "--json", "state", "-q", ".state"], cwd=self.worktree(status["ticket"])).strip()
-            except subprocess.CalledProcessError as error:
-                if "no pull requests found" not in (error.stderr or ""):
-                    raise
-                return "NONE"
-        return self.run(["gh", "pr", "view", status["pr"], "--json", "state", "-q", ".state"]).strip()
+        branch = f"afk/{self.current_project()}-{status['ticket']}"
+        try:
+            pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url"], cwd=self.worktree(status["ticket"])))
+        except subprocess.CalledProcessError as error:
+            if "no pull requests found" not in (error.stderr or ""):
+                raise
+            return "NONE", None
+        return pr["state"], pr["url"]
 
     def agent_running(self, pane):
         return self.pane_command(pane) == "claude"
@@ -591,6 +591,7 @@ LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops"
 PHASES = ("implement", "verify", "prepr", "pr", "review")
 
 PR_POLL_SECONDS = 60
+NO_PR = "no PR found for its branch"
 
 # A shell pane running one of these at its prompt is idle, so closing it loses nothing.
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh"}
@@ -619,12 +620,12 @@ WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "stuck": "!",
 
 
 def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None,
-         pr_state=None, cleanup_blocker=None):
+         pr_state=None, pr_url=None, cleanup_blocker=None):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
-    pr_state is GitHub's state for the worker's PR when this tick polled it, else None.
+    pr_state is GitHub's state for the worker's PR when this tick polled it, else None; pr_url is the PR's URL, if any.
     cleanup_blocker, for a merged PR, says why cleaning up now could lose the human's work.
     A status of None out means the worker is cleaned up and gone.
     """
@@ -636,6 +637,8 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
         ]
     if pr_state is not None:
         status = {**status, "pr_polled_at": now}
+    if pr_url:
+        status = {**status, "pr": pr_url}
     if merged:
         # Checked again every tick, but the human hears about it once.
         effects = [] if status["state"] == "cleanup-pending" else [("notify", f"{ticket} merged; cleanup pending: {cleanup_blocker}")]
@@ -645,7 +648,7 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
         status, effects = {**status, "state": "yours"}, []
     else:
         limits = {**LIMITS, **(limits or {})}
-        status, effects = advance(ticket, status, now, agent_running, may_verify, limits)
+        status, effects = advance(ticket, status, now, agent_running, may_verify, limits, pr_state)
         if not effects:
             status, effects = enforce(ticket, status, now, limits, last_activity)
     if status["state"] != status.get("shown"):
@@ -654,8 +657,20 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
     return status, effects
 
 
-def advance(ticket, status, now, agent_running, may_verify, limits):
+def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=None):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
+    if phase == "pr" and pr_state == "OPEN" and state in ("blocked", "attention", "stuck"):
+        # The worker stopped short but its branch has a PR, most likely opened by the human: it's up for review.
+        effects = [("prompt", ticket, status["pane"], "review")] if agent_running else []
+        return enter_review(ticket, status, now, effects)
+    if phase == "review":
+        # Only this attention clears itself: any other still needs the human to look.
+        missing = state == "attention" and message == NO_PR
+        if pr_state == "NONE" and not missing:
+            status = {**status, "state": "attention", "message": NO_PR, "notified": status.get("reports")}
+            return status, [("notify", f"{ticket} needs attention: {NO_PR}")]
+        if pr_state == "OPEN" and missing:
+            return {**status, "state": "review", "message": ""}, []
     if state == "queued" and may_verify:
         state = "done"  # its turn to verify: advance as if it had just finished
     if state == "done" and status.get("idle") and not agent_running:
@@ -676,17 +691,21 @@ def advance(ticket, status, now, agent_running, may_verify, limits):
         if phase == "verify" and not may_verify:
             # Stays in its finished phase, so if it needs attention while queued, done still leads to verify.
             return {**status, "state": "queued", "queued_at": now}, []
-        status = {**status, "phase": phase, "state": "working", "message": "", "idle": False, "phase_started_at": now}
         effects = [("prompt", ticket, status["pane"], phase)]
         if phase == "review":
-            pr = re.search(r"https?://\S+", message)
-            status = {**status, "state": "review", "pr": pr.group(0) if pr else message}
-            effects.append(("notify", f"{ticket} PR ready for review: {status['pr']}"))
-        return status, effects
+            return enter_review(ticket, status, now, effects)
+        return {**status, "phase": phase, "state": "working", "message": "", "idle": False, "phase_started_at": now}, effects
     if state in ("question", "blocked", "attention") and status.get("reports") != status.get("notified"):
         label = "needs attention" if state == "attention" else state
         return {**status, "notified": status.get("reports")}, [("notify", f"{ticket} {label}: {message}")]
     return status, []
+
+
+def enter_review(ticket, status, now, effects):
+    # The PR's URL is whatever the last poll found by branch, never taken from a report.
+    status = {**status, "phase": "review", "state": "review", "message": "", "idle": False, "phase_started_at": now}
+    pr = status.get("pr")
+    return status, effects + [("notify", f"{ticket} PR ready for review" + (f": {pr}" if pr else ""))]
 
 
 def enforce(ticket, status, now, limits, last_activity):
