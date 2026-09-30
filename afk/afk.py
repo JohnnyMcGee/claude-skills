@@ -349,10 +349,13 @@ class Afk:
                 last_event=payload.get("hook_event_name", event),
             )
             if event == "stop":
+                # Not a stall by itself: a worker ends its turn to wait on a background task (a review subagent,
+                # CI checks) and resumes when it lands. The idle limit catches a worker that never resumes.
                 changes["idle"] = True
-                if status["state"] == "working":
-                    # Stopped without reporting since its last phase prompt: a silent stall.
-                    changes.update(state="attention", message="stopped without reporting", reports=status.get("reports", 0) + 1)
+            elif event == "activity":
+                # About to use a tool, so no longer stopped: it resumed, say when a background task it waited on
+                # landed. Nothing may be pasted into it until it stops again.
+                changes["idle"] = False
             return changes
 
         self.update_status(changes)
@@ -394,9 +397,10 @@ class Afk:
                              last_activity=last_write(before.get("transcript_path")))
                 try:
                     pr_state = pr_url = None
+                    pr_ready = False
                     if before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
-                        pr_state, pr_url = self.pr_state(before)
-                    given.update(pr_state=pr_state, pr_url=pr_url)
+                        pr_state, pr_url, pr_ready = self.pr_state(before)
+                    given.update(pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready)
                     merged = pr_state == "MERGED" or before["state"] == "cleanup-pending"
                     blocker = self.cleanup_blocker(before) if merged else None
                     status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
@@ -522,19 +526,20 @@ class Afk:
         return prompt
 
     def pr_state(self, status):
-        """GitHub's state for the worker's PR, OPEN, CLOSED, MERGED or NONE, and its URL (None when there's no PR).
+        """GitHub's state for the worker's PR, OPEN, CLOSED, MERGED or NONE, its URL (None when there's no PR), and
+        whether it carries /open-pr's READY_LABEL.
 
         afk only ever reads PRs; merging is the human's call. Whoever opened the PR, the worker or the human, it is
         found by the worker's branch, so afk never depends on a URL being reported.
         """
         branch = f"afk/{self.current_project()}-{status['ticket']}"
         try:
-            pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url"], cwd=self.worktree(status["ticket"])))
+            pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url,labels"], cwd=self.worktree(status["ticket"])))
         except subprocess.CalledProcessError as error:
             if "no pull requests found" not in (error.stderr or ""):
                 raise
-            return "NONE", None
-        return pr["state"], pr["url"]
+            return "NONE", None, False
+        return pr["state"], pr["url"], any(label["name"] == READY_LABEL for label in pr.get("labels", []))
 
     def agent_running(self, pane):
         return self.pane_command(pane) == "claude"
@@ -632,6 +637,9 @@ PHASES = ("implement", "verify", "prepr", "pr", "review")
 
 PR_POLL_SECONDS = 60
 NO_PR = "no PR found for its branch"
+NO_REPORT = "stopped without reporting"
+# /open-pr adds this label only once the PR's automated gates are clear.
+READY_LABEL = "Ready for Review"
 
 # A shell pane running one of these at its prompt is idle, so closing it loses nothing.
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh"}
@@ -660,12 +668,13 @@ WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "stuck": "!",
 
 
 def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None,
-         pr_state=None, pr_url=None, cleanup_blocker=None):
+         pr_state=None, pr_url=None, pr_ready=False, cleanup_blocker=None):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
     pr_state is GitHub's state for the worker's PR when this tick polled it, else None; pr_url is the PR's URL, if any.
+    pr_ready says the polled PR carries READY_LABEL.
     cleanup_blocker, for a merged PR, says why cleaning up now could lose the human's work.
     A status of None out means the worker is cleaned up and gone.
     """
@@ -688,7 +697,7 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
         status, effects = {**status, "state": "yours"}, []
     else:
         limits = {**LIMITS, **(limits or {})}
-        status, effects = advance(ticket, status, now, agent_running, may_verify, limits, pr_state)
+        status, effects = advance(ticket, status, now, agent_running, may_verify, limits, pr_state, pr_ready)
         if not effects:
             status, effects = enforce(ticket, status, now, limits, last_activity)
     if status["state"] != status.get("shown"):
@@ -697,11 +706,13 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
     return status, effects
 
 
-def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=None):
+def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=None, pr_ready=False):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
-    if phase == "pr" and pr_state == "OPEN" and state in ("blocked", "attention", "stuck") and status.get("idle"):
-        # The worker stopped short but its branch has a PR, most likely opened by the human: it's up for review.
-        # Like any phase prompt, the review prompt waits until the worker's session has stopped.
+    if phase == "pr" and pr_state == "OPEN" and pr_ready and state in ("working", "blocked", "attention", "stuck") and status.get("idle"):
+        # The worker stopped without reporting done, but its PR carries the label /open-pr adds once the gates are
+        # clear, whoever cleared them: it's up for review. An open PR alone isn't enough, since /open-pr stops
+        # between turns while it waits on checks and reviewers. Like any phase prompt, the review prompt waits
+        # until the worker's session has stopped.
         effects = [("prompt", ticket, status["pane"], "review")] if agent_running else []
         return enter_review(ticket, status, now, effects)
     if phase == "review":
@@ -751,7 +762,8 @@ def enter_review(ticket, status, now, effects):
 
 
 def enforce(ticket, status, now, limits, last_activity):
-    """Trip a runaway limit: interrupt the worker, mark it stuck and notify. Never kill it.
+    """Trip a runaway limit: interrupt the worker, mark it stuck and notify. Never kill it. A worker that stopped
+    without reporting and stayed quiet is instead marked attention, with nothing to interrupt.
 
     last_activity is when the worker's session last wrote anything; a phase prompt counts as activity.
     """
@@ -761,12 +773,21 @@ def enforce(ticket, status, now, limits, last_activity):
     tripped = status.get("tripped") == status["phase_started_at"]
     if not running or tripped or status["phase"] == "review":
         return status, []
-    reason = None
+    quiet = now - max(last_activity or 0, status["phase_started_at"]) > limits["idle_minutes"] * 60
+    if status["state"] == "working" and status.get("idle"):
+        # It stopped without reporting, likely to wait on a background task, so only the idle limit applies: once
+        # nothing has woken it for that long, it's a silent stall. It's already stopped, so there is nothing to
+        # interrupt.
+        if not quiet:
+            return status, []
+        reports = status.get("reports", 0) + 1
+        status = {**status, "state": "attention", "message": NO_REPORT, "reports": reports, "notified": reports}
+        return status, [("notify", f"{ticket} needs attention: {NO_REPORT}")]
     if now - status["phase_started_at"] > limits["phase_minutes"] * 60:
         reason = f"over {limits['phase_minutes']}m in {status['phase']}"
-    elif now - max(last_activity or 0, status["phase_started_at"]) > limits["idle_minutes"] * 60:
+    elif quiet:
         reason = f"idle for over {limits['idle_minutes']}m"
-    if reason is None:
+    else:
         return status, []
     status = {**status, "state": "stuck", "message": reason, "tripped": status["phase_started_at"]}
     return status, [("interrupt", status["pane"]), ("notify", f"{ticket} stuck: {reason}")]
@@ -1075,6 +1096,7 @@ def worker_settings(base):
         },
         "hooks": {
             "SessionStart": hook("session-start"),
+            "PreToolUse": hook("activity"),
             "Stop": hook("stop"),
             "Notification": hook("notification"),
         },

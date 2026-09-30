@@ -38,9 +38,10 @@ class FakeRun:
         return [c for c in self.calls if tuple(c[: len(prefix)]) == prefix]
 
 
-def pr_view(state, url="https://github.com/acme/widgets/pull/42"):
-    """What `gh pr view <branch> --json state,url` prints for a PR in `state`."""
-    return json.dumps({"state": state, "url": url})
+def pr_view(state, url="https://github.com/acme/widgets/pull/42", ready=False):
+    """What `gh pr view <branch> --json state,url,labels` prints for a PR in `state`, labelled by /open-pr if ready."""
+    labels = [{"name": "Ready for Review"}] if ready else []
+    return json.dumps({"state": state, "url": url, "labels": labels})
 
 
 class AfkTestCase(unittest.TestCase):
@@ -761,7 +762,8 @@ class StartTest(AfkTestCase):
     def test_settings_wire_status_hooks_to_afk_hook(self):
         hooks = self.settings()["hooks"]
 
-        for event, arg in [("SessionStart", "session-start"), ("Stop", "stop"), ("Notification", "notification")]:
+        for event, arg in [("SessionStart", "session-start"), ("PreToolUse", "activity"), ("Stop", "stop"),
+                           ("Notification", "notification")]:
             command = shlex.split(hooks[event][0]["hooks"][0]["command"])
             self.assertEqual(command[-2:], ["hook", arg])
             self.assertTrue(os.access(command[0], os.X_OK), command[0])
@@ -1404,6 +1406,11 @@ class WatchTest(AfkTestCase):
         payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "Stop"}
         self.afk("hook", "stop", stdin=json.dumps(payload), env=self.worker_env(ticket))
 
+    def resume(self, ticket="03"):
+        """The stopped worker's session takes up a tool again, as when a background task it waited on lands."""
+        payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "PreToolUse"}
+        self.afk("hook", "activity", stdin=json.dumps(payload), env=self.worker_env(ticket))
+
     def transcript(self, ticket="03"):
         return self.tmp / f"{ticket}.jsonl"
 
@@ -1537,8 +1544,13 @@ class WatchTest(AfkTestCase):
         self.assertEqual(len(self.desktop_notifications()), 2)
         self.assertIn("Renamed the endpoint as asked", self.desktop_notifications()[-1])
 
-    def test_stop_without_a_report_needs_attention_and_notifies_once(self):
-        self.stop()
+    def stall(self, ticket="03"):
+        """The worker stops without reporting, and nothing wakes it again for longer than the idle limit."""
+        self.stop(ticket)
+        self.now += (afk.LIMITS["idle_minutes"] + 1) * 60
+
+    def test_stop_without_a_report_that_stays_quiet_past_the_idle_limit_needs_attention_and_notifies_once(self):
+        self.stall()
 
         self.afk("tick")
         self.afk("tick")
@@ -1551,10 +1563,27 @@ class WatchTest(AfkTestCase):
     def test_stop_without_a_report_after_a_new_phase_prompt_needs_attention(self):
         self.finish_phase()
 
-        self.stop()
+        self.stall()
         self.afk("tick")
 
         self.assertEqual((self.phase(), self.status()["state"]), ("verify", "attention"))
+
+    def test_a_worker_that_stops_to_wait_on_a_background_task_keeps_working(self):
+        # prepr ends its turn while its code-review subagent runs, and resumes when the review lands.
+        self.finish_phase("Implemented")
+        self.finish_phase("Verified")
+        notifications = len(self.desktop_notifications())
+        self.stop()
+        self.afk("tick")
+        self.now += (afk.LIMITS["idle_minutes"] - 1) * 60
+        self.active()
+        self.now += (afk.LIMITS["idle_minutes"] - 1) * 60
+
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("prepr", "working"))
+        self.assertEqual(len(self.desktop_notifications()), notifications)
+        self.assertEqual(self.interrupts(), [])
 
     def test_standing_by_in_review_does_not_need_attention(self):
         self.reach_review()
@@ -1617,7 +1646,7 @@ class WatchTest(AfkTestCase):
         self.finish_phase()
         self.assertEqual(self.window(), ("03-widget-ui", "working"))
 
-        self.stop()
+        self.stall()
         self.afk("tick")
         self.assertEqual(self.window(), ("03-widget-ui!", "attention"))
 
@@ -1844,12 +1873,12 @@ class WatchTest(AfkTestCase):
     def pr_polls(self):
         return self.run_fake.find("gh", "pr", "view")
 
-    def github(self, state, ticket="03", url="https://github.com/acme/widgets/pull/42"):
+    def github(self, state, ticket="03", url="https://github.com/acme/widgets/pull/42", ready=False):
         """GitHub has a PR in `state` for the worker's branch, or none at all for state None."""
         def view(cmd):
             if state is None:
                 raise subprocess.CalledProcessError(1, cmd, stderr=f'no pull requests found for branch "afk/widgets-{ticket}"')
-            return pr_view(state, url)
+            return pr_view(state, url, ready)
 
         self.run_fake.responses[("gh", "pr", "view", f"afk/widgets-{ticket}")] = view
 
@@ -1861,7 +1890,7 @@ class WatchTest(AfkTestCase):
         self.afk("tick")
 
         poll = self.pr_polls()[-1]
-        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-03", "--json", "state,url"])
+        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-03", "--json", "state,url,labels"])
         self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], str(self.project_dir / "worktrees" / "03"))
         self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
         self.assertEqual(self.status()["pr"], "https://github.com/acme/widgets/pull/42")
@@ -1991,13 +2020,13 @@ class WatchTest(AfkTestCase):
         self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
         self.assertIn("03 merged", self.desktop_notifications()[-1])
 
-    def test_a_blocked_worker_whose_pr_the_human_opened_moves_to_review_with_its_prompt(self):
+    def test_a_blocked_worker_whose_pr_the_human_made_ready_moves_to_review_with_its_prompt(self):
         self.reach_pr()
         self.github(None)
         self.report("blocked", "Couldn't run /open-pr")
         self.stop()
         self.afk("tick")
-        self.github("OPEN")
+        self.github("OPEN", ready=True)
         self.now += 60
 
         self.afk("tick")
@@ -2006,8 +2035,21 @@ class WatchTest(AfkTestCase):
         self.assertIn("AFK phase: review", self.prompts_sent()[-1])
         self.assertIn("03 PR ready for review: https://github.com/acme/widgets/pull/42", self.desktop_notifications()[-1])
 
+    def test_a_blocked_worker_whose_pr_is_open_but_not_ready_stays_blocked(self):
+        self.reach_pr()
+        self.github("OPEN")
+        self.report("blocked", "A check fails on base too")
+        self.stop()
+        self.now += 60
+
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("pr", "blocked"))
+        self.assertNotIn("AFK phase: review", self.prompts_sent()[-1])
+
     def test_a_worker_that_reported_blocked_but_has_not_stopped_is_not_prompted_until_it_stops(self):
         self.reach_pr()
+        self.github("OPEN", ready=True)
         self.report("blocked", "Couldn't run /open-pr")
         self.now += 60
         prompts = len(self.prompts_sent())
@@ -2015,6 +2057,54 @@ class WatchTest(AfkTestCase):
         self.afk("tick")
 
         self.assertEqual((self.phase(), self.status()["state"]), ("pr", "blocked"))
+        self.assertEqual(len(self.prompts_sent()), prompts)
+
+        self.stop()
+        self.now += 60
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+
+    def test_a_worker_waiting_between_open_pr_turns_stays_in_pr_without_needing_attention(self):
+        # /open-pr opened the PR, armed its monitors and ended its turn to wait on checks and reviewers.
+        self.reach_pr()
+        self.github("OPEN")
+        notifications = len(self.desktop_notifications())
+        self.stop()
+        self.now += 60
+
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("pr", "working"))
+        self.assertNotIn("AFK phase: review", self.prompts_sent()[-1])
+        self.assertEqual(len(self.desktop_notifications()), notifications)
+
+    def test_a_worker_that_stops_once_open_pr_labelled_its_pr_ready_moves_to_review(self):
+        self.reach_pr()
+        self.github("OPEN", ready=True)
+        self.stop()
+        self.now += 60
+
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+        self.assertIn("AFK phase: review", self.prompts_sent()[-1])
+
+    def test_a_worker_that_resumed_and_labelled_its_pr_is_not_prompted_until_it_stops_again(self):
+        # /open-pr stopped to wait on reviewers, resumed when they posted, and labelled the PR Ready before reporting.
+        self.reach_pr()
+        self.github("OPEN")
+        self.stop()
+        self.now += 60
+        self.afk("tick")
+        self.resume()
+        self.github("OPEN", ready=True)
+        self.now += 60
+        prompts = len(self.prompts_sent())
+
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("pr", "working"))
         self.assertEqual(len(self.prompts_sent()), prompts)
 
         self.stop()
@@ -2178,7 +2268,7 @@ class WatchTest(AfkTestCase):
         self.afk("tick")
 
         [poll] = self.pr_polls()
-        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-04", "--json", "state,url"])
+        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-04", "--json", "state,url,labels"])
         self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], worktree)
         self.assertEqual(self.status("04")["state"], "cleanup-pending")
         self.assertIn("04 merged; cleanup pending", self.desktop_notifications()[-1])
@@ -2243,6 +2333,18 @@ class LimitsTest(unittest.TestCase):
         self.assertIn("idle", status["message"])
         self.assertIn(("interrupt", "%5"), effects)
         self.assertEqual(len([e for e in effects if e[0] == "notify"]), 1)
+
+    def test_a_stopped_worker_with_no_activity_past_the_idle_limit_needs_attention_without_an_interrupt(self):
+        status, effects = afk.tick("03", self.worker(idle=True), 30 * 60, limits=self.limits, last_activity=14 * 60)
+
+        self.assertEqual((status["state"], status["message"]), ("attention", "stopped without reporting"))
+        self.assertNotIn(("interrupt", "%5"), effects)
+        self.assertEqual(len([e for e in effects if e[0] == "notify"]), 1)
+
+    def test_a_stopped_worker_past_the_phase_limit_is_not_interrupted_while_within_the_idle_limit(self):
+        status, effects = afk.tick("03", self.worker(idle=True), 61 * 60, limits=self.limits, last_activity=59 * 60)
+
+        self.assertEqual((status["state"], effects), ("working", []))
 
     def test_recent_activity_keeps_the_worker_working(self):
         status, effects = afk.tick("03", self.worker(), 30 * 60, limits=self.limits, last_activity=16 * 60)
