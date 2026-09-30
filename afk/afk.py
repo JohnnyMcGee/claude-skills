@@ -47,24 +47,64 @@ class Afk:
     def project_dir(self, project):
         return self.state_root() / project
 
-    def cmd_init(self, spec):
+    def cmd_init(self, spec=None):
+        """Create the project, or refresh it: re-running keeps its limits, overrides and hand-added repos."""
+        if spec is None:
+            spec = self.config()["spec"]  # re-init the current session's project
         issue = GITHUB_ISSUE.match(spec)
         if issue:
             tracker, project = "github", f"{issue['repo']}-{issue['number']}"
-            repo = self.run(["git", "rev-parse", "--show-toplevel"]).strip()  # run from inside the clone
+            repo = Path(self.run(["git", "rev-parse", "--show-toplevel"]).strip())  # run from inside the clone
+            tickets = GithubTracker(self.run, spec)
         else:
             spec = Path(spec).resolve()
             if spec.is_file():
                 spec = spec.parent
             tracker, project = "local", spec.name
             repo = spec.parent.parent  # <repo>/.scratch/<slug>
+            tickets = LocalTracker(spec)
         session = self.run(["tmux", "display-message", "-p", "#{session_name}"]).strip()
         pdir = self.project_dir(project)
         pdir.mkdir(parents=True, exist_ok=True)
-        config = {"spec": str(spec), "tracker": tracker, "repo": str(repo), "session": session}
-        (pdir / "config.toml").write_text(to_toml(config))
+        path = pdir / "config.toml"
+        config = tomllib.loads(path.read_text()) if path.exists() else {}
+        own = getattr(tickets, "repo", None)
+        wanted = [r for r in tickets.repos() if not (own and same(r, own))]
+        found = self.find_clones(repo, wanted)
+        kept = {r: c for r, c in config.get("repos", {}).items() if Path(c).is_dir()}
+        repos = {**kept, **found}
+        config.update({"spec": str(spec), "tracker": tracker, "repo": str(repo), "session": session})
+        config.pop("repos", None)
+        path.write_text(to_toml({**config, **({"repos": repos} if repos else {})}))
         self.run(["tmux", "set-option", "-t", session, "@afk_project", project])
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
+        for name, clone in repos.items():
+            self.out(f"  {name}  {clone}")
+        missing = [r for r in wanted if not any(same(r, k) for k in repos)]
+        if missing:
+            self.out(f"no local clone of {', '.join(missing)}: clone it next to {repo} (or as a submodule) and run "
+                     f"`afk init` again, or add it under [repos] in {path}")
+
+    def find_clones(self, repo, wanted):
+        """Clones of the wanted owner/name repos: the project clone itself, then its submodules, its subdirectories and
+        its siblings, the first found winning; matched by any of each clone's remotes."""
+        gitmodules = repo / ".gitmodules"
+        submodules = re.findall(r"^\s*path\s*=\s*(.+?)\s*$", gitmodules.read_text(), re.MULTILINE) if gitmodules.is_file() else []
+        candidates = [repo, *(repo / p for p in submodules)] + sorted(repo.iterdir()) + sorted(repo.parent.iterdir())
+        found = {}
+        for candidate in candidates:
+            if not (candidate / ".git").exists():
+                continue
+            try:
+                remotes = self.run(["git", "-C", str(candidate), "remote", "-v"])
+            except subprocess.CalledProcessError:
+                continue  # a broken checkout isn't a clone we can use
+            for url in re.findall(r"^\S+\s+(\S+)", remotes, re.MULTILINE):
+                named = REMOTE_REPO.search(url)
+                for want in wanted:
+                    if named and same(f"{named['owner']}/{named['name']}", want):
+                        found.setdefault(want, str(candidate))
+        return found
 
     def cmd_frontier(self):
         for ticket in self.tracker().frontier():
@@ -558,7 +598,7 @@ class Afk:
         config = self.config()
         if not repo or repo == getattr(self.tracker(), "repo", None):
             return Path(config["repo"])
-        clone = config.get("repos", {}).get(repo)
+        clone = next((c for r, c in config.get("repos", {}).items() if same(r, repo)), None)
         return clone and Path(clone)
 
     def repo_config(self, clone=None):
@@ -767,6 +807,9 @@ def same(a, b):
 
 GITHUB_ISSUE = re.compile(r"https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)/?$")
 
+# The owner/name a git remote URL points at, over SSH or HTTPS.
+REMOTE_REPO = re.compile(r"[:/](?P<owner>[\w.-]+)/(?P<name>[\w.-]+?)(?:\.git)?/?$")
+
 
 @dataclass
 class Ticket:
@@ -795,6 +838,10 @@ class LocalTracker:
 
     def tickets(self):
         return [parse_ticket(p) for p in sorted(self.issues_dir.glob("*.md"))]
+
+    def repos(self):
+        """The repos the tickets' Repo: lines name."""
+        return list(dict.fromkeys(t.repo for t in self.tickets() if t.repo))
 
     def get(self, ticket_id):
         for ticket in self.tickets():
@@ -878,6 +925,16 @@ class GithubTracker:
 
     def tickets(self):
         return [self.ticket(issue) for issue in self.api(f"issues/{self.spec_number}/sub_issues")]
+
+    def repos(self):
+        """Every repo a sub-issue lives in or names on its Repo: line, in any owner, so none is refused here."""
+        repos = {}
+        for issue in self.api(f"issues/{self.spec_number}/sub_issues"):
+            named = re.fullmatch(r"[\w.-]+/[\w.-]+", field(issue.get("body") or "", "Repo"))
+            for repo in (self.repo_of(issue), named and named.group(0)):
+                if repo and not any(same(repo, r) for r in repos):
+                    repos[repo] = None
+        return list(repos)
 
     def ticket(self, issue):
         if issue["state"] == "closed":
@@ -1181,8 +1238,28 @@ def write_json(path, data):
     tmp.replace(path)
 
 
-def to_toml(flat):
-    return "".join(f"{k} = {toml_string(v)}\n" for k, v in flat.items())
+def to_toml(table, prefix=()):
+    """TOML for a table of strings, numbers, booleans, lists of those, and nested tables."""
+    keys = "".join(f"{toml_key(k)} = {toml_value(v)}\n" for k, v in table.items() if not isinstance(v, dict))
+    tables = "".join(
+        f"\n[{'.'.join(map(toml_key, (*prefix, k)))}]\n" + to_toml(v, (*prefix, k))
+        for k, v in table.items() if isinstance(v, dict)
+    )
+    return keys + tables
+
+
+def toml_key(key):
+    return key if re.fullmatch(r"[\w-]+", key) else toml_string(key)
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(map(toml_value, value)) + "]"
+    return toml_string(value)
 
 
 def toml_string(value):
