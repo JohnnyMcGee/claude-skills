@@ -1821,6 +1821,18 @@ class UnblockedTest(AfkTestCase):
         self.assertEqual(early, [])
         self.assertEqual(polled, ["afk: widgets 3 tickets unblocked — run /afk next"])
 
+    def test_a_ticket_that_is_blocked_again_notifies_again_once_it_unblocks(self):
+        self.tick()
+        self.ticket("05-export", "Widget export", blocked_by="03")
+        self.now += 60
+        self.tick()
+        self.ticket("05-export", "Widget export")
+
+        self.now += 60
+        _, notifications = self.tick()
+
+        self.assertEqual(notifications, ["afk: widgets 2 tickets unblocked — run /afk next"])
+
     def test_no_judgment_point_while_every_worker_slot_is_taken(self):
         with open(self.project_dir / "config.toml", "a") as config:
             config.write("\n[limits]\nmax_workers = 1\n")

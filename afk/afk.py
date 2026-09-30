@@ -305,6 +305,8 @@ class Afk:
         if now - seen.get("polled_at", float("-inf")) >= FRONTIER_POLL:
             seen.update(polled_at=now, unblocked=[t.id for t in self.tracker().frontier()])
         candidates = [t for t in seen["unblocked"] if t not in started]
+        # A ticket that drops out, say blocked again, counts as newly unblocked when it returns.
+        seen["notified"] = [t for t in seen.get("notified", []) if t in candidates]
         if candidates and self.capacity(statuses):
             message = f"{len(candidates)} ticket{'s' * (len(candidates) != 1)} unblocked — run /afk next"
             self.out(message)
