@@ -135,6 +135,7 @@ class GithubTestCase(AfkTestCase):
 
     def issue(self, number, title, state="open", assignees=(), body=""):
         self.issues[number] = {
+            "id": 1000 + number,
             "number": number,
             "title": title,
             "state": state,
@@ -211,6 +212,100 @@ class GithubFrontierTest(GithubTestCase):
         )
 
 
+class GithubNextTest(GithubTestCase):
+    def test_each_candidate_is_resolved_against_its_own_repos_task_types(self):
+        api = self.tmp / "api"
+        (api / "docs" / "agents").mkdir(parents=True)
+        (api / "docs" / "agents" / "afk.md").write_text(
+            '+++\ndefault_type = "service"\n[task_types.service]\nmodel = "haiku"\n+++\n'
+        )
+        self.repo_config(TASK_TYPES)
+        self.issue(4, "Widget UI", body="Repo: acme/widgets\nType: frontend\n")
+        self.issue(5, "Widget endpoints", body="Repo: acme/widgets-api\n")
+        self.issue(6, "Widget app", body="Repo: acme/widgets-mobile\n")
+        self.afk("init", self.SPEC)
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write(f'\n[repos]\n"acme/widgets-api" = "{api}"\n')
+
+        tickets = {t["id"]: t for t in json.loads(self.afk("next"))["tickets"]}
+
+        pick = lambda t: {k: t[k] for k in ("repo", "clone", "type", "model")}
+        self.assertEqual(pick(tickets["4"]), {"repo": "acme/widgets", "clone": str(self.repo), "type": "frontend", "model": "sonnet"})
+        self.assertEqual(pick(tickets["5"]), {"repo": "acme/widgets-api", "clone": str(api), "type": "service", "model": "haiku"})
+        self.assertEqual(pick(tickets["6"]), {"repo": "acme/widgets-mobile", "clone": None, "type": None, "model": None})
+
+
+# A ticket spanning two repos, as the parts /afk next proposes splitting it into.
+SPLIT_PARTS = [
+    {"repo": "acme/api", "title": "Export endpoint", "body": "Serve widgets as CSV."},
+    {"repo": "acme/web", "title": "Export button", "body": "Download the CSV."},
+]
+
+
+class GithubSplitTest(GithubTestCase):
+    """Splitting on GitHub, against a fake that applies the writes afk makes, so their effect shows in the frontier."""
+
+    def setUp(self):
+        super().setUp()
+        self.not_sub_issues = set()
+        self.run_fake.responses[("gh", "issue", "close")] = self.gh_issue_close
+        self.issue(3, "Widget schema", state="closed")
+        self.issue(5, "Widget export", body="## What to build\n\nExport.\n\n## Blocked by\n\n- #3\n")
+        self.issue(6, "Widget report")
+        self.issue(7, "Widget audit", body="## Blocked by\n\n- #5\n")
+        self.native_blockers = {6: [5]}
+        self.afk("init", self.SPEC)
+
+    def gh_api(self, cmd):
+        path = next(arg for arg in cmd[2:] if arg.startswith("repos/"))
+        method = cmd[cmd.index("-X") + 1] if "-X" in cmd else "GET"
+        fields = dict(cmd[i + 1].split("=", 1) for i, arg in enumerate(cmd) if arg in ("-f", "-F"))
+        by_id = lambda id: next(n for n, issue in self.issues.items() if issue["id"] == int(id))
+        number = lambda: int(path.split("/")[4])
+        if (method, path) == ("POST", "repos/acme/widgets/issues"):
+            created = max(self.issues) + 1
+            self.issue(created, fields["title"], body=fields["body"])
+            self.not_sub_issues.add(created)
+            return json.dumps(self.issues[created])
+        if (method, path) == ("POST", "repos/acme/widgets/issues/2/sub_issues"):
+            self.not_sub_issues.discard(by_id(fields["sub_issue_id"]))
+            return "{}"
+        if method == "POST" and path.endswith("/dependencies/blocked_by"):
+            self.native_blockers.setdefault(number(), []).append(by_id(fields["issue_id"]))
+            return "{}"
+        if method == "PATCH":
+            self.issues[number()]["body"] = fields["body"]
+            return "{}"
+        if path == "repos/acme/widgets/issues/2/sub_issues":
+            return json.dumps([[i for n, i in self.issues.items() if n not in self.not_sub_issues]])
+        if path.endswith("/dependencies/blocking"):
+            return json.dumps([[self.issues[d] for d, blockers in self.native_blockers.items() if number() in blockers]])
+        return super().gh_api(cmd)
+
+    def gh_issue_close(self, cmd):
+        self.issues[int(cmd[3])]["state"] = "closed"
+        return ""
+
+    def test_repo_and_blocked_by_in_a_parts_body_do_not_override_its_own(self):
+        self.issue(4, "Widget config")
+        body = "Copied from #5.\n\nRepo: acme/other\n\n## Blocked by\n\n- #4\n"
+        self.afk("split", "5", stdin=json.dumps([{"repo": "acme/api", "title": "Export endpoint", "body": body}]))
+
+        self.assertIn("8  Export endpoint  (acme/api)", self.afk("frontier").splitlines())
+
+    def test_split_closes_the_ticket_for_per_repo_sub_issues_that_its_dependents_wait_for(self):
+        self.afk("split", "5", stdin=json.dumps(SPLIT_PARTS))
+
+        self.assertEqual(self.afk("frontier").splitlines(), ["8  Export endpoint  (acme/api)", "9  Export button  (acme/web)"])
+        [close] = self.run_fake.find("gh", "issue", "close")
+        self.assertIn("Split into #8, #9", close[close.index("--comment") + 1])
+        self.issues[3]["state"] = "open"  # the parts inherit the original's blockers
+        self.assertEqual(self.afk("frontier").splitlines(), ["3  Widget schema"])
+        self.issues[3]["state"] = "closed"
+        self.issues[8]["state"] = self.issues[9]["state"] = "closed"
+        self.assertEqual(self.afk("frontier").splitlines(), ["6  Widget report", "7  Widget audit"])
+
+
 class GithubStartTest(GithubTestCase):
     def setUp(self):
         super().setUp()
@@ -259,6 +354,22 @@ class GithubStartTest(GithubTestCase):
 
         [send] = self.run_fake.find("tmux", "send-keys")
         self.assertIn("https://github.com/acme/widgets/issues/4", shlex.split(send[4])[-1])
+
+    def test_a_tickets_repo_line_picks_its_clone_and_the_spec_repo_is_the_projects_own(self):
+        api = self.tmp / "api"
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write(f'\n[repos]\n"acme/widgets-api" = "{api}"\n')
+        self.issue(5, "Widget endpoints", body="Repo: acme/widgets-api\n")
+        self.issue(6, "Widget docs", body="Repo: acme/widgets\n")
+        self.run_fake.responses[("tmux", "new-window")] = lambda cmd: "%5\n"
+
+        self.afk("start", "5")
+        self.afk("start", "6")
+
+        self.assertEqual(
+            [c[2] for c in self.run_fake.find("git", "-C") if c[3:5] == ["worktree", "add"]],
+            [str(api), str(self.repo)],
+        )
 
 
 class FrontierTest(AfkTestCase):
@@ -1774,6 +1885,11 @@ class WatchTest(AfkTestCase):
         self.afk("start", "05")
         self.assertEqual(self.status("05")["state"], "working")
 
+    def test_hitl_workers_leave_afk_next_capacity_free(self):
+        self.start_hitl()  # beside 03, under the default max_workers of 3
+
+        self.assertEqual(json.loads(self.afk("next"))["capacity"], 2)
+
     def test_a_merged_hitl_pr_is_found_by_its_branch_and_cleaned_up_once_safe(self):
         self.start_hitl()
         worktree = str(self.project_dir / "worktrees" / "04")
@@ -1896,6 +2012,294 @@ class LimitsTest(unittest.TestCase):
         status, _ = self.review_round(status, now=4)
 
         self.assertEqual(status["state"], "review")
+
+
+class NextTest(AfkTestCase):
+    """`afk next` gives the /afk next skill what it needs to propose a batch: capacity, workers and candidates."""
+
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI", type="frontend")
+        self.ticket("05-export", "Widget export")
+        self.ticket("07-import", "Widget import", blocked_by="05")
+        self.afk("init", str(self.scratch))
+        self.repo_config(TASK_TYPES)
+        (self.repo / "docs" / "agents" / "prompts").mkdir()
+        (self.repo / "docs" / "agents" / "prompts" / "frontend.md").write_text("Match the design.\n")
+
+    def next(self):
+        return json.loads(self.afk("next"))
+
+    def test_next_lists_unblocked_tickets_with_their_resolved_task_type(self):
+        proposal = self.next()
+
+        self.assertEqual(
+            proposal["tickets"],
+            [
+                {"id": "03", "title": "Widget UI", "path": str(self.scratch / "issues" / "03-ui.md"), "repo": None, "clone": str(self.repo),
+                 "type": "frontend", "agent": "claude", "model": "sonnet", "effort": "medium"},
+                {"id": "05", "title": "Widget export", "path": str(self.scratch / "issues" / "05-export.md"), "repo": None, "clone": str(self.repo),
+                 "type": "backend", "agent": "claude", "model": "opus", "effort": "high"},
+            ],
+        )
+        self.assertEqual(proposal["capacity"], 3)
+
+    def test_running_workers_take_capacity_and_leave_the_candidates(self):
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write("\n[limits]\nmax_workers = 2\n")
+        self.afk("start", "03")
+
+        proposal = self.next()
+
+        self.assertEqual(proposal["capacity"], 1)
+        self.assertEqual([t["id"] for t in proposal["tickets"]], ["05"])
+        self.assertEqual(
+            proposal["workers"],
+            [{"ticket": "03", "title": "Widget UI", "phase": "implement", "state": "working", "type": "frontend"}],
+        )
+
+
+class SplitTest(AfkTestCase):
+    """A ticket spanning repos is split into one sibling ticket per repo, replacing it in the dependency graph."""
+
+    def setUp(self):
+        super().setUp()
+        self.ticket("01-schema", "Widget schema", status="done")
+        self.ticket("03-ui", "Widget UI")
+        self.ticket("05-export", "Widget export", blocked_by="01")
+        self.afk("init", str(self.scratch))
+
+    def split(self, ticket, parts):
+        return self.afk("split", ticket, stdin=json.dumps(parts))
+
+    def test_split_replaces_the_ticket_with_one_ticket_per_repo_that_inherits_its_blockers(self):
+        self.split("05", SPLIT_PARTS)
+
+        self.assertEqual(
+            self.afk("frontier").splitlines(),
+            ["03  Widget UI", "06  Export endpoint  (acme/api)", "07  Export button  (acme/web)"],
+        )
+        self.assertIn("Serve widgets as CSV.", (self.scratch / "issues" / "06-export-endpoint.md").read_text())
+        self.ticket("01-schema", "Widget schema")  # reopening the original's blocker blocks every part again
+        self.assertEqual(self.afk("frontier").splitlines(), ["01  Widget schema", "03  Widget UI"])
+
+    def test_split_into_no_parts_or_a_malformed_part_fails_before_writing_anything(self):
+        malformed = [
+            [],
+            [SPLIT_PARTS[0], {"repo": "acme/web", "title": "Export button"}],
+            [SPLIT_PARTS[0], "acme/web"],
+            [{**SPLIT_PARTS[0], "title": "Export\n**Status:** done"}],
+            [{**SPLIT_PARTS[0], "repo": "acme/api\nType: frontend"}],
+        ]
+        for parts in malformed:
+            with self.subTest(parts=parts):
+                out = io.StringIO()
+                code = afk.main(["split", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO(json.dumps(parts)), stdout=out)
+
+                self.assertNotEqual(code, 0)
+                self.assertIn("non-empty JSON list of {repo, title, body}", out.getvalue())
+                self.assertEqual(self.afk("frontier").splitlines(), ["03  Widget UI", "05  Widget export"])
+
+    def test_metadata_lines_in_a_parts_body_do_not_override_its_own(self):
+        body = "Copied from 05.\n\n**Blocked by:** 999\n\n**Status:** done\n\n**Repo:** acme/other\n"
+        self.split("05", [{"repo": "acme/api", "title": "Export endpoint", "body": body}])
+
+        self.assertEqual(self.afk("frontier").splitlines(), ["03  Widget UI", "06  Export endpoint  (acme/api)"])
+
+    def test_tickets_blocked_by_the_split_ticket_wait_for_every_part(self):
+        self.ticket("04-report", "Widget report", blocked_by="03, 05")
+        self.ticket("03-ui", "Widget UI", status="done")
+        self.split("05", SPLIT_PARTS)
+
+        self.ticket("06-export-endpoint", "Export endpoint", status="done")
+        still_blocked = self.afk("frontier").splitlines()
+        self.ticket("07-export-button", "Export button", status="done")
+        unblocked = self.afk("frontier").splitlines()
+
+        self.assertEqual(still_blocked, ["07  Export button  (acme/web)"])
+        self.assertEqual(unblocked, ["04  Widget report"])
+
+
+class UnblockedTest(AfkTestCase):
+    """The watcher surfaces unblocked tickets and free capacity as a judgment point, for the user's /afk next."""
+
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI")
+        self.ticket("05-export", "Widget export")
+        self.afk("init", str(self.scratch))
+
+    def tick(self):
+        calls_before = len(self.run_fake.calls)
+        output = self.afk("tick")
+        notifications = [" ".join(c[1:]) for c in self.run_fake.calls[calls_before:] if c[0] == "notify-send"]
+        return output, notifications
+
+    def test_unblocked_tickets_with_free_capacity_notify_once_and_show_on_the_dashboard(self):
+        output, notifications = self.tick()
+
+        self.assertEqual(notifications, ["afk: widgets 2 tickets unblocked — run /afk next"])
+        self.assertIn("2 tickets unblocked — run /afk next", output.splitlines())
+        self.assertNotIn("claude", [arg for c in self.run_fake.calls for arg in c])  # no LLM until the user asks
+
+        self.now += 120
+        output, notifications = self.tick()
+
+        self.assertEqual(notifications, [])
+        self.assertIn("2 tickets unblocked — run /afk next", output.splitlines())
+
+    def test_a_newly_unblocked_ticket_notifies_again_once_the_tracker_is_next_polled(self):
+        self.tick()
+        self.ticket("07-import", "Widget import")
+
+        self.now += 30
+        _, early = self.tick()
+        self.now += 31
+        _, polled = self.tick()
+
+        self.assertEqual(early, [])
+        self.assertEqual(polled, ["afk: widgets 3 tickets unblocked — run /afk next"])
+
+    def test_a_ticket_that_is_blocked_again_notifies_again_once_it_unblocks(self):
+        self.tick()
+        self.ticket("05-export", "Widget export", blocked_by="03")
+        self.now += 60
+        self.tick()
+        self.ticket("05-export", "Widget export")
+
+        self.now += 60
+        _, notifications = self.tick()
+
+        self.assertEqual(notifications, ["afk: widgets 2 tickets unblocked — run /afk next"])
+
+    def test_no_judgment_point_while_every_worker_slot_is_taken(self):
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write("\n[limits]\nmax_workers = 1\n")
+        self.afk("start", "03")
+
+        output, notifications = self.tick()
+
+        self.assertEqual(notifications, [])
+        self.assertNotIn("unblocked", output)
+
+
+class ApprovedStartTest(AfkTestCase):
+    """Starting the tickets approved at Gate 1: within max_workers, with the user's corrections."""
+
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI")
+        self.ticket("05-export", "Widget export")
+        self.afk("init", str(self.scratch))
+        self.repo_config(TASK_TYPES)
+        (self.repo / "docs" / "agents" / "prompts").mkdir()
+        (self.repo / "docs" / "agents" / "prompts" / "frontend.md").write_text("Match the design.\n")
+        panes = iter(["%5", "%6"])
+        self.run_fake.responses[("tmux", "new-window")] = lambda cmd: next(panes) + "\n"
+
+    def limit_workers(self, n):
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write(f"\n[limits]\nmax_workers = {n}\n")
+
+    def start_fails(self, *argv):
+        calls_before = len(self.run_fake.calls)
+        out = io.StringIO()
+        code = afk.main(["start", *argv], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+        self.assertNotEqual(code, 0)
+        self.assertEqual([c for c in self.run_fake.calls[calls_before:] if c[0] in ("git", "gh") or c[1] == "new-window"], [])
+        self.assertFalse((self.project_dir / "workers" / argv[0]).exists())
+        return out.getvalue()
+
+    def test_start_beyond_max_workers_fails_before_claiming_or_creating_anything(self):
+        self.limit_workers(1)
+        self.afk("start", "03")
+
+        out = self.start_fails("05")
+
+        self.assertIn("max_workers", out)
+
+    def test_corrections_override_the_task_types_model_and_effort_and_are_recorded(self):
+        self.afk("start", "05", "--type", "frontend", "--model", "haiku", "--effort", "low")
+
+        [send] = self.run_fake.find("tmux", "send-keys")
+        claude = shlex.split(send[4])
+        claude = claude[claude.index("claude") :]
+        self.assertEqual(claude[claude.index("--model") + 1], "haiku")
+        self.assertEqual(claude[claude.index("--effort") + 1], "low")
+        self.assertIn("Match the design.", claude[-1])  # the rest of the frontend type still applies
+        status = json.loads((self.project_dir / "workers" / "05" / "status.json").read_text())
+        self.assertEqual(
+            {k: status[k] for k in ("type", "agent", "model", "effort")},
+            {"type": "frontend", "agent": "claude", "model": "haiku", "effort": "low"},
+        )
+
+    def test_an_unsupported_agent_correction_fails_before_creating_anything(self):
+        self.assertIn("grok", self.start_fails("05", "--agent", "grok"))
+
+    def add_api_repo(self):
+        """A second clone in the project, with its own AFK config, mapped from owner/name in project config."""
+        self.api = self.tmp / "api"
+        (self.api / "docs" / "agents").mkdir(parents=True)
+        (self.api / "docs" / "agents" / "afk.md").write_text('+++\nbase = "develop"\n+++\n')
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write(f'\n[repos]\n"acme/api" = "{self.api}"\n')
+
+    def test_a_repo_correction_starts_the_worker_in_that_repos_clone_from_its_base(self):
+        self.add_api_repo()
+
+        self.afk("start", "05", "--repo", "acme/api")
+
+        worktree = self.project_dir / "worktrees" / "05"
+        self.assertEqual(
+            self.run_fake.find("git", "-C"),
+            [["git", "-C", str(self.api), "worktree", "add", "-b", "afk/widgets-05", str(worktree), "develop"]],
+        )
+        status = json.loads((self.project_dir / "workers" / "05" / "status.json").read_text())
+        self.assertEqual(status["repo"], "acme/api")
+
+    def test_phase_prompts_target_the_base_branch_of_the_workers_repo(self):
+        self.add_api_repo()
+        self.afk("start", "05", "--repo", "acme/api")
+        worker = {"AFK_PROJECT": "widgets", "AFK_TICKET": "05"}
+
+        for _ in ("implement", "verify"):
+            self.afk("report", "done", "ok", env=worker)
+            self.afk("hook", "stop", stdin="{}", env=worker)
+            self.afk("tick")
+
+        prepr = [stdin for cmd, stdin in zip(self.run_fake.calls, self.run_fake.inputs) if cmd[:2] == ["tmux", "load-buffer"]][-1]
+        self.assertIn("origin/develop", prepr)
+        self.assertNotIn("origin/main", prepr)
+
+    def test_a_merged_worker_is_cleaned_up_in_its_own_repos_clone(self):
+        self.add_api_repo()
+        self.run_fake.responses[("tmux", "split-window")] = "%9\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%9")] = "bash\n"
+        self.run_fake.responses[("gh", "pr", "view")] = "MERGED\n"
+        self.afk("start", "05", "--repo", "acme/api")
+        worker = {"AFK_PROJECT": "widgets", "AFK_TICKET": "05"}
+        for message in ["Implemented", "Verified", "Checks pass", "https://github.com/acme/api/pull/7"]:
+            self.afk("report", "done", message, env=worker)
+            self.afk("hook", "stop", stdin="{}", env=worker)
+            self.afk("tick")
+
+        self.now += 60
+        self.afk("tick")
+
+        worktree = str(self.project_dir / "worktrees" / "05")
+        self.assertEqual(
+            [c for c in self.run_fake.find("git", "-C") if c[3] in ("worktree", "branch") and c[4] != "add"],
+            [["git", "-C", str(self.api), "worktree", "remove", worktree],
+             ["git", "-C", str(self.api), "branch", "-D", "afk/widgets-05"]],
+        )
+
+    def test_a_repo_the_project_has_no_clone_for_fails_before_creating_anything(self):
+        self.add_api_repo()
+
+        out = self.start_fails("05", "--repo", "acme/mobile")
+
+        self.assertIn("acme/mobile", out)
+        self.assertIn("acme/api", out)
 
 if __name__ == "__main__":
     unittest.main()

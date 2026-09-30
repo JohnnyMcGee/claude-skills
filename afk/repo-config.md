@@ -63,7 +63,7 @@ A task type's keys:
 
 `hitl` is built in: a ticket of that type gets a guide-mode worker that isn't driven through phases (see [SKILL.md](SKILL.md#hitl-tickets)). It needs no entry, but `task_types.hitl` can still set its model, effort, skill or prompt.
 
-A ticket's type is its `Type:` line, else `default_type`. Override it at start time with `afk start <ticket> --type <name>`. An unknown type or agent fails the start before anything is created.
+A ticket's type is its `Type:` line, else `default_type`. Override it at Gate 1, or with `afk start <ticket> --type <name>`. An unknown type or agent fails the start before anything is created.
 
 ## Prose
 
@@ -89,3 +89,14 @@ Later layers win, key by key, so an override only needs the fields it changes:
    [overrides.task_types.frontend]
    model = "haiku"
    ```
+
+## Repos
+
+A project can span repos. The `[repos]` table in the project's `config.toml` lists their clones:
+
+```toml
+[repos]
+"acme/widgets-api" = "/home/me/code/widgets-api"
+```
+
+`[repos]` maps a ticket's `Repo: owner/name` to its local clone; each clone brings its own `docs/agents/afk.md`. A ticket without a `Repo:` line, or naming the spec's own repo, uses the clone the project was created from.

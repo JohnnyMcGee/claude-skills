@@ -70,14 +70,63 @@ class Afk:
         for ticket in self.tracker().frontier():
             self.out(f"{ticket.id}  {ticket.title}" + (f"  ({ticket.repo})" if ticket.repo else ""))
 
+    def cmd_next(self):
+        """What the /afk next skill needs to propose a batch, as JSON: free capacity and the unblocked tickets."""
+        workers = self.worker_statuses()
+        started = {w["ticket"] for w in workers}
+        tickets = []
+        for ticket in self.tracker().frontier():
+            if ticket.id in started:
+                continue  # a local ticket stays open while its worker runs
+            clone = self.find_clone(ticket.repo)  # None flags a repo the project has no clone of
+            repo_config = self.repo_config(clone) if clone else {}
+            choices = launch_choices(ticket, repo_config.get("default_type"), repo_config.get("task_types", {}), {})
+            tickets.append({"id": ticket.id, "title": ticket.title, "path": str(ticket.path), "repo": ticket.repo,
+                            "clone": clone and str(clone), **choices})
+        self.out(json.dumps({
+            "capacity": self.capacity(workers),
+            "workers": [{k: w.get(k) for k in ("ticket", "title", "phase", "state", "type")} for w in workers],
+            "tickets": tickets,
+        }, indent=2))
+
+    def capacity(self, workers):
+        """Free worker slots: as for `afk start`, workers in review are parked on the human and hitl workers are the
+        human's, so neither counts."""
+        return max(0, self.max_workers() - sum(w["phase"] not in ("review", "hitl") for w in workers))
+
+    def max_workers(self):
+        return {**LIMITS, **self.config().get("limits", {})}["max_workers"]
+
+    def worker_statuses(self):
+        return [read_json(p) for p in sorted(self.workers_dir().glob("*/status.json"))]
+
+    def cmd_split(self, ticket_id):
+        """Replace a ticket spanning repos with one sibling per repo; stdin is a JSON list of {repo, title, body}."""
+        parts = json.loads(self.stdin.read())
+        # Checked whole before any write: trackers write part by part, so a bad late part would leave a partial split.
+        if not isinstance(parts, list) or not parts or not all(
+            isinstance(part, dict)
+            and all(isinstance(part.get(key), str) and part[key].strip() for key in ("repo", "title", "body"))
+            and not any(c in part[key] for key in ("repo", "title") for c in "\r\n")  # one line each: no forged fields
+            for part in parts
+        ):
+            raise SystemExit("afk: split needs a non-empty JSON list of {repo, title, body} on stdin")
+        tracker = self.tracker()
+        ticket = tracker.get(ticket_id)
+        if not ticket.open:
+            raise SystemExit(f"afk: ticket {ticket.id} is not open (it is {ticket.status})")
+        ids = tracker.split(ticket, parts)
+        self.out(f"split {ticket.id} into {', '.join(ids)}")
+
     def cmd_start(self, ticket_id, *options):
         project = self.current_project()
         config = self.config()
-        if options and (len(options) != 2 or options[0] != "--type"):
-            raise SystemExit("afk: usage: afk start <ticket> [--type <type>]")
+        corrections = dict(zip(options[::2], options[1::2]))
+        if len(options) % 2 or set(corrections) - set(START_OPTIONS) or len(corrections) != len(options) // 2:
+            raise SystemExit("afk: usage: afk start <ticket> " + " ".join(f"[{o} <{o[2:]}>]" for o in START_OPTIONS))
+        corrections = {option[2:]: value for option, value in corrections.items()}
         tracker = self.tracker()
         ticket = tracker.get(ticket_id)
-        type_name = options[1] if options else ticket.type
         pdir = self.project_dir(project)
         worktree = pdir / "worktrees" / ticket.id
         worker_dir = pdir / "workers" / ticket.id
@@ -86,14 +135,17 @@ class Afk:
             raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
         if not ticket.open:
             raise SystemExit(f"afk: ticket {ticket.id} is not open (it is {ticket.status})")
-        repo_config = self.repo_config()
-        type_name = type_name or repo_config.get("default_type")
+        repo = corrections.pop("repo", None) or ticket.repo
+        clone = self.clone(repo)
+        repo_config = self.repo_config(clone)
         task_types = repo_config.get("task_types", {})
+        choices = launch_choices(ticket, repo_config.get("default_type"), task_types, corrections)
+        type_name = choices["type"]
         if type_name and type_name not in task_types and type_name != HITL:
             raise SystemExit(f"afk: unknown task type '{type_name}'; docs/agents/afk.md defines: {', '.join(task_types) or 'none'}")
+        if choices["agent"] not in AGENTS:
+            raise SystemExit(f"afk: ticket {ticket.id} would use agent '{choices['agent']}'; supported: {', '.join(AGENTS)}")
         task_type = task_types.get(type_name, {})
-        if task_type.get("agent", "claude") not in AGENTS:
-            raise SystemExit(f"afk: task type '{type_name}' uses agent '{task_type['agent']}'; supported: {', '.join(AGENTS)}")
         base = repo_config.get("base", "main")
         # A hitl ticket is the human's: its worker guides them and is never driven through the phases.
         phase, state = ("hitl", "yours") if type_name == HITL else ("implement", "working")
@@ -104,10 +156,10 @@ class Afk:
         try:
             tracker.claim(ticket)
             undo.append(lambda: tracker.release(ticket))
-            self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree), base])
-            undo.append(lambda: self.run(["git", "-C", config["repo"], "branch", "-D", branch]))
-            undo.append(lambda: self.run(["git", "-C", config["repo"], "worktree", "remove", "--force", str(worktree)]))
-            self.prepare_worktree(Path(config["repo"]), worktree, repo_config, slot_env)
+            self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), base])
+            undo.append(lambda: self.run(["git", "-C", str(clone), "branch", "-D", branch]))
+            undo.append(lambda: self.run(["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)]))
+            self.prepare_worktree(clone, worktree, repo_config, slot_env)
 
             pane = self.run(
                 ["tmux", "new-window", "-d", "-t", config["session"] + ":", "-n", window_name(ticket),
@@ -121,13 +173,14 @@ class Afk:
             launch = [
                 "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
-                *[arg for key in ("model", "effort") if key in task_type for arg in (f"--{key}", task_type[key])],
-                self.first_prompt(ticket, phase, task_type),
+                *[arg for key in ("model", "effort") if choices[key] for arg in (f"--{key}", choices[key])],
+                self.first_prompt(ticket, phase, task_type, clone),
             ]
             write_json(
                 worker_dir / "status.json",
-                {"ticket": ticket.id, "phase": phase, "state": state, "message": "",
-                 "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "type": type_name, "phase_started_at": self.clock()},
+                {"ticket": ticket.id, "title": ticket.title, "phase": phase, "state": state, "message": "",
+                 "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "repo": repo, **choices,
+                 "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
@@ -226,7 +279,7 @@ class Afk:
         with locked(workers):
             if worker_dir.exists():
                 raise SystemExit(f"afk: ticket {worker_dir.name} is already started; see `afk status`")
-            max_workers = {**LIMITS, **self.config().get("limits", {})}["max_workers"]
+            max_workers = self.max_workers()
             # Workers in review are parked on the human and hitl workers are the human's, so neither counts;
             # one still starting has no status yet.
             active = [d for d in workers.glob("*/slot") if counts_toward_max(d.parent)]
@@ -323,13 +376,39 @@ class Afk:
                 shown.append(status)
         for line in dashboard(shown, now):
             self.out(line)
+        self.surface_unblocked(shown, now)
         if failures:
             raise failures[0]
+
+    def surface_unblocked(self, statuses, now):
+        """The Gate 1 judgment point: unblocked tickets and a free worker slot. The user decides with /afk next.
+
+        The tracker is polled at most every FRONTIER_POLL seconds, as a GitHub frontier costs a request per ticket,
+        and the user is notified once per newly unblocked ticket, not every tick.
+        """
+        path = self.project_dir(self.current_project()) / "frontier.json"
+        seen = read_json(path) if path.exists() else {}
+        before = dict(seen)
+        started = {s["ticket"] for s in statuses}
+        if now - seen.get("polled_at", float("-inf")) >= FRONTIER_POLL:
+            seen.update(polled_at=now, unblocked=[t.id for t in self.tracker().frontier()])
+        candidates = [t for t in seen["unblocked"] if t not in started]
+        # A ticket that drops out, say blocked again, counts as newly unblocked when it returns.
+        seen["notified"] = [t for t in seen.get("notified", []) if t in candidates]
+        if candidates and self.capacity(statuses):
+            message = f"{len(candidates)} ticket{'s' * (len(candidates) != 1)} unblocked — run /afk next"
+            self.out(message)
+            if set(candidates) - set(seen.get("notified", [])):
+                self.notify(message)
+                seen["notified"] = candidates
+        if seen != before:
+            write_json(path, seen)
 
     def perform(self, kind, *args):
         if kind == "prompt":
             ticket_id, pane, phase = args
-            self.send_prompt(ticket_id, pane, self.phase_prompt(ticket_id, phase))
+            repo = read_json(self.workers_dir() / ticket_id / "status.json").get("repo")
+            self.send_prompt(ticket_id, pane, self.phase_prompt(ticket_id, phase, self.clone(repo)))
         elif kind == "window":
             # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
             pane, name, state = args
@@ -358,7 +437,10 @@ class Afk:
 
     def clean_up(self, ticket_id, pane):
         """Remove a merged worker's window, worktree, local branch and state; removing its dir frees its slot."""
-        project, repo = self.current_project(), self.config()["repo"]
+        project = self.current_project()
+        repo = str(self.clone(read_json(self.workers_dir() / ticket_id / "status.json").get("repo")))
+        tracker = self.tracker()
+        tracker.complete(tracker.get(ticket_id))
         self.run(["tmux", "kill-window", "-t", pane])
         self.run(["git", "-C", repo, "worktree", "remove", str(self.worktree(ticket_id))])
         self.run(["git", "-C", repo, "branch", "-D", f"afk/{project}-{ticket_id}"])
@@ -379,20 +461,20 @@ class Afk:
         except (OSError, subprocess.CalledProcessError):
             pass
 
-    def phase_prompt(self, ticket_id, phase):
+    def phase_prompt(self, ticket_id, phase, clone):
         ticket = self.tracker().get(ticket_id)
         return render(
             SKILL_DIR / f"phase-{phase}.md",
             ticket=ticket.id,
             ticket_path=ticket.path,
-            base=self.repo_config().get("base", "main"),
+            base=self.repo_config(clone).get("base", "main"),
         )
 
-    def first_prompt(self, ticket, phase, task_type):
+    def first_prompt(self, ticket, phase, task_type, clone):
         """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
-        prompt = self.phase_prompt(ticket.id, phase)
+        prompt = self.phase_prompt(ticket.id, phase, clone)
         if "prompt" in task_type:
-            template = Path(self.config()["repo"]) / task_type["prompt"]
+            template = clone / task_type["prompt"]
             prompt += "\n" + render(template, ticket=ticket.id, ticket_path=ticket.path)
         if "skill" in task_type:
             prompt = f"{task_type['skill']} {prompt}"
@@ -464,10 +546,25 @@ class Afk:
     def config(self):
         return tomllib.loads((self.project_dir(self.current_project()) / "config.toml").read_text())
 
-    def repo_config(self):
-        """The repo's AFK config: docs/agents/afk.md, then gitignored afk.local.md, then the project's [overrides]."""
+    def clone(self, repo):
+        clone = self.find_clone(repo)
+        if clone is None:
+            repos = self.config().get("repos", {})
+            raise SystemExit(f"afk: no clone of {repo} in this project; its [repos] are: {', '.join(repos) or 'none'}")
+        return clone
+
+    def find_clone(self, repo):
+        """The local clone of an owner/name repo, the project's own when there is none, or None if it has no clone."""
         config = self.config()
-        return reduce(deep_merge, [*repo_config_layers(Path(config["repo"])), config.get("overrides", {})], {})
+        if not repo or repo == getattr(self.tracker(), "repo", None):
+            return Path(config["repo"])
+        clone = config.get("repos", {}).get(repo)
+        return clone and Path(clone)
+
+    def repo_config(self, clone=None):
+        """A repo's AFK config: docs/agents/afk.md, then gitignored afk.local.md, then the project's [overrides]."""
+        config = self.config()
+        return reduce(deep_merge, [*repo_config_layers(Path(clone or config["repo"])), config.get("overrides", {})], {})
 
     def tracker(self):
         config = self.config()
@@ -482,6 +579,11 @@ AGENTS = ("claude",)
 
 # The built-in task type for human-in-the-loop tickets; the repo may still configure it under task_types.
 HITL = "hitl"
+
+FRONTIER_POLL = 60  # seconds between the watcher's reads of the tracker
+
+# Corrections the user can make at Gate 1, each a `afk start` option.
+START_OPTIONS = ("--type", "--agent", "--model", "--effort", "--repo")
 
 # Runaway limits; a project's config.toml [limits] table overrides any of them.
 LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
@@ -677,6 +779,30 @@ class LocalTracker:
     def release(self, ticket):
         pass
 
+    def complete(self, ticket):
+        """Merged: mark it done, as GitHub closes an issue, so the frontier doesn't offer it again."""
+        ticket.path.write_text(set_field(ticket.path.read_text(), "Status", "done"))
+
+    def split(self, ticket, parts):
+        numbers = [int(t.id) for t in self.tickets()]
+        blocked_by = ", ".join(ticket.blocked_by) or "None — can start immediately"
+        ids = []
+        for number, part in enumerate(parts, start=max(numbers) + 1):
+            id = str(number).zfill(len(ticket.id))
+            # Fields before the body: the first match wins, so fields copied into the body can't override them.
+            (self.issues_dir / f"{id}-{slug(part['title'])}.md").write_text(
+                f"# {id} — {part['title']}\n\n**Repo:** {part['repo']}\n\n**Blocked by:** {blocked_by}\n\n"
+                f"**Status:** ready-for-agent\n\n{part['body'].strip()}\n"
+            )
+            ids.append(id)
+        for dependent in self.tickets():
+            if ticket.id in dependent.blocked_by:
+                blockers = [b for b in dependent.blocked_by if b != ticket.id] + ids
+                dependent.path.write_text(set_field(dependent.path.read_text(), "Blocked by", ", ".join(blockers)))
+        text = ticket.path.read_text()
+        ticket.path.write_text(set_field(text, "Status", "closed") + f"\n**Split into:** {', '.join(ids)}\n")
+        return ids
+
     def frontier(self):
         tickets = self.tickets()
         done = {t.id for t in tickets if t.done}
@@ -729,12 +855,43 @@ class GithubTracker:
     def release(self, ticket):
         self.run(["gh", "issue", "edit", ticket.id, "--repo", self.repo, "--remove-assignee", "@me"])
 
+    def complete(self, ticket):
+        """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it."""
+
     def blockers(self, ticket):
         """Native blocked-by dependencies; failing those, the issues the body's "Blocked by" section names."""
         native = self.api(f"issues/{ticket.id}/dependencies/blocked_by")
         if native:
             return native
         return [json.loads(self.run(["gh", "api", f"repos/{self.repo}/issues/{n}"])) for n in ticket.blocked_by]
+
+    def split(self, ticket, parts):
+        """Create the parts as sub-issues of the spec, point the ticket's dependents at them, then close the ticket."""
+        blocked_by = "\n".join(f"- #{b['number']}" for b in self.blockers(ticket)) or "None — can start immediately"
+        created = []
+        for part in parts:
+            # Repo line and Blocked by section first, as the first match wins; the heading after them ends the section.
+            body = f"Repo: {part['repo']}\n\n## Blocked by\n\n{blocked_by}\n\n## Details\n\n{part['body'].strip()}\n"
+            created.append(json.loads(self.run(
+                ["gh", "api", f"repos/{self.repo}/issues", "-X", "POST", "-f", f"title={part['title']}", "-f", f"body={body}"]
+            )))
+            self.run(["gh", "api", f"repos/{self.repo}/issues/{self.spec_number}/sub_issues", "-X", "POST",
+                      "-F", f"sub_issue_id={created[-1]['id']}"])
+        numbers = ", ".join(f"#{issue['number']}" for issue in created)
+        for dependent in self.api(f"issues/{ticket.id}/dependencies/blocking"):
+            for issue in created:
+                self.run(["gh", "api", f"repos/{self.repo}/issues/{dependent['number']}/dependencies/blocked_by", "-X", "POST",
+                          "-F", f"issue_id={issue['id']}"])
+        for dependent in self.api(f"issues/{self.spec_number}/sub_issues"):
+            body = dependent.get("body") or ""
+            blockers = section(body, "Blocked by")
+            rewired = re.sub(rf"(?<![\w/])#{ticket.id}\b", numbers, blockers)
+            if rewired != blockers:
+                self.run(["gh", "api", f"repos/{self.repo}/issues/{dependent['number']}", "-X", "PATCH",
+                          "-f", f"body={body.replace(blockers, rewired, 1)}"])
+        self.run(["gh", "issue", "close", ticket.id, "--repo", self.repo, "--reason", "not planned",
+                  "--comment", f"Split into {numbers}, one per repo."])
+        return [str(issue["number"]) for issue in created]
 
     def frontier(self):
         # Blockers carry their own state, so one outside this spec's sub-issues still counts.
@@ -755,11 +912,25 @@ def parse_ticket(path):
         blocked_by=[n.zfill(len(number)) for n in re.findall(r"(?:^|,)\s*#?(\d+)\b", field(text, "Blocked by"))],
         path=path,
         type=field(text, "Type"),
+        repo=field(text, "Repo") or None,
     )
 
 
+def launch_choices(ticket, default_type, task_types, corrections):
+    """A ticket's task type and the agent, model and effort it launches with, after the user's corrections."""
+    type_name = corrections.get("type") or ticket.type or default_type
+    task_type = task_types.get(type_name, {})
+    choices = {"type": type_name, "agent": task_type.get("agent", "claude"), "model": task_type.get("model"),
+               "effort": task_type.get("effort")}
+    return {**choices, **{k: v for k, v in corrections.items() if k != "type"}}
+
+
+def slug(title):
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+
 def window_name(ticket):
-    abbrev = re.sub(r"[^a-z0-9]+", "-", ticket.title.lower()).strip("-")[:10].rstrip("-")
+    abbrev = slug(ticket.title)[:10].rstrip("-")
     return f"{ticket.id}-{abbrev}"
 
 
@@ -899,6 +1070,12 @@ def field(text, name):
     return match.group(1).strip() if match else ""
 
 
+def set_field(text, name, value):
+    """Replace the value of a `Name: value` line, keeping its label's markdown."""
+    pattern = rf"^(\W*{re.escape(name)}\W*:\**[ \t]*).*$"
+    return re.sub(pattern, lambda m: m.group(1) + value, text, count=1, flags=re.MULTILINE | re.IGNORECASE)
+
+
 def section(markdown, heading):
     """Body of a `## Heading` section, up to the next heading of any level."""
     match = re.search(rf"^#+\s*{re.escape(heading)}\s*$(.*?)(?=^#+\s|\Z)", markdown, re.MULTILINE | re.DOTALL | re.IGNORECASE)
@@ -957,7 +1134,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|start|watch|tick|report|status|hook|check|trial> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|status|hook|check|trial> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)
