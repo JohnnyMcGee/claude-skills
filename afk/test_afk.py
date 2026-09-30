@@ -222,6 +222,30 @@ class WorkerStatusTest(AfkTestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(self.status_rows()[0], ["03", "implement", "working"])
 
+    def status_file(self, ticket):
+        return json.loads((self.project_dir / "workers" / ticket / "status.json").read_text())
+
+    def test_hooks_record_session_id_transcript_and_event_in_status_file(self):
+        for event, name in [("session-start", "SessionStart"), ("notification", "Notification"), ("stop", "Stop")]:
+            payload = {
+                "session_id": "sess-123",
+                "transcript_path": "/home/u/.claude/projects/x/sess-123.jsonl",
+                "hook_event_name": name,
+            }
+            self.afk("hook", event, stdin=json.dumps(payload), env=self.worker_env("03"))
+
+            status = self.status_file("03")
+            self.assertEqual(status["session_id"], "sess-123")
+            self.assertEqual(status["transcript_path"], "/home/u/.claude/projects/x/sess-123.jsonl")
+            self.assertEqual(status["last_event"], name)
+        self.assertNotIn("session_id", self.status_file("05"))
+
+    def test_hook_keeps_reported_state(self):
+        self.afk("report", "done", "Finished", env=self.worker_env("03"))
+        self.afk("hook", "stop", stdin=json.dumps({"session_id": "s", "transcript_path": "/t"}), env=self.worker_env("03"))
+
+        self.assertEqual(self.status_rows()[0], ["03", "implement", "done", "Finished"])
+
 
 if __name__ == "__main__":
     unittest.main()

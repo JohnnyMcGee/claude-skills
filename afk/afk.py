@@ -92,6 +92,14 @@ class Afk:
             return 2
         self.update_status(state=state, message=message)
 
+    def cmd_hook(self, event):
+        payload = json.loads(self.stdin.read() or "{}")
+        self.update_status(
+            session_id=payload.get("session_id"),
+            transcript_path=payload.get("transcript_path"),
+            last_event=payload.get("hook_event_name", event),
+        )
+
     def cmd_status(self):
         rows = [read_json(p) for p in sorted((self.project_dir(self.current_project()) / "workers").glob("*/status.json"))]
         self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<10}MESSAGE")
