@@ -35,6 +35,8 @@ Run `/pre-pr` …
 …
 ```
 
+`/afk-setup` writes this file. `afk check [<repo>]` validates it as `afk start` will read it (with `afk.local.md` merged in) and warns about missing prose sections; `afk trial [<repo>]` proves it by creating a scratch worktree on branch `afk/trial`, copying files and running bootstrap on slot 9, and `afk trial --teardown` removes it.
+
 ## Frontmatter keys
 
 Every key is optional.
