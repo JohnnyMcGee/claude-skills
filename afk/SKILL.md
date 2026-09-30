@@ -75,7 +75,7 @@ idle_minutes = 20   # working, but its transcript hasn't changed
 fix_loops = 3       # review rounds (feedback → fix → done) before stopping to look
 ```
 
-A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, where it has already stopped, nor for a worker that stopped without reporting and went quiet, which is marked `attention` instead), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A limit trips at most once per phase, so a stuck worker that is nudged and later reports `done` moves on as usual.
+A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, where it has already stopped, nor for a worker that stopped without reporting: only `idle_minutes` applies to it, and once it trips the worker is marked `attention` instead), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A limit trips at most once per phase, so a stuck worker that is nudged and later reports `done` moves on as usual.
 
 ## Setup
 

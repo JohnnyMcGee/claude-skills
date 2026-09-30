@@ -2341,6 +2341,11 @@ class LimitsTest(unittest.TestCase):
         self.assertNotIn(("interrupt", "%5"), effects)
         self.assertEqual(len([e for e in effects if e[0] == "notify"]), 1)
 
+    def test_a_stopped_worker_past_the_phase_limit_is_not_interrupted_while_within_the_idle_limit(self):
+        status, effects = afk.tick("03", self.worker(idle=True), 61 * 60, limits=self.limits, last_activity=59 * 60)
+
+        self.assertEqual((status["state"], effects), ("working", []))
+
     def test_recent_activity_keeps_the_worker_working(self):
         status, effects = afk.tick("03", self.worker(), 30 * 60, limits=self.limits, last_activity=16 * 60)
 

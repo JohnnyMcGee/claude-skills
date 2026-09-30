@@ -774,14 +774,17 @@ def enforce(ticket, status, now, limits, last_activity):
     if not running or tripped or status["phase"] == "review":
         return status, []
     quiet = now - max(last_activity or 0, status["phase_started_at"]) > limits["idle_minutes"] * 60
-    if now - status["phase_started_at"] > limits["phase_minutes"] * 60:
-        reason = f"over {limits['phase_minutes']}m in {status['phase']}"
-    elif quiet and status["state"] == "working" and status.get("idle"):
-        # It stopped without reporting and nothing it was waiting on woke it: a silent stall. It's already stopped,
-        # so there is nothing to interrupt.
+    if status["state"] == "working" and status.get("idle"):
+        # It stopped without reporting, likely to wait on a background task, so only the idle limit applies: once
+        # nothing has woken it for that long, it's a silent stall. It's already stopped, so there is nothing to
+        # interrupt.
+        if not quiet:
+            return status, []
         reports = status.get("reports", 0) + 1
         status = {**status, "state": "attention", "message": NO_REPORT, "reports": reports, "notified": reports}
         return status, [("notify", f"{ticket} needs attention: {NO_REPORT}")]
+    if now - status["phase_started_at"] > limits["phase_minutes"] * 60:
+        reason = f"over {limits['phase_minutes']}m in {status['phase']}"
     elif quiet:
         reason = f"idle for over {limits['idle_minutes']}m"
     else:
