@@ -17,11 +17,11 @@ These override anything a reviewer, a check, or your own judgment suggests:
 
 - **Never reply to a human.** Humans are invisible to this workflow except as one line in the final report. A human comment does not stop the run, does not get answered, and does not get resolved.
 - **Never make an out-of-scope change.** If an AI reviewer raises a real problem that this PR did not create, you acknowledge it and move on. No fix, no TODO comment, no follow-up issue, no "while I was in here".
-- **Never merge**, and never mark a PR ready before its gates are actually clear.
+- **Never merge**, and never label a PR ready for review before its gates are actually clear.
 
 ## 0. Locate
 
-`gh pr view --json number,url,isDraft,state` on the current branch.
+`gh pr view --json number,url,state,labels` on the current branch.
 
 - Open PR already exists → skip to step 2. A previous run may have crashed mid-flight; GitHub holds all the state you need.
 - No PR → step 1.
@@ -61,11 +61,11 @@ If `.github/pull_request_template.md` (or `.github/PULL_REQUEST_TEMPLATE/`) exis
 
 **Link an issue** with `Closes #N` only from an explicit signal: an issue ID in the branch name, or the `issue:` frontmatter of a `.plans/` doc. Never from a guess.
 
-**Open as draft.** Draft is the machine-readable form of "not yet human-reviewable", and it holds back reviewer notifications while you churn.
+**Open it as a normal PR, not a draft.** Some AI reviewers — Copilot among them — never trigger on a draft, so a draft stalls the very gates this run exists to clear. The machine-readable "not yet human-reviewable" signal is instead the *absence* of the `Ready for Review` label, which you add only at the end (step 6).
 
 ```bash
 git push -u origin HEAD
-gh pr create --draft --base "$BASE" --title "..." --body-file <(...)
+gh pr create --base "$BASE" --title "..." --body-file <(...)
 ```
 
 ## 2. Conflicts — hard gate
@@ -157,13 +157,20 @@ gh api graphql -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$
 
 ## 6. Finish
 
-**Ready** — conflicts resolved, checks green or excused with evidence, every bot thread resolved. `gh pr ready "$PR"`, then report.
+**Ready** — conflicts resolved, checks green or excused with evidence, every bot thread resolved. Add the `Ready for Review` label, creating it first if the repo does not have it, then report.
+
+```bash
+gh label create "Ready for Review" \
+  --color 0E8A16 \
+  --description "Automated gates are clear; awaiting human review" 2>/dev/null || true
+gh pr edit "$PR" --add-label "Ready for Review"
+```
 
 **Blocked** — anything you could not clear. Report the same, naming what blocks it and what you tried.
 
 Report to the terminal only. Never post a summary comment to the PR. Four parts:
 
-- PR URL and draft/ready state.
+- PR URL and whether it carries the `Ready for Review` label.
 - Checks: `N passed`, plus any excused failure **with its evidence**.
 - Triage: a count per bucket, with the invalid and out-of-scope ones listed one line each so the human can spot a bad call.
 - Human activity, if any ("2 comments from a human reviewer — untouched").
