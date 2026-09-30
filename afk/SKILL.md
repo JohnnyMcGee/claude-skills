@@ -13,9 +13,9 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 
 ## Commands
 
-- **`afk init <spec>`** — create the project from a local spec directory (`.scratch/<slug>/` or its `spec.md`) and bind it to the current tmux session. Run once per project.
-- **`afk frontier`** — list open, unclaimed tickets whose blockers are all resolved/done/closed.
-- **`afk start <ticket>`** — create a worktree and branch `afk/<project>-<ticket>`, open a tmux window `<ticket>-<abbrev>` split agent-left / shell-right, and launch an interactive `claude` worker in auto permission mode with per-session hooks and a deny list (no force-push, no push to base, no `gh pr merge`, no worktree removal).
+- **`afk init <spec>`** — create the project from a local spec directory (`.scratch/<slug>/` or its `spec.md`), or from a GitHub spec issue URL whose sub-issues are the tickets (run it from inside that repo's clone), and bind it to the current tmux session. Run once per project.
+- **`afk frontier`** — list open, unclaimed tickets whose blockers are all resolved/done/closed. On GitHub a ticket is claimed when it has any assignee, blockers are its native blocked-by dependencies (else its `## Blocked by` section), and a `Repo: owner/name` line shows as `(owner/name)`; without one the repo is unresolved.
+- **`afk start <ticket>`** — claim the ticket (on GitHub, assign it to you), create a worktree and branch `afk/<project>-<ticket>`, open a tmux window `<ticket>-<abbrev>` split agent-left / shell-right, and launch an interactive `claude` worker in auto permission mode with per-session hooks and a deny list (no force-push, no push to base, no `gh pr merge`, no worktree removal).
 - **`afk watch`** — the watcher: run it in the orchestrator window's right pane. Every couple of seconds it advances workers through their phases, redraws the dashboard (ticket, phase, state, time in phase, PR), marks each worker's tmux window with its state, and notifies (bell, tmux message, `notify-send`) when a worker needs the human. It needs no LLM. `afk tick` runs one step of it.
 - **`afk status`** — every worker's ticket, phase, state and last message.
 
