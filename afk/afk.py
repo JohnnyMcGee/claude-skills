@@ -17,6 +17,7 @@ import time
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from functools import reduce
 from pathlib import Path
 
@@ -220,7 +221,7 @@ class Afk:
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "title": ticket.title, "phase": phase, "state": state, "message": "",
                  "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "repo": repo, **choices,
-                 "phase_started_at": self.clock()},
+                 "started_at": self.clock(), "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
@@ -537,14 +538,17 @@ class Afk:
         whether it carries /open-pr's READY_LABEL.
 
         afk only ever reads PRs; merging is the human's call. Whoever opened the PR, the worker or the human, it is
-        found by the worker's branch, so afk never depends on a URL being reported.
+        found by the worker's branch, so afk never depends on a URL being reported. A PR opened before the worker
+        started, from an earlier attempt at the ticket on the same branch, is none of this worker's.
         """
         branch = f"afk/{self.current_project()}-{status['ticket']}"
         try:
-            pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url,labels"], cwd=self.worktree(status["ticket"])))
+            pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url,labels,createdAt"], cwd=self.worktree(status["ticket"])))
         except subprocess.CalledProcessError as error:
             if "no pull requests found" not in (error.stderr or ""):
                 raise
+            return "NONE", None, False
+        if datetime.fromisoformat(pr["createdAt"]).timestamp() < status.get("started_at", float("-inf")):
             return "NONE", None, False
         return pr["state"], pr["url"], any(label["name"] == READY_LABEL for label in pr.get("labels", []))
 

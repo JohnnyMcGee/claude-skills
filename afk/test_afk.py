@@ -7,6 +7,7 @@ import tempfile
 import threading
 import tomllib
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import afk
@@ -38,10 +39,12 @@ class FakeRun:
         return [c for c in self.calls if tuple(c[: len(prefix)]) == prefix]
 
 
-def pr_view(state, url="https://github.com/acme/widgets/pull/42", ready=False):
-    """What `gh pr view <branch> --json state,url,labels` prints for a PR in `state`, labelled by /open-pr if ready."""
+def pr_view(state, url="https://github.com/acme/widgets/pull/42", ready=False, created=None):
+    """What `gh pr view <branch> --json state,url,labels,createdAt` prints for a PR in `state`, labelled by /open-pr
+    if ready and opened at clock time `created` (by default, well after any worker started)."""
     labels = [{"name": "Ready for Review"}] if ready else []
-    return json.dumps({"state": state, "url": url, "labels": labels})
+    opened = datetime.fromtimestamp(created if created is not None else 2_000_000_000, timezone.utc)
+    return json.dumps({"state": state, "url": url, "labels": labels, "createdAt": opened.strftime("%Y-%m-%dT%H:%M:%SZ")})
 
 
 class AfkTestCase(unittest.TestCase):
@@ -1910,7 +1913,7 @@ class WatchTest(AfkTestCase):
         self.afk("tick")
 
         poll = self.pr_polls()[-1]
-        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-03", "--json", "state,url,labels"])
+        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-03", "--json", "state,url,labels,createdAt"])
         self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], str(self.project_dir / "worktrees" / "03"))
         self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
         self.assertEqual(self.status()["pr"], "https://github.com/acme/widgets/pull/42")
@@ -2319,7 +2322,7 @@ class WatchTest(AfkTestCase):
         self.afk("tick")
 
         [poll] = self.pr_polls()
-        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-04", "--json", "state,url,labels"])
+        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-04", "--json", "state,url,labels,createdAt"])
         self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], worktree)
         self.assertEqual(self.status("04")["state"], "cleanup-pending")
         self.assertIn("04 merged; cleanup pending", self.desktop_notifications()[-1])
@@ -2348,6 +2351,20 @@ class WatchTest(AfkTestCase):
         self.afk("tick")
 
         self.assertEqual(len(self.pr_polls()), 2)
+        self.assertEqual((self.phase("04"), self.status("04")["state"]), ("hitl", "yours"))
+
+    def test_a_restarted_worker_is_not_cleaned_up_for_the_pr_an_earlier_attempt_closed(self):
+        self.start_hitl()
+        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-04")] = pr_view("CLOSED", created=self.now)
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%8")] = "bash\n"
+        self.afk("tick")
+        self.assertFalse((self.project_dir / "workers" / "04").exists())
+        self.now += 60
+
+        self.afk("start", "04")  # the closed PR released it onto the frontier; its branch is recreated
+        self.now += 60
+        self.afk("tick")
+
         self.assertEqual((self.phase("04"), self.status("04")["state"]), ("hitl", "yours"))
 
     def test_a_hitl_worker_whose_ticket_is_closed_without_a_pr_is_cleaned_up_once_safe(self):
