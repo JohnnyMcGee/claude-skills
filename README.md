@@ -6,7 +6,7 @@ A small collection of [Claude Code skills](https://code.claude.com/docs/en/skill
 
 ### afk
 
-An orchestrator for AFK agent workers, one project per tmux session. A stdlib-only Python CLI (`afk`) finds the ticket frontier in a local `.scratch` spec, starts each ticket in its own worktree (with the repo's gitignored files and bootstrap from `docs/agents/afk.md`), branch, port slot and split tmux window with an interactive `claude` worker (auto permission mode, per-session status hooks, and a deny list against force-push, pushing to base, `gh pr merge` and worktree removal), and tracks every worker's reported status. `afk watch` then drives each worker through implement → verify → prepr → pr → review by pasting phase prompts into its pane, shows a dashboard, marks tmux windows with each worker's state, and notifies you when a worker has a question, is blocked, stalls, or has a PR Ready. It polls GitHub for merges (it never merges itself) and then removes the worktree, branch and window, unless your shell pane is busy or the worktree is dirty. In that case it leaves them and tells you.
+An orchestrator for AFK agent workers, one project per tmux session. A stdlib-only Python CLI (`afk`) finds the ticket frontier in a local `.scratch` spec or a GitHub spec issue's sub-issues (claiming GitHub tickets by assignment), starts each ticket in its own worktree (with the repo's gitignored files and bootstrap from `docs/agents/afk.md`), branch, port slot and split tmux window with an interactive `claude` worker (auto permission mode, per-session status hooks, and a deny list against force-push, pushing to base, `gh pr merge` and worktree removal), and tracks every worker's reported status. `afk watch` then drives each worker through implement → verify → prepr → pr → review by pasting phase prompts into its pane, shows a dashboard, marks tmux windows with each worker's state, and notifies you when a worker has a question, is blocked, stalls, or has a PR Ready. It polls GitHub for merges (it never merges itself) and then removes the worktree, branch and window, unless your shell pane is busy or the worktree is dirty. In that case it leaves them and tells you.
 
 Invoke with `/afk <init <spec> | frontier | start <ticket> | watch | status>`. The `afk` CLI must be on your PATH (see below).
 
@@ -44,7 +44,7 @@ Each skill is a folder containing a `SKILL.md` (plus any supporting files) — s
 
 ### Putting `afk` on PATH
 
-The `afk` skill drives a CLI that both you and its worker agents call. Symlink it onto your PATH (Python 3.11+, `tmux`, `git` required):
+The `afk` skill drives a CLI that both you and its worker agents call. Symlink it onto your PATH (Python 3.11+, `tmux`, `git` required; `gh` for GitHub specs):
 
 ```bash
 mkdir -p ~/.local/bin

@@ -48,33 +48,44 @@ class Afk:
         return self.state_root() / project
 
     def cmd_init(self, spec):
-        spec = Path(spec).resolve()
-        if spec.is_file():
-            spec = spec.parent
-        project = spec.name
-        repo = spec.parent.parent  # <repo>/.scratch/<slug>
+        issue = GITHUB_ISSUE.match(spec)
+        if issue:
+            tracker, project = "github", f"{issue['repo']}-{issue['number']}"
+            repo = self.run(["git", "rev-parse", "--show-toplevel"]).strip()  # run from inside the clone
+        else:
+            spec = Path(spec).resolve()
+            if spec.is_file():
+                spec = spec.parent
+            tracker, project = "local", spec.name
+            repo = spec.parent.parent  # <repo>/.scratch/<slug>
         session = self.run(["tmux", "display-message", "-p", "#{session_name}"]).strip()
         pdir = self.project_dir(project)
         pdir.mkdir(parents=True, exist_ok=True)
-        config = {"spec": str(spec), "tracker": "local", "repo": str(repo), "session": session}
+        config = {"spec": str(spec), "tracker": tracker, "repo": str(repo), "session": session}
         (pdir / "config.toml").write_text(to_toml(config))
         self.run(["tmux", "set-option", "-t", session, "@afk_project", project])
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
 
     def cmd_frontier(self):
         for ticket in self.tracker().frontier():
-            self.out(f"{ticket.id}  {ticket.title}")
+            self.out(f"{ticket.id}  {ticket.title}" + (f"  ({ticket.repo})" if ticket.repo else ""))
 
     def cmd_start(self, ticket_id, *options):
         project = self.current_project()
         config = self.config()
         if options and (len(options) != 2 or options[0] != "--type"):
             raise SystemExit("afk: usage: afk start <ticket> [--type <type>]")
-        ticket = self.tracker().get(ticket_id)
+        tracker = self.tracker()
+        ticket = tracker.get(ticket_id)
         type_name = options[1] if options else ticket.type
         pdir = self.project_dir(project)
         worktree = pdir / "worktrees" / ticket.id
         worker_dir = pdir / "workers" / ticket.id
+        # Checked before openness: a ticket this orchestrator started is now claimed. claim_worker settles races.
+        if worker_dir.exists():
+            raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
+        if not ticket.open:
+            raise SystemExit(f"afk: ticket {ticket.id} is not open (it is {ticket.status})")
         repo_config = self.repo_config()
         type_name = type_name or repo_config.get("default_type")
         task_types = repo_config.get("task_types", {})
@@ -89,6 +100,8 @@ class Afk:
         branch = f"afk/{project}-{ticket.id}"
         undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
         try:
+            tracker.claim(ticket)
+            undo.append(lambda: tracker.release(ticket))
             self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree), base])
             undo.append(lambda: self.run(["git", "-C", config["repo"], "branch", "-D", branch]))
             undo.append(lambda: self.run(["git", "-C", config["repo"], "worktree", "remove", "--force", str(worktree)]))
@@ -357,7 +370,10 @@ class Afk:
         return reduce(deep_merge, [*layers, config.get("overrides", {})], {})
 
     def tracker(self):
-        return LocalTracker(Path(self.config()["spec"]))
+        config = self.config()
+        if config["tracker"] == "github":
+            return GithubTracker(self.run, config["spec"])
+        return LocalTracker(Path(config["spec"]))
 
 
 REPORT_STATES = ("done", "blocked", "question")
@@ -457,6 +473,8 @@ class VerifyQueue:
 
 DONE_STATUSES = {"resolved", "done", "closed"}
 
+GITHUB_ISSUE = re.compile(r"https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)/?$")
+
 
 @dataclass
 class Ticket:
@@ -466,6 +484,7 @@ class Ticket:
     blocked_by: list
     path: Path
     type: str
+    repo: str | None = None  # owner/name; None leaves it for Gate 1 to resolve
 
     @property
     def done(self):
@@ -491,10 +510,74 @@ class LocalTracker:
                 return ticket
         raise SystemExit(f"afk: no ticket '{ticket_id}'")
 
+    def claim(self, ticket):
+        """A local spec belongs to this orchestrator alone, so there is no one to claim it from."""
+
+    def release(self, ticket):
+        pass
+
     def frontier(self):
         tickets = self.tickets()
         done = {t.id for t in tickets if t.done}
         return [t for t in tickets if t.open and all(b in done for b in t.blocked_by)]
+
+
+class GithubTracker:
+    """Tickets as the sub-issues of a GitHub spec issue, read through `gh`."""
+
+    def __init__(self, run, spec_url):
+        self.run = run
+        issue = GITHUB_ISSUE.match(spec_url)
+        self.repo = f"{issue['owner']}/{issue['repo']}"
+        self.spec_number = issue["number"]
+
+    def api(self, path):
+        pages = json.loads(self.run(["gh", "api", "--paginate", "--slurp", f"repos/{self.repo}/{path}"]))
+        return [item for page in pages for item in page]
+
+    def tickets(self):
+        return [self.ticket(issue) for issue in self.api(f"issues/{self.spec_number}/sub_issues")]
+
+    def ticket(self, issue):
+        if issue["state"] == "closed":
+            status = "closed"
+        elif issue["assignees"]:
+            status = "claimed"  # by another orchestrator or a human
+        else:
+            status = "open"
+        body = issue.get("body") or ""
+        blocked_by = re.findall(r"(?<![\w/])#(\d+)\b", section(body, "Blocked by"))
+        repo = re.fullmatch(r"[\w.-]+/[\w.-]+", field(body, "Repo"))
+        return Ticket(
+            id=str(issue["number"]), title=issue["title"], status=status, blocked_by=blocked_by, path=issue["html_url"],
+            type=field(body, "Type"), repo=repo and repo.group(0),
+        )
+
+    def get(self, ticket_id):
+        try:
+            return self.ticket(json.loads(self.run(["gh", "api", f"repos/{self.repo}/issues/{ticket_id}"])))
+        except subprocess.CalledProcessError as error:
+            if "Not Found" not in (error.stderr or ""):
+                raise
+            raise SystemExit(f"afk: no ticket '{ticket_id}'")
+
+    def claim(self, ticket):
+        """Assignment is the cross-orchestrator lock: a claimed ticket drops out of every frontier."""
+        self.run(["gh", "issue", "edit", ticket.id, "--repo", self.repo, "--add-assignee", "@me"])
+
+    def release(self, ticket):
+        self.run(["gh", "issue", "edit", ticket.id, "--repo", self.repo, "--remove-assignee", "@me"])
+
+    def blockers(self, ticket):
+        """Native blocked-by dependencies; failing those, the issues the body's "Blocked by" section names."""
+        native = self.api(f"issues/{ticket.id}/dependencies/blocked_by")
+        if native:
+            return native
+        return [json.loads(self.run(["gh", "api", f"repos/{self.repo}/issues/{n}"])) for n in ticket.blocked_by]
+
+    def frontier(self):
+        # Blockers carry their own state, so one outside this spec's sub-issues still counts.
+        return [t for t in self.tickets() if t.open and all(b["state"] == "closed" for b in self.blockers(t))]
 
 
 def parse_ticket(path):
@@ -583,6 +666,12 @@ def field(text, name):
     """Value of a `Name: value` line, tolerating markdown bold around the label."""
     match = re.search(rf"^\W*{re.escape(name)}\W*:\**\s*(.*)$", text, re.MULTILINE | re.IGNORECASE)
     return match.group(1).strip() if match else ""
+
+
+def section(markdown, heading):
+    """Body of a `## Heading` section, up to the next heading of any level."""
+    match = re.search(rf"^#+\s*{re.escape(heading)}\s*$(.*?)(?=^#+\s|\Z)", markdown, re.MULTILINE | re.DOTALL | re.IGNORECASE)
+    return match.group(1) if match else ""
 
 
 @contextmanager

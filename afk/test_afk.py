@@ -110,6 +110,157 @@ class InitTest(AfkTestCase):
         )
 
 
+class GithubTestCase(AfkTestCase):
+    """A project whose spec is GitHub issue acme/widgets#2 and whose tickets are its sub-issues, all via faked `gh`."""
+
+    SPEC = "https://github.com/acme/widgets/issues/2"
+
+    def setUp(self):
+        super().setUp()
+        self.issues = {}
+        self.native_blockers = {}
+        self.run_fake.responses[("git", "rev-parse", "--show-toplevel")] = f"{self.repo}\n"
+        self.run_fake.responses[("tmux", "show-options")] = "widgets-2\n"
+        self.run_fake.responses[("gh", "api")] = self.gh_api
+
+    def gh_api(self, cmd):
+        path = next(arg for arg in cmd[2:] if arg.startswith("repos/"))
+        if path == "repos/acme/widgets/issues/2/sub_issues":
+            result = list(self.issues.values())
+        elif path.endswith("/dependencies/blocked_by"):
+            result = [self.issues[n] for n in self.native_blockers.get(int(path.split("/")[4]), [])]
+        else:
+            result = self.issues[int(path.split("/")[4])]
+        return json.dumps([result] if "--slurp" in cmd else result)  # --slurp wraps each page in one array
+
+    def issue(self, number, title, state="open", assignees=(), body=""):
+        self.issues[number] = {
+            "number": number,
+            "title": title,
+            "state": state,
+            "assignees": [{"login": login} for login in assignees],
+            "body": body,
+            "html_url": f"https://github.com/acme/widgets/issues/{number}",
+        }
+
+    @property
+    def project_dir(self):
+        return self.state_home / "afk" / "widgets-2"
+
+
+class GithubInitTest(GithubTestCase):
+    def test_init_from_a_spec_issue_url_records_the_github_tracker_and_the_local_checkout(self):
+        self.afk("init", self.SPEC)
+
+        config = tomllib.loads((self.project_dir / "config.toml").read_text())
+        self.assertEqual(config["spec"], self.SPEC)
+        self.assertEqual(config["tracker"], "github")
+        self.assertEqual(config["repo"], str(self.repo))
+        self.assertEqual(
+            self.run_fake.find("tmux", "set-option"),
+            [["tmux", "set-option", "-t", "work", "@afk_project", "widgets-2"]],
+        )
+
+
+class GithubFrontierTest(GithubTestCase):
+    def test_frontier_lists_open_sub_issues_nobody_has_claimed(self):
+        self.issue(3, "Widget schema", state="closed")
+        self.issue(4, "Widget API")
+        self.issue(5, "Widget UI", assignees=["someone-else"])
+        self.issue(6, "Widget export")
+        self.afk("init", self.SPEC)
+
+        output = self.afk("frontier")
+
+        self.assertEqual(output.splitlines(), ["4  Widget API", "6  Widget export"])
+
+    def test_frontier_skips_sub_issues_with_an_open_native_blocker(self):
+        self.issue(3, "Widget schema", state="closed")
+        self.issue(4, "Widget API")
+        self.issue(5, "Widget UI")
+        self.issue(6, "Widget search")
+        self.native_blockers = {5: [3], 6: [3, 4]}
+        self.afk("init", self.SPEC)
+
+        output = self.afk("frontier")
+
+        self.assertEqual(output.splitlines(), ["4  Widget API", "5  Widget UI"])
+
+    def test_without_native_blockers_the_body_blocked_by_section_is_used(self):
+        self.issue(3, "Widget schema", state="closed")
+        self.issue(4, "Widget API", body="## What to build\n\nNeeds 2 endpoints.\n\n## Blocked by\n\n- #3\n")
+        self.issue(5, "Widget UI", body="## Blocked by\n\n- #3\n- #4\n\n## Notes\n\nSee #9.\n")
+        self.issue(6, "Widget export", body="## Blocked by\n\nNone — can start immediately\n")
+        self.afk("init", self.SPEC)
+
+        output = self.afk("frontier")
+
+        self.assertEqual(output.splitlines(), ["4  Widget API", "6  Widget export"])
+
+    def test_a_repo_line_resolves_the_tickets_repo_and_its_absence_leaves_it_unresolved(self):
+        self.issue(4, "Widget API", body="## What to build\n\nThe API.\n\n**Repo:** acme/widgets-api\n")
+        self.issue(5, "Widget UI", body="Repo: acme/widgets-web\n")
+        self.issue(6, "Widget export", body="## What to build\n\nExport to the repo's CSV format.\n")
+        self.afk("init", self.SPEC)
+
+        output = self.afk("frontier")
+
+        self.assertEqual(
+            output.splitlines(),
+            ["4  Widget API  (acme/widgets-api)", "5  Widget UI  (acme/widgets-web)", "6  Widget export"],
+        )
+
+
+class GithubStartTest(GithubTestCase):
+    def setUp(self):
+        super().setUp()
+        self.issue(4, "Widget API")
+        self.afk("init", self.SPEC)
+
+    def test_start_claims_the_ticket_by_assigning_it_before_setting_up_the_worker(self):
+        self.afk("start", "4")
+
+        claim = ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--add-assignee", "@me"]
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [claim])
+        [add] = self.run_fake.find("git", "-C", str(self.repo), "worktree", "add")
+        self.assertLess(self.run_fake.calls.index(claim), self.run_fake.calls.index(add))
+
+    def test_a_claimed_or_closed_ticket_cannot_be_started(self):
+        self.issue(5, "Widget UI", assignees=["someone-else"])
+        self.issue(6, "Widget export", state="closed")
+
+        for number in ("5", "6"):
+            out = io.StringIO()
+            code = afk.main(["start", number], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+            self.assertNotEqual(code, 0)
+            self.assertIn("not open", out.getvalue())
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "add"), [])
+
+    def test_failed_start_releases_the_claim(self):
+        def split_fails(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="no space for new pane")
+
+        self.run_fake.responses[("tmux", "split-window")] = split_fails
+        code = afk.main(["start", "4"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=io.StringIO())
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(
+            self.run_fake.find("gh", "issue", "edit"),
+            [
+                ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--add-assignee", "@me"],
+                ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--remove-assignee", "@me"],
+            ],
+        )
+
+    def test_worker_is_pointed_at_the_issue_url(self):
+        self.afk("start", "4")
+
+        [send] = self.run_fake.find("tmux", "send-keys")
+        self.assertIn("https://github.com/acme/widgets/issues/4", shlex.split(send[4])[-1])
+
+
 class FrontierTest(AfkTestCase):
     def test_frontier_lists_open_tickets_whose_blockers_are_all_done(self):
         self.ticket("01-schema", "Widget schema", status="resolved")
