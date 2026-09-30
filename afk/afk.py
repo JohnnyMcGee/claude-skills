@@ -4,6 +4,7 @@
 stdlib only. Every external command (tmux, git, gh, claude) goes through run().
 """
 
+import fcntl
 import json
 import os
 import re
@@ -11,12 +12,15 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 
 AFK_BIN = os.path.realpath(__file__)
+SKILL_DIR = Path(AFK_BIN).parent
 
 
 def default_run(cmd, input=None):
@@ -24,11 +28,12 @@ def default_run(cmd, input=None):
 
 
 class Afk:
-    def __init__(self, run, env, stdin, stdout):
+    def __init__(self, run, env, stdin, stdout, clock):
         self.run = run
         self.env = env
         self.stdin = stdin
         self.stdout = stdout
+        self.clock = clock
 
     def out(self, line):
         print(line, file=self.stdout)
@@ -87,9 +92,13 @@ class Afk:
             launch = [
                 "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}",
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
-                worker_prompt(ticket),
+                self.phase_prompt(ticket.id, "implement"),
             ]
-            write_json(worker_dir / "status.json", {"ticket": ticket.id, "phase": "implement", "state": "working", "message": ""})
+            write_json(
+                worker_dir / "status.json",
+                {"ticket": ticket.id, "phase": "implement", "state": "working", "message": "",
+                 "pane": pane, "window": window_name(ticket), "phase_started_at": self.clock()},
+            )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
             # Roll back, even on Ctrl-C, so a plain retry of `afk start` works.
@@ -105,15 +114,116 @@ class Afk:
         if state not in REPORT_STATES:
             self.out(f"afk: report state must be one of {', '.join(REPORT_STATES)}")
             return 2
-        self.update_status(state=state, message=message)
+        self.update_status(lambda status: dict(state=state, message=message, idle=False, reports=status.get("reports", 0) + 1))
 
     def cmd_hook(self, event):
         payload = json.loads(self.stdin.read() or "{}")
-        self.update_status(
-            session_id=payload.get("session_id"),
-            transcript_path=payload.get("transcript_path"),
-            last_event=payload.get("hook_event_name", event),
+
+        def changes(status):
+            changes = dict(
+                session_id=payload.get("session_id"),
+                transcript_path=payload.get("transcript_path"),
+                last_event=payload.get("hook_event_name", event),
+            )
+            if event == "stop":
+                changes["idle"] = True
+                if status["state"] == "working":
+                    # Stopped without reporting since its last phase prompt: a silent stall.
+                    changes.update(state="attention", message="stopped without reporting", reports=status.get("reports", 0) + 1)
+            return changes
+
+        self.update_status(changes)
+
+    def cmd_watch(self, interval="2"):
+        """Loop around tick for the orchestrator window's right pane. Needs no LLM, so waiting is free."""
+        try:
+            while True:
+                self.stdout.write("\033[H\033[2J")  # redraw the dashboard in place
+                try:
+                    self.cmd_tick()
+                except subprocess.CalledProcessError as error:
+                    # The failed worker's status wasn't persisted, so the next tick retries it.
+                    self.out(f"afk: `{shlex.join(error.cmd)}` failed: {(error.stderr or '').strip()}")
+                self.stdout.flush()
+                time.sleep(float(interval))
+        except KeyboardInterrupt:
+            return 0
+
+    def cmd_tick(self):
+        now = self.clock()
+        shown, failures = [], []
+        # Each worker is read, acted on and persisted under its lock, so a report or hook can't land in between,
+        # a failure can't make a later tick repeat another worker's effects, and one failing worker fails alone.
+        for path in sorted(self.workers_dir().glob("*/status.json")):
+            with locked(path.parent):
+                before = read_json(path)
+                status, effects = tick(path.parent.name, before, now)
+                if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
+                    # Pasting into a bare shell would run the prompt's markdown as commands.
+                    status, effects = tick(path.parent.name, before, now, agent_running=False)
+                try:
+                    for effect in effects:
+                        self.perform(*effect)
+                except subprocess.CalledProcessError as error:
+                    failures.append(error)
+                    shown.append(before)
+                    continue
+                if status != before:
+                    write_json(path, status)
+                shown.append(status)
+        for line in dashboard(shown, now):
+            self.out(line)
+        if failures:
+            raise failures[0]
+
+    def perform(self, kind, *args):
+        if kind == "prompt":
+            ticket_id, pane, phase = args
+            self.send_prompt(ticket_id, pane, self.phase_prompt(ticket_id, phase))
+        elif kind == "window":
+            # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
+            pane, name, state = args
+            self.best_effort(["tmux", "rename-window", "-t", pane, name + WINDOW_MARKS.get(state, "")])
+            self.best_effort(["tmux", "set-option", "-w", "-t", pane, "@afk_state", state])
+        elif kind == "notify":
+            self.notify(*args)
+
+    def notify(self, message):
+        """The only way afk gets the human's attention. Backends are best-effort: none may stop the watcher."""
+        self.stdout.write("\a")  # the watcher's pane rings, flagging the orchestrator window
+        self.best_effort(["tmux", "display-message", "-t", self.config()["session"] + ":", f"afk: {message}"])
+        self.best_effort(["notify-send", f"afk: {self.current_project()}", message])
+
+    def best_effort(self, cmd):
+        try:
+            self.run(cmd)
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    def phase_prompt(self, ticket_id, phase):
+        ticket = self.tracker().get(ticket_id)
+        return render(
+            SKILL_DIR / f"phase-{phase}.md",
+            ticket=ticket.id,
+            ticket_path=ticket.path,
+            base=self.config().get("base", "main"),
         )
+
+    def agent_running(self, pane):
+        try:
+            return self.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"]).strip() == "claude"
+        except subprocess.CalledProcessError:
+            return False
+
+    def send_prompt(self, ticket_id, pane, text):
+        """Paste as one bracketed paste, so the prompt's newlines don't submit it early, then submit."""
+        buffer = f"afk-{ticket_id}"
+        self.run(["tmux", "load-buffer", "-b", buffer, "-"], input=text)
+        self.run(["tmux", "paste-buffer", "-p", "-d", "-b", buffer, "-t", pane])
+        self.run(["tmux", "send-keys", "-t", pane, "Enter"])
+
+    def workers_dir(self):
+        return self.project_dir(self.current_project()) / "workers"
 
     def cmd_status(self):
         rows = [read_json(p) for p in sorted((self.project_dir(self.current_project()) / "workers").glob("*/status.json"))]
@@ -127,9 +237,12 @@ class Afk:
             raise SystemExit("afk: AFK_TICKET is not set; run this from an afk worker")
         return self.project_dir(self.current_project()) / "workers" / ticket / "status.json"
 
-    def update_status(self, **changes):
+    def update_status(self, changes):
+        """Merge changes(current status) into this worker's status, under its lock."""
         path = self.worker_status_path()
-        write_json(path, {**read_json(path), **changes})
+        with locked(path.parent):
+            status = read_json(path)
+            write_json(path, {**status, **changes(status)})
 
     def current_project(self):
         project = self.env.get("AFK_PROJECT") or self.run(
@@ -147,6 +260,47 @@ class Afk:
 
 
 REPORT_STATES = ("done", "blocked", "question")
+
+PHASES = ("implement", "verify", "prepr", "pr", "review")
+
+# Appended to a worker's window name so its state shows even without afk's tmux status format.
+WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "review": "✓"}
+
+
+def tick(ticket, status, now, agent_running=True):
+    """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
+
+    agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
+    """
+    status, effects = advance(ticket, status, now, agent_running)
+    if status["state"] != status.get("shown"):
+        status = {**status, "shown": status["state"]}
+        effects.append(("window", status["pane"], status["window"], status["state"]))
+    return status, effects
+
+
+def advance(ticket, status, now, agent_running):
+    state, phase, message = status["state"], status["phase"], status.get("message", "")
+    if state == "done" and status.get("idle") and not agent_running:
+        state, message = "attention", "claude is no longer running in its pane"
+        status = {**status, "state": state, "message": message, "reports": status.get("reports", 0) + 1}
+    # Only act on done once the worker has also stopped: never type into a busy session.
+    if state == "done" and status.get("idle"):
+        if phase == "review":
+            return {**status, "state": "review"}, [("notify", f"{ticket} addressed review feedback: {message}")]
+        phase = PHASES[PHASES.index(phase) + 1]
+        status = {**status, "phase": phase, "state": "working", "message": "", "idle": False, "phase_started_at": now}
+        effects = [("prompt", ticket, status["pane"], phase)]
+        if phase == "review":
+            pr = re.search(r"https?://\S+", message)
+            status = {**status, "state": "review", "pr": pr.group(0) if pr else message}
+            effects.append(("notify", f"{ticket} PR ready for review: {status['pr']}"))
+        return status, effects
+    if state in ("question", "blocked", "attention") and status.get("reports") != status.get("notified"):
+        label = "needs attention" if state == "attention" else state
+        return {**status, "notified": status.get("reports")}, [("notify", f"{ticket} {label}: {message}")]
+    return status, []
+
 
 DONE_STATUSES = {"resolved", "done", "closed"}
 
@@ -236,17 +390,39 @@ def worker_settings(base):
     }
 
 
-def worker_prompt(ticket):
-    return (
-        f"You are an AFK worker. Implement the ticket at {ticket.path}. "
-        'When you finish, or need the human, end by running `afk report <done|blocked|question> "<message>"`.'
-    )
+def dashboard(statuses, now):
+    yield f"{'TICKET':<8}{'PHASE':<11}{'STATE':<11}{'ELAPSED':<9}PR"
+    for s in statuses:
+        elapsed = duration(now - s.get("phase_started_at", now))
+        yield f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<11}{elapsed:<9}{s.get('pr', '-')}"
+
+
+def duration(seconds):
+    minutes, hours = int(seconds) // 60, int(seconds) // 3600
+    if hours:
+        return f"{hours}h{minutes % 60:02d}m"
+    return f"{minutes}m" if minutes else f"{int(seconds)}s"
+
+
+def render(template, **values):
+    text = template.read_text()
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", str(value))
+    return text
 
 
 def field(text, name):
     """Value of a `Name: value` line, tolerating markdown bold around the label."""
     match = re.search(rf"^\W*{re.escape(name)}\W*:\**\s*(.*)$", text, re.MULTILINE | re.IGNORECASE)
     return match.group(1).strip() if match else ""
+
+
+@contextmanager
+def locked(worker_dir):
+    """Serialise read-modify-writes of one worker's status between the watcher, its hooks and its reports."""
+    with open(worker_dir / "lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def read_json(path):
@@ -267,15 +443,16 @@ def toml_string(value):
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def main(argv, run=None, env=None, stdin=None, stdout=None):
+def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
     app = Afk(
         run or default_run,
         os.environ if env is None else env,
         stdin or sys.stdin,
         stdout or sys.stdout,
+        clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|start|report|status|hook> ...")
+        app.out("usage: afk <init|frontier|start|watch|tick|report|status|hook> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)

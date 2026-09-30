@@ -4,6 +4,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+import threading
 import tomllib
 import unittest
 from pathlib import Path
@@ -20,9 +21,11 @@ class FakeRun:
     def __init__(self, responses=None):
         self.responses = responses or {}
         self.calls = []
+        self.inputs = []
 
     def __call__(self, cmd, input=None):
         self.calls.append(list(cmd))
+        self.inputs.append(input)
         matches = [p for p in self.responses if tuple(cmd[: len(p)]) == p]
         if not matches:
             return ""
@@ -49,9 +52,11 @@ class AfkTestCase(unittest.TestCase):
                 ("tmux", "show-options"): "widgets\n",
                 ("git", "-C"): "",
                 ("tmux", "new-window"): "%5\n",
+                ("tmux", "display-message", "-p", "-t"): "claude\n",  # the pane's foreground command
             }
         )
         self.env = {"XDG_STATE_HOME": str(self.state_home), "HOME": str(self.tmp)}
+        self.now = 1_000_000.0
 
     def afk(self, *argv, stdin="", env=None):
         out = io.StringIO()
@@ -61,6 +66,7 @@ class AfkTestCase(unittest.TestCase):
             env={**self.env, **(env or {})},
             stdin=io.StringIO(stdin),
             stdout=out,
+            clock=lambda: self.now,
         )
         self.assertEqual(code, 0, out.getvalue())
         return out.getvalue()
@@ -323,6 +329,368 @@ class WorkerStatusTest(AfkTestCase):
         self.afk("hook", "stop", stdin=json.dumps({"session_id": "s", "transcript_path": "/t"}), env=self.worker_env("03"))
 
         self.assertEqual(self.status_rows()[0], ["03", "implement", "done", "Finished"])
+
+
+class WatchTest(AfkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI")
+        self.afk("init", str(self.scratch))
+        self.afk("start", "03")
+        self.calls_before = len(self.run_fake.calls)
+
+    def worker_env(self, ticket="03"):
+        return {"AFK_PROJECT": "widgets", "AFK_TICKET": ticket}
+
+    def report(self, state, message="", ticket="03"):
+        self.afk("report", state, message, env=self.worker_env(ticket))
+
+    def stop(self, ticket="03"):
+        payload = {"session_id": "s", "transcript_path": "/t", "hook_event_name": "Stop"}
+        self.afk("hook", "stop", stdin=json.dumps(payload), env=self.worker_env(ticket))
+
+    def prompts_sent(self, pane="%5"):
+        """Prompts pasted into a pane and submitted since setUp, in order."""
+        calls = list(zip(self.run_fake.calls, self.run_fake.inputs))[self.calls_before :]
+        prompts, buffers = [], {}
+        for cmd, stdin in calls:
+            if cmd[:2] == ["tmux", "load-buffer"]:
+                buffers[cmd[cmd.index("-b") + 1]] = stdin
+            elif cmd[:2] == ["tmux", "paste-buffer"] and cmd[cmd.index("-t") + 1] == pane:
+                self.assertIn("-p", cmd)  # bracketed paste, so newlines don't submit early
+                prompts.append(buffers[cmd[cmd.index("-b") + 1]])
+            elif cmd[:2] == ["tmux", "send-keys"] and cmd[cmd.index("-t") + 1] == pane:
+                self.assertEqual(cmd[-1], "Enter")
+        return prompts
+
+    def phase(self, ticket="03"):
+        return json.loads((self.project_dir / "workers" / ticket / "status.json").read_text())["phase"]
+
+    def status(self, ticket="03"):
+        return json.loads((self.project_dir / "workers" / ticket / "status.json").read_text())
+
+    def finish_phase(self, message="Done"):
+        self.report("done", message)
+        self.stop()
+        self.afk("tick")
+
+    def test_done_report_then_stop_advances_to_verify_and_sends_its_prompt(self):
+        self.report("done", "Implemented")
+        self.stop()
+
+        self.afk("tick")
+
+        self.assertEqual(self.phase(), "verify")
+        [prompt] = self.prompts_sent()
+        self.assertTrue(prompt.startswith("AFK phase: verify"), prompt)
+        self.assertIn(str(self.scratch / "issues" / "03-ui.md"), prompt)
+
+    def test_done_report_while_worker_is_still_busy_sends_nothing(self):
+        self.report("done", "Implemented")
+
+        self.afk("tick")
+
+        self.assertEqual(self.phase(), "implement")
+        self.assertEqual(self.prompts_sent(), [])
+
+    def test_stop_left_over_from_before_the_report_does_not_count_as_idle(self):
+        self.stop()
+        self.report("done", "Implemented")
+
+        self.afk("tick")
+
+        self.assertEqual(self.prompts_sent(), [])
+
+    def test_each_done_phase_advances_to_the_next_until_review(self):
+        for _ in range(4):
+            self.finish_phase()
+
+        self.assertEqual(self.phase(), "review")
+        self.assertEqual(self.status()["state"], "review")
+        self.assertEqual(
+            [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()],
+            ["AFK phase: verify", "AFK phase: prepr", "AFK phase: pr", "AFK phase: review"],
+        )
+
+    def desktop_notifications(self):
+        return [" ".join(c[1:]) for c in self.run_fake.calls[self.calls_before :] if c[0] == "notify-send"]
+
+    def test_question_and_blocked_reports_notify_once_without_advancing(self):
+        for state, message in [("question", "Which database?"), ("blocked", "CI is down")]:
+            with self.subTest(state):
+                self.report(state, message)
+                self.stop()
+
+                self.afk("tick")
+                self.afk("tick")
+
+                self.assertEqual(self.phase(), "implement")
+                self.assertEqual(self.prompts_sent(), [])
+                [notification] = [n for n in self.desktop_notifications() if message in n]
+                self.assertIn("03", notification)
+                self.assertIn(state, notification)
+
+    def test_same_question_asked_again_after_an_answer_notifies_again(self):
+        self.report("question", "Which database?")
+        self.stop()
+        self.afk("tick")
+        self.report("question", "Which database?")
+        self.stop()
+
+        self.afk("tick")
+
+        self.assertEqual(len(self.desktop_notifications()), 2)
+
+    def reach_review(self, pr="https://github.com/acme/widgets/pull/42"):
+        for message in ["Implemented", "Verified", "Checks pass", pr]:
+            self.finish_phase(message)
+
+    def test_reaching_review_notifies_with_the_pr(self):
+        self.reach_review()
+
+        [notification] = self.desktop_notifications()
+        self.assertIn("03", notification)
+        self.assertIn("https://github.com/acme/widgets/pull/42", notification)
+
+    def test_done_after_review_feedback_stays_in_review_and_notifies(self):
+        self.reach_review()
+        prompts = len(self.prompts_sent())
+
+        self.finish_phase("Renamed the endpoint as asked")
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+        self.assertEqual(len(self.prompts_sent()), prompts)
+        self.assertEqual(len(self.desktop_notifications()), 2)
+        self.assertIn("Renamed the endpoint as asked", self.desktop_notifications()[-1])
+
+    def test_stop_without_a_report_needs_attention_and_notifies_once(self):
+        self.stop()
+
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
+        [notification] = self.desktop_notifications()
+        self.assertIn("03", notification)
+        self.assertIn("attention", notification)
+
+    def test_stop_without_a_report_after_a_new_phase_prompt_needs_attention(self):
+        self.finish_phase()
+
+        self.stop()
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("verify", "attention"))
+
+    def test_standing_by_in_review_does_not_need_attention(self):
+        self.reach_review()
+
+        self.stop()
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "review")
+
+    def test_worker_that_needed_attention_can_report_done_and_move_on(self):
+        self.stop()
+        self.afk("tick")
+
+        self.finish_phase()
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("verify", "working"))
+
+    def test_tick_renders_dashboard_of_each_tickets_phase_state_time_in_phase_and_pr(self):
+        self.ticket("05-export", "Widget export")
+        self.afk("start", "05")
+        self.now += 60
+        self.reach_review()
+        self.now += 3600 + 300
+
+        dashboard = self.afk("tick").splitlines()
+
+        self.assertEqual(dashboard[0].split(), ["TICKET", "PHASE", "STATE", "ELAPSED", "PR"])
+        self.assertEqual(
+            [line.split() for line in dashboard[1:]],
+            [
+                ["03", "review", "review", "1h05m", "https://github.com/acme/widgets/pull/42"],
+                ["05", "implement", "working", "1h06m", "-"],
+            ],
+        )
+
+    def test_dashboard_shows_short_elapsed_times_in_minutes_and_seconds(self):
+        self.now += 45
+        self.assertEqual(self.afk("tick").splitlines()[1].split()[3], "45s")
+        self.now += 12 * 60
+        self.assertEqual(self.afk("tick").splitlines()[1].split()[3], "12m")
+
+    def window(self, pane="%5"):
+        """The worker window's last applied name and @afk_state since setUp."""
+        name = state = None
+        for cmd in self.run_fake.calls[self.calls_before :]:
+            if cmd[:2] == ["tmux", "rename-window"] and cmd[cmd.index("-t") + 1] == pane:
+                name = cmd[-1]
+            if cmd[:2] == ["tmux", "set-option"] and "@afk_state" in cmd and cmd[cmd.index("-t") + 1] == pane:
+                self.assertIn("-w", cmd)
+                state = cmd[-1]
+        return name, state
+
+    def test_window_name_and_state_option_follow_the_worker(self):
+        self.report("question", "Which database?")
+        self.stop()
+        self.afk("tick")
+        self.assertEqual(self.window(), ("03-widget-ui?", "question"))
+
+        self.finish_phase()
+        self.assertEqual(self.window(), ("03-widget-ui", "working"))
+
+        self.stop()
+        self.afk("tick")
+        self.assertEqual(self.window(), ("03-widget-ui!", "attention"))
+
+        for message in ["Verified", "Checks pass", "https://github.com/acme/widgets/pull/42"]:
+            self.finish_phase(message)
+        self.assertEqual(self.window(), ("03-widget-ui✓", "review"))
+
+    def test_window_is_only_updated_when_the_state_changes(self):
+        self.report("blocked", "CI is down")
+        self.stop()
+        self.afk("tick")
+        renames = len(self.run_fake.find("tmux", "rename-window"))
+
+        self.afk("tick")
+
+        self.assertEqual(len(self.run_fake.find("tmux", "rename-window")), renames)
+
+    def test_notify_rings_the_bell_and_shows_a_tmux_message_as_well_as_a_desktop_notification(self):
+        self.report("question", "Which database?")
+        self.stop()
+
+        output = self.afk("tick")
+
+        self.assertIn("\a", output)
+        [message] = [c for c in self.run_fake.find("tmux", "display-message") if "Which database?" in c[-1]]
+        self.assertEqual(message[message.index("-t") + 1], "work:")
+        self.assertEqual(len(self.desktop_notifications()), 1)
+
+    def test_quiet_ticks_do_not_ring_the_bell(self):
+        self.assertNotIn("\a", self.afk("tick"))
+
+    def test_a_failing_notification_backend_does_not_stop_the_watcher(self):
+        def missing(cmd):
+            raise FileNotFoundError(2, "No such file or directory", "notify-send")
+
+        self.run_fake.responses[("notify-send",)] = missing
+        self.report("question", "Which database?")
+        self.stop()
+
+        self.afk("tick")
+
+        self.assertTrue([c for c in self.run_fake.find("tmux", "display-message") if "Which database?" in c[-1]])
+        self.afk("tick")
+        self.assertEqual(len(self.desktop_notifications()), 1)
+
+    def test_a_prompt_that_fails_to_send_does_not_resend_other_workers_prompts(self):
+        self.ticket("05-export", "Widget export")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.afk("start", "05")
+        self.calls_before = len(self.run_fake.calls)
+        for ticket in ("03", "05"):
+            self.report("done", "Implemented", ticket=ticket)
+            self.stop(ticket=ticket)
+
+        def pane_gone(cmd):
+            if "%7" in cmd:
+                raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %7")
+            return ""
+
+        self.run_fake.responses[("tmux", "paste-buffer")] = pane_gone
+        out = io.StringIO()
+        afk.main(["tick"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+        del self.run_fake.responses[("tmux", "paste-buffer")]
+
+        self.afk("tick")
+
+        self.assertEqual(len(self.prompts_sent("%5")), 1)
+        self.assertEqual(len(self.prompts_sent("%7")), 2)  # the failed paste, then its retry
+        self.assertEqual((self.phase("03"), self.phase("05")), ("verify", "verify"))
+
+    def test_a_worker_whose_pane_is_gone_does_not_hold_up_the_others(self):
+        self.ticket("05-export", "Widget export")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.afk("start", "05")
+        for ticket in ("03", "05"):
+            self.report("done", "Implemented", ticket=ticket)
+            self.stop(ticket=ticket)
+
+        def pane_gone(cmd):
+            if "%5" in cmd:
+                raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %5")
+            return ""
+
+        self.run_fake.responses[("tmux", "paste-buffer")] = pane_gone
+        out = io.StringIO()
+        code = afk.main(["tick"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("can't find pane: %5", out.getvalue())
+        self.assertEqual((self.phase("03"), self.phase("05")), ("implement", "verify"))
+
+    def test_a_report_arriving_while_the_tick_prompts_that_worker_is_not_lost(self):
+        self.report("done", "Implemented")
+        self.stop()
+        reporter = threading.Thread(target=self.report, args=("question", "Which database?"))
+
+        def worker_reports_mid_paste(cmd):
+            reporter.start()
+            reporter.join(timeout=0.2)  # without a lock it lands now, and the tick's write would clobber it
+            return ""
+
+        self.run_fake.responses[("tmux", "paste-buffer")] = worker_reports_mid_paste
+        self.afk("tick")
+        reporter.join()
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("verify", "question"))
+
+    def test_a_failing_window_update_does_not_resend_the_phase_prompt(self):
+        def rename_fails(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="server busy")
+
+        self.run_fake.responses[("tmux", "rename-window")] = rename_fails
+        self.report("done", "Implemented")
+        self.stop()
+
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual(self.phase(), "verify")
+        self.assertEqual(len(self.prompts_sent()), 1)
+
+    def test_next_phase_is_not_pasted_into_a_pane_where_claude_has_exited(self):
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = "bash\n"
+        self.report("done", "Implemented")
+        self.stop()
+
+        self.afk("tick")
+
+        self.assertEqual(self.prompts_sent(), [])
+        self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
+        [notification] = self.desktop_notifications()
+        self.assertIn("03", notification)
+        self.assertIn("claude", notification)
+
+    def test_a_killed_agent_pane_needs_attention_instead_of_failing_every_tick(self):
+        def pane_gone(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %5")
+
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = pane_gone
+        self.report("done", "Implemented")
+        self.stop()
+
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
+        self.assertEqual(len(self.desktop_notifications()), 1)
 
 
 if __name__ == "__main__":
