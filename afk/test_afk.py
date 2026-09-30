@@ -108,6 +108,16 @@ class FrontierTest(AfkTestCase):
 
         self.assertEqual(output.splitlines(), ["03  Widget UI", "05  Widget export"])
 
+    def test_numbers_in_blocker_prose_are_not_treated_as_tickets(self):
+        self.ticket("01-auth", "Add 2FA login", status="done")
+        self.ticket("02-keys", "Key rotation", blocked_by="None — needs 2 API keys")
+        self.ticket("03-audit", "Audit log", blocked_by="01 — Add 2FA login")
+        self.afk("init", str(self.scratch))
+
+        output = self.afk("frontier")
+
+        self.assertEqual(output.splitlines(), ["02  Key rotation", "03  Audit log"])
+
 
 class StartTest(AfkTestCase):
     def setUp(self):

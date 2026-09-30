@@ -185,7 +185,7 @@ def parse_ticket(path):
         id=number,
         title=title,
         status=field(text, "Status").lower(),
-        blocked_by=[n.zfill(len(number)) for n in re.findall(r"\b(\d+)\b", field(text, "Blocked by"))],
+        blocked_by=[n.zfill(len(number)) for n in re.findall(r"(?:^|,)\s*#?(\d+)\b", field(text, "Blocked by"))],
         path=path,
     )
 
