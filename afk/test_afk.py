@@ -1767,13 +1767,15 @@ class SplitTest(AfkTestCase):
         self.ticket("01-schema", "Widget schema")  # reopening the original's blocker blocks every part again
         self.assertEqual(self.afk("frontier").splitlines(), ["01  Widget schema", "03  Widget UI"])
 
-    def test_split_into_no_parts_fails_and_keeps_the_ticket(self):
-        out = io.StringIO()
-        code = afk.main(["split", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO("[]"), stdout=out)
+    def test_split_into_no_parts_or_a_malformed_part_fails_before_writing_anything(self):
+        for parts in ([], [SPLIT_PARTS[0], {"repo": "acme/web", "title": "Export button"}], [SPLIT_PARTS[0], "acme/web"]):
+            with self.subTest(parts=parts):
+                out = io.StringIO()
+                code = afk.main(["split", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO(json.dumps(parts)), stdout=out)
 
-        self.assertNotEqual(code, 0)
-        self.assertIn("non-empty", out.getvalue())
-        self.assertEqual(self.afk("frontier").splitlines(), ["03  Widget UI", "05  Widget export"])
+                self.assertNotEqual(code, 0)
+                self.assertIn("non-empty JSON list of {repo, title, body}", out.getvalue())
+                self.assertEqual(self.afk("frontier").splitlines(), ["03  Widget UI", "05  Widget export"])
 
     def test_tickets_blocked_by_the_split_ticket_wait_for_every_part(self):
         self.ticket("04-report", "Widget report", blocked_by="03, 05")

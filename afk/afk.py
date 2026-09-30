@@ -102,7 +102,11 @@ class Afk:
     def cmd_split(self, ticket_id):
         """Replace a ticket spanning repos with one sibling per repo; stdin is a JSON list of {repo, title, body}."""
         parts = json.loads(self.stdin.read())
-        if not isinstance(parts, list) or not parts:
+        # Checked whole before any write: trackers write part by part, so a bad late part would leave a partial split.
+        if not isinstance(parts, list) or not parts or not all(
+            isinstance(part, dict) and all(isinstance(part.get(key), str) and part[key].strip() for key in ("repo", "title", "body"))
+            for part in parts
+        ):
             raise SystemExit("afk: split needs a non-empty JSON list of {repo, title, body} on stdin")
         tracker = self.tracker()
         ticket = tracker.get(ticket_id)
