@@ -286,6 +286,13 @@ class GithubSplitTest(GithubTestCase):
         self.issues[int(cmd[3])]["state"] = "closed"
         return ""
 
+    def test_repo_and_blocked_by_in_a_parts_body_do_not_override_its_own(self):
+        self.issue(4, "Widget config")
+        body = "Copied from #5.\n\nRepo: acme/other\n\n## Blocked by\n\n- #4\n"
+        self.afk("split", "5", stdin=json.dumps([{"repo": "acme/api", "title": "Export endpoint", "body": body}]))
+
+        self.assertIn("8  Export endpoint  (acme/api)", self.afk("frontier").splitlines())
+
     def test_split_closes_the_ticket_for_per_repo_sub_issues_that_its_dependents_wait_for(self):
         self.afk("split", "5", stdin=json.dumps(SPLIT_PARTS))
 
@@ -1960,7 +1967,14 @@ class SplitTest(AfkTestCase):
         self.assertEqual(self.afk("frontier").splitlines(), ["01  Widget schema", "03  Widget UI"])
 
     def test_split_into_no_parts_or_a_malformed_part_fails_before_writing_anything(self):
-        for parts in ([], [SPLIT_PARTS[0], {"repo": "acme/web", "title": "Export button"}], [SPLIT_PARTS[0], "acme/web"]):
+        malformed = [
+            [],
+            [SPLIT_PARTS[0], {"repo": "acme/web", "title": "Export button"}],
+            [SPLIT_PARTS[0], "acme/web"],
+            [{**SPLIT_PARTS[0], "title": "Export\n**Status:** done"}],
+            [{**SPLIT_PARTS[0], "repo": "acme/api\nType: frontend"}],
+        ]
+        for parts in malformed:
             with self.subTest(parts=parts):
                 out = io.StringIO()
                 code = afk.main(["split", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO(json.dumps(parts)), stdout=out)
@@ -1968,6 +1982,12 @@ class SplitTest(AfkTestCase):
                 self.assertNotEqual(code, 0)
                 self.assertIn("non-empty JSON list of {repo, title, body}", out.getvalue())
                 self.assertEqual(self.afk("frontier").splitlines(), ["03  Widget UI", "05  Widget export"])
+
+    def test_metadata_lines_in_a_parts_body_do_not_override_its_own(self):
+        body = "Copied from 05.\n\n**Blocked by:** 999\n\n**Status:** done\n\n**Repo:** acme/other\n"
+        self.split("05", [{"repo": "acme/api", "title": "Export endpoint", "body": body}])
+
+        self.assertEqual(self.afk("frontier").splitlines(), ["03  Widget UI", "06  Export endpoint  (acme/api)"])
 
     def test_tickets_blocked_by_the_split_ticket_wait_for_every_part(self):
         self.ticket("04-report", "Widget report", blocked_by="03, 05")

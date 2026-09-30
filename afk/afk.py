@@ -104,7 +104,9 @@ class Afk:
         parts = json.loads(self.stdin.read())
         # Checked whole before any write: trackers write part by part, so a bad late part would leave a partial split.
         if not isinstance(parts, list) or not parts or not all(
-            isinstance(part, dict) and all(isinstance(part.get(key), str) and part[key].strip() for key in ("repo", "title", "body"))
+            isinstance(part, dict)
+            and all(isinstance(part.get(key), str) and part[key].strip() for key in ("repo", "title", "body"))
+            and not any(c in part[key] for key in ("repo", "title") for c in "\r\n")  # one line each: no forged fields
             for part in parts
         ):
             raise SystemExit("afk: split needs a non-empty JSON list of {repo, title, body} on stdin")
@@ -760,9 +762,10 @@ class LocalTracker:
         ids = []
         for number, part in enumerate(parts, start=max(numbers) + 1):
             id = str(number).zfill(len(ticket.id))
+            # Fields before the body: the first match wins, so fields copied into the body can't override them.
             (self.issues_dir / f"{id}-{slug(part['title'])}.md").write_text(
-                f"# {id} — {part['title']}\n\n{part['body'].strip()}\n\n**Repo:** {part['repo']}\n\n"
-                f"**Blocked by:** {blocked_by}\n\n**Status:** ready-for-agent\n"
+                f"# {id} — {part['title']}\n\n**Repo:** {part['repo']}\n\n**Blocked by:** {blocked_by}\n\n"
+                f"**Status:** ready-for-agent\n\n{part['body'].strip()}\n"
             )
             ids.append(id)
         for dependent in self.tickets():
@@ -840,7 +843,8 @@ class GithubTracker:
         blocked_by = "\n".join(f"- #{b['number']}" for b in self.blockers(ticket)) or "None — can start immediately"
         created = []
         for part in parts:
-            body = f"{part['body'].strip()}\n\nRepo: {part['repo']}\n\n## Blocked by\n\n{blocked_by}\n"
+            # Repo line and Blocked by section first, as the first match wins; the heading after them ends the section.
+            body = f"Repo: {part['repo']}\n\n## Blocked by\n\n{blocked_by}\n\n## Details\n\n{part['body'].strip()}\n"
             created.append(json.loads(self.run(
                 ["gh", "api", f"repos/{self.repo}/issues", "-X", "POST", "-f", f"title={part['title']}", "-f", f"body={body}"]
             )))
