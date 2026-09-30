@@ -650,6 +650,20 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual((self.phase(), self.status()["state"]), ("verify", "question"))
 
+    def test_a_failing_window_update_does_not_resend_the_phase_prompt(self):
+        def rename_fails(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="server busy")
+
+        self.run_fake.responses[("tmux", "rename-window")] = rename_fails
+        self.report("done", "Implemented")
+        self.stop()
+
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual(self.phase(), "verify")
+        self.assertEqual(len(self.prompts_sent()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

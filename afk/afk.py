@@ -178,23 +178,24 @@ class Afk:
             ticket_id, pane, phase = args
             self.send_prompt(ticket_id, pane, self.phase_prompt(ticket_id, phase))
         elif kind == "window":
+            # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
             pane, name, state = args
-            self.run(["tmux", "rename-window", "-t", pane, name + WINDOW_MARKS.get(state, "")])
-            self.run(["tmux", "set-option", "-w", "-t", pane, "@afk_state", state])
+            self.best_effort(["tmux", "rename-window", "-t", pane, name + WINDOW_MARKS.get(state, "")])
+            self.best_effort(["tmux", "set-option", "-w", "-t", pane, "@afk_state", state])
         elif kind == "notify":
             self.notify(*args)
 
     def notify(self, message):
         """The only way afk gets the human's attention. Backends are best-effort: none may stop the watcher."""
         self.stdout.write("\a")  # the watcher's pane rings, flagging the orchestrator window
-        for backend in (
-            ["tmux", "display-message", "-t", self.config()["session"] + ":", f"afk: {message}"],
-            ["notify-send", f"afk: {self.current_project()}", message],
-        ):
-            try:
-                self.run(backend)
-            except (OSError, subprocess.CalledProcessError):
-                pass
+        self.best_effort(["tmux", "display-message", "-t", self.config()["session"] + ":", f"afk: {message}"])
+        self.best_effort(["notify-send", f"afk: {self.current_project()}", message])
+
+    def best_effort(self, cmd):
+        try:
+            self.run(cmd)
+        except (OSError, subprocess.CalledProcessError):
+            pass
 
     def phase_prompt(self, ticket_id, phase):
         ticket = self.tracker().get(ticket_id)
