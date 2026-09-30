@@ -31,6 +31,10 @@ Never start a ticket the user has not named or approved.
 
 The watcher drives each worker through `implement → verify → prepr → pr → review`, pasting the next phase's prompt (`phase-<name>.md` in this folder) into the worker's pane. It sends a prompt only after the worker has reported `done` *and* its session has stopped, so it never types into a busy worker. If the repo sets `verify_concurrency`, a worker due to verify while the slots are full waits with state `queued` and is started when one frees. Reaching `review` means the PR is Ready; the review prompt gives standing instructions for handling feedback the user types into the pane.
 
+## Merge and cleanup
+
+The watcher polls each `review` PR with `gh pr view` about once a minute. It never merges a PR or requests reviewers: merging is the user's call. Once the PR is merged, it removes the worker's window, worktree and local branch, which frees its slot, and notifies the user to run `/afk next` for the next batch. It does this only when the worker's shell pane is idle at a shell prompt and the worktree has no uncommitted changes. Otherwise the worker becomes `cleanup-pending` and the user is notified once. The watcher checks again every tick and cleans up as soon as it's safe. Tell the user what is holding cleanup up. Don't clean up by hand.
+
 ## Worker protocol
 
 Workers end every phase with `afk report <done|blocked|question> "<message>"`. That, plus the hooks, is what `afk status` shows.
