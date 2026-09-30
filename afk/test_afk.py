@@ -203,6 +203,22 @@ class StartTest(AfkTestCase):
         )
         self.assertFalse((self.project_dir / "workers" / "03").exists())
 
+    def test_interrupted_start_rolls_back_and_can_be_retried(self):
+        def interrupted(cmd):
+            raise KeyboardInterrupt
+
+        self.run_fake.responses[("tmux", "split-window")] = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self.afk("start", "03")
+
+        self.assertEqual(len(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove")), 1)
+        del self.run_fake.responses[("tmux", "split-window")]
+        self.afk("start", "03")
+        self.assertEqual(self.worker_state("03"), "working")
+
+    def worker_state(self, ticket):
+        return json.loads((self.project_dir / "workers" / ticket / "status.json").read_text())["state"]
+
     def test_starting_an_already_started_ticket_leaves_the_running_worker_alone(self):
         self.afk("start", "03")
         calls_before = len(self.run_fake.calls)

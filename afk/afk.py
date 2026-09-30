@@ -91,8 +91,8 @@ class Afk:
             ]
             write_json(worker_dir / "status.json", {"ticket": ticket.id, "phase": "implement", "state": "working", "message": ""})
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
-        except Exception:
-            # Roll back so a plain retry of `afk start` works.
+        except BaseException:
+            # Roll back, even on Ctrl-C, so a plain retry of `afk start` works.
             for step in reversed(undo):
                 try:
                     step()
