@@ -15,7 +15,7 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 
 - **`afk init <spec>`** — create the project from a local spec directory (`.scratch/<slug>/` or its `spec.md`), or from a GitHub spec issue URL whose sub-issues are the tickets (run it from inside that repo's clone), and bind it to the current tmux session. Run once per project.
 - **`afk frontier`** — list open, unclaimed tickets whose blockers are all resolved/done/closed. On GitHub a ticket is claimed when it has any assignee, blockers are its native blocked-by dependencies (else its `## Blocked by` section), and a `Repo: owner/name` line shows as `(owner/name)`; without one the repo is unresolved.
-- **`afk start <ticket> [--type <type>]`** — claim the ticket (on GitHub, assign it to you), create a worktree and branch `afk/<project>-<ticket>` from the repo's base branch, copy its gitignored files in and run its bootstrap commands, allocate a slot (`AFK_SLOT`, `AFK_PORT_BASE`), open a tmux window `<ticket>-<abbrev>` split agent-left / shell-right, and launch an interactive `claude` worker in auto permission mode with per-session hooks and a deny list (no force-push, no push to base, no `gh pr merge`, no worktree removal). The ticket's task type picks the model, effort, skill and prompt template. All of this comes from the repo's `docs/agents/afk.md`; see [repo-config.md](repo-config.md).
+- **`afk start <ticket> [--type <type>]`** — claim the ticket (on GitHub, assign it to you), create a worktree and branch `afk/<project>-<ticket>` from the repo's base branch, copy its gitignored files in and run its bootstrap commands, allocate a slot (`AFK_SLOT`, `AFK_PORT_BASE`), open a tmux window `<ticket>-<abbrev>` split agent-left / shell-right, and launch an interactive `claude` worker in auto permission mode with per-session hooks and a deny list (no force-push, no push to base, no `gh pr merge`, no worktree removal). The ticket's task type picks the model, effort, skill and prompt template; a `hitl` ticket gets a guide-mode prompt instead of implement (see [HITL tickets](#hitl-tickets)). All of this comes from the repo's `docs/agents/afk.md`; see [repo-config.md](repo-config.md).
 - **`afk watch`** — the watcher: run it in the orchestrator window's right pane. Every couple of seconds it advances workers through their phases, redraws the dashboard (ticket, phase, state, time in phase, PR), marks each worker's tmux window with its state, and notifies (bell, tmux message, `notify-send`) when a worker needs the human. It needs no LLM. `afk tick` runs one step of it.
 - **`afk status`** — every worker's ticket, phase, state and last message.
 
@@ -32,9 +32,13 @@ Never start a ticket the user has not named or approved.
 
 The watcher drives each worker through `implement → verify → prepr → pr → review`, pasting the next phase's prompt (`phase-<name>.md` in this folder) into the worker's pane. It sends a prompt only after the worker has reported `done` *and* its session has stopped, so it never types into a busy worker. If the repo sets `verify_concurrency`, a worker due to verify while the slots are full waits with state `queued` and is started when one frees. Reaching `review` means the PR is Ready; the review prompt gives standing instructions for handling feedback the user types into the pane.
 
+## HITL tickets
+
+A ticket of the built-in `hitl` type is the user's to work on. `afk start` sets it up exactly as it would any other ticket: worktree, bootstrap, slot and window. But its worker is launched in guide mode (`phase-hitl.md`), where it helps the user rather than doing the work. The watcher never drives it through phases, never prompts it, and doesn't hold it to phase or idle limits. It shows as phase `hitl`, state `yours`. It doesn't count toward `max_workers`, and starting one is never refused for being over that limit. The watcher finds its PR by branch (`afk/<project>-<ticket>`) once the user opens one, and merge cleanup works as below.
+
 ## Merge and cleanup
 
-The watcher polls each `review` PR with `gh pr view` about once a minute. It never merges a PR or requests reviewers: merging is the user's call. Once the PR is merged, it removes the worker's window, worktree and local branch, which frees its slot, and notifies the user to run `/afk next` for the next batch. It does this only when the worker's shell pane is idle at a shell prompt and the worktree has no uncommitted changes. Otherwise the worker becomes `cleanup-pending` and the user is notified once. The watcher checks again every tick and cleans up as soon as it's safe. Tell the user what is holding cleanup up. Don't clean up by hand.
+The watcher polls each `review` PR, and each `hitl` worker's branch, with `gh pr view` about once a minute. It never merges a PR or requests reviewers: merging is the user's call. Once the PR is merged, it removes the worker's window, worktree and local branch, which frees its slot, and notifies the user to run `/afk next` for the next batch. It does this only when the worker's shell pane is idle at a shell prompt and the worktree has no uncommitted changes. Otherwise the worker becomes `cleanup-pending` and the user is notified once. The watcher checks again every tick and cleans up as soon as it's safe. Tell the user what is holding cleanup up. Don't clean up by hand.
 
 ## Worker protocol
 
@@ -50,7 +54,7 @@ The watcher contains runaway workers. Defaults, overridable in the project's `co
 
 ```toml
 [limits]
-max_workers = 3     # `afk start` refuses beyond this; workers in review don't count
+max_workers = 3     # `afk start` refuses beyond this; workers in review and hitl workers don't count
 phase_minutes = 90  # wall-clock in one phase while working
 idle_minutes = 20   # working, but its transcript hasn't changed
 fix_loops = 3       # review rounds (feedback → fix → done) before stopping to look

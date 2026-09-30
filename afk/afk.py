@@ -89,13 +89,15 @@ class Afk:
         repo_config = self.repo_config()
         type_name = type_name or repo_config.get("default_type")
         task_types = repo_config.get("task_types", {})
-        if type_name and type_name not in task_types:
+        if type_name and type_name not in task_types and type_name != HITL:
             raise SystemExit(f"afk: unknown task type '{type_name}'; docs/agents/afk.md defines: {', '.join(task_types) or 'none'}")
         task_type = task_types.get(type_name, {})
         if task_type.get("agent", "claude") not in AGENTS:
             raise SystemExit(f"afk: task type '{type_name}' uses agent '{task_type['agent']}'; supported: {', '.join(AGENTS)}")
         base = repo_config.get("base", "main")
-        slot = self.claim_worker(worker_dir)
+        # A hitl ticket is the human's: its worker guides them and is never driven through the phases.
+        phase, state = ("hitl", "yours") if type_name == HITL else ("implement", "working")
+        slot = self.claim_worker(worker_dir, counted=phase != "hitl")
         slot_env = [f"AFK_SLOT={slot}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * slot}"]
         branch = f"afk/{project}-{ticket.id}"
         undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
@@ -125,11 +127,11 @@ class Afk:
                 "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
                 *[arg for key in ("model", "effort") if key in task_type for arg in (f"--{key}", task_type[key])],
-                self.implement_prompt(ticket, task_type),
+                self.first_prompt(ticket, phase, task_type),
             ]
             write_json(
                 worker_dir / "status.json",
-                {"ticket": ticket.id, "phase": "implement", "state": "working", "message": "",
+                {"ticket": ticket.id, "phase": phase, "state": state, "message": "",
                  "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "type": type_name, "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
@@ -143,17 +145,21 @@ class Afk:
             raise
         self.out(f"started {ticket.id} in {worktree} on {branch}")
 
-    def claim_worker(self, worker_dir):
-        """Create the worker's dir and claim the lowest slot no active worker holds; removing the dir frees it."""
+    def claim_worker(self, worker_dir, counted=True):
+        """Create the worker's dir and claim the lowest slot no active worker holds; removing the dir frees it.
+
+        An uncounted worker (a hitl ticket's) is neither held to max_workers nor counted toward it.
+        """
         workers = worker_dir.parent
         workers.mkdir(parents=True, exist_ok=True)
         with locked(workers):
             if worker_dir.exists():
                 raise SystemExit(f"afk: ticket {worker_dir.name} is already started; see `afk status`")
             max_workers = {**LIMITS, **self.config().get("limits", {})}["max_workers"]
-            # Workers in review are parked on the human, so they don't count; one still starting has no status yet.
-            active = [d for d in workers.glob("*/slot") if not is_reviewing(d.parent / "status.json")]
-            if len(active) >= max_workers:
+            # Workers in review are parked on the human and hitl workers are the human's, so neither counts;
+            # one still starting has no status yet.
+            active = [d for d in workers.glob("*/slot") if counts_toward_max(d.parent / "status.json")]
+            if counted and len(active) >= max_workers:
                 raise SystemExit(f"afk: {len(active)} workers already active (max_workers = {max_workers}); see `afk status`")
             worker_dir.mkdir()
             taken = {int(p.read_text()) for p in workers.glob("*/slot")}
@@ -222,8 +228,8 @@ class Afk:
                              last_activity=last_write(before.get("transcript_path")))
                 try:
                     pr_state = None
-                    if before["phase"] == "review" and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
-                        pr_state = self.pr_state(before["pr"])
+                    if before["phase"] in ("review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
+                        pr_state = self.pr_state(before)
                     merged = pr_state == "MERGED" or before["state"] == "cleanup-pending"
                     blocker = self.cleanup_blocker(before) if merged else None
                     status, effects = tick(path.parent.name, before, now, pr_state=pr_state, cleanup_blocker=blocker, **given)
@@ -309,9 +315,9 @@ class Afk:
             base=self.repo_config().get("base", "main"),
         )
 
-    def implement_prompt(self, ticket, task_type):
+    def first_prompt(self, ticket, phase, task_type):
         """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
-        prompt = self.phase_prompt(ticket.id, "implement")
+        prompt = self.phase_prompt(ticket.id, phase)
         if "prompt" in task_type:
             template = Path(self.config()["repo"]) / task_type["prompt"]
             prompt += "\n" + render(template, ticket=ticket.id, ticket_path=ticket.path)
@@ -319,9 +325,21 @@ class Afk:
             prompt = f"{task_type['skill']} {prompt}"
         return prompt
 
-    def pr_state(self, pr):
-        """GitHub's state for the PR: OPEN, CLOSED or MERGED. afk only ever reads PRs; merging is the human's call."""
-        return self.run(["gh", "pr", "view", pr, "--json", "state", "-q", ".state"]).strip()
+    def pr_state(self, status):
+        """GitHub's state for the worker's PR: OPEN, CLOSED or MERGED. afk only ever reads PRs; merging is the human's call.
+
+        A hitl worker's PR is the human's and never reported, so it is looked up by the worker's branch: NONE until
+        the human opens one.
+        """
+        if status["phase"] == "hitl":
+            branch = f"afk/{self.current_project()}-{status['ticket']}"
+            try:
+                return self.run(["gh", "pr", "view", branch, "--json", "state", "-q", ".state"], cwd=self.worktree(status["ticket"])).strip()
+            except subprocess.CalledProcessError as error:
+                if "no pull requests found" not in (error.stderr or ""):
+                    raise
+                return "NONE"
+        return self.run(["gh", "pr", "view", status["pr"], "--json", "state", "-q", ".state"]).strip()
 
     def agent_running(self, pane):
         return self.pane_command(pane) == "claude"
@@ -391,6 +409,9 @@ REPORT_STATES = ("done", "blocked", "question")
 
 AGENTS = ("claude",)
 
+# The built-in task type for human-in-the-loop tickets; the repo may still configure it under task_types.
+HITL = "hitl"
+
 # Runaway limits; a project's config.toml [limits] table overrides any of them.
 LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
 
@@ -427,6 +448,9 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
         # Checked again every tick, but the human hears about it once.
         effects = [] if status["state"] == "cleanup-pending" else [("notify", f"{ticket} merged; cleanup pending: {cleanup_blocker}")]
         status = {**status, "state": "cleanup-pending", "message": cleanup_blocker}
+    elif status["phase"] == "hitl":
+        # The human drives it, so there's nothing to advance, no limit to hold it to, and no report to act on.
+        status, effects = {**status, "state": "yours"}, []
     else:
         limits = {**LIMITS, **(limits or {})}
         status, effects = advance(ticket, status, now, agent_running, may_verify, limits)
@@ -729,11 +753,11 @@ def locked(worker_dir):
         yield
 
 
-def is_reviewing(status_path):
+def counts_toward_max(status_path):
     try:
-        return read_json(status_path)["phase"] == "review"
+        return read_json(status_path)["phase"] not in ("review", "hitl")
     except FileNotFoundError:
-        return False
+        return True
 
 
 def last_write(path):

@@ -1511,6 +1511,99 @@ class WatchTest(AfkTestCase):
         self.assertEqual(self.status()["state"], "cleanup-pending")
         self.assertIn("shell pane is unknown", self.desktop_notifications()[-1])
 
+    # HITL tickets
+
+    def start_hitl(self):
+        """Start ticket 04, of the built-in hitl type, in panes %7 (agent) and %8 (shell)."""
+        self.ticket("04-spike", "Widget spike", type="hitl")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.run_fake.responses[("tmux", "split-window")] = "%8\n"
+        self.afk("start", "04")
+        self.calls_before = len(self.run_fake.calls)
+
+    def test_a_hitl_ticket_is_set_up_like_any_other_but_launches_a_guide_mode_agent(self):
+        self.start_hitl()
+
+        worktree = str(self.project_dir / "worktrees" / "04")
+        self.assertIn(["git", "-C", str(self.repo), "worktree", "add", "-b", "afk/widgets-04", worktree, "main"], self.run_fake.calls)
+        [split] = [c for c in self.run_fake.find("tmux", "split-window") if "%7" in c]
+        launch = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])
+        self.assertIn("AFK_SLOT=2", launch)
+        claude = launch[launch.index("claude") :]
+        self.assertEqual(claude[1:3], ["--permission-mode", "auto"])
+        prompt = claude[-1]
+        self.assertTrue(prompt.startswith("AFK guide mode — ticket 04"), prompt)
+        self.assertIn(str(self.scratch / "issues" / "04-spike.md"), prompt)
+        self.assertNotIn("AFK phase: implement", prompt)
+
+    def test_the_watcher_never_drives_a_hitl_worker_and_shows_it_as_the_users(self):
+        self.start_hitl()
+        self.stop("04")
+        self.afk("tick")
+        self.report("done", "Finished the spike", ticket="04")
+        self.stop("04")
+        self.afk("tick")
+        self.now += 3 * 3600  # well past every phase and idle limit
+
+        dashboard = self.afk("tick").splitlines()
+
+        self.assertEqual(self.prompts_sent("%7"), [])
+        self.assertEqual(self.run_fake.find("tmux", "send-keys", "-t", "%7", "Escape"), [])
+        self.assertEqual([n for n in self.desktop_notifications() if " 04 " in n], [])
+        self.assertEqual(dashboard[2].split()[:3], ["04", "hitl", "yours"])
+
+    def test_hitl_workers_do_not_count_toward_max_workers(self):
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write("\n[limits]\nmax_workers = 1\n")
+
+        self.start_hitl()  # 03 already fills the one AFK slot
+
+        self.reach_review()  # 03 parks on the human, leaving only the hitl worker active
+        self.ticket("05-export", "Widget export")
+        self.afk("start", "05")
+        self.assertEqual(self.status("05")["state"], "working")
+
+    def test_a_merged_hitl_pr_is_found_by_its_branch_and_cleaned_up_once_safe(self):
+        self.start_hitl()
+        worktree = str(self.project_dir / "worktrees" / "04")
+        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-04")] = "MERGED\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%8")] = "vim\n"
+        self.run_fake.responses[("git", "-C", worktree, "status")] = ""
+
+        self.afk("tick")
+
+        [poll] = self.pr_polls()
+        self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-04", "--json", "state", "-q", ".state"])
+        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], worktree)
+        self.assertEqual(self.status("04")["state"], "cleanup-pending")
+        self.assertIn("04 merged; cleanup pending", self.desktop_notifications()[-1])
+
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%8")] = "bash\n"
+        self.afk("tick")
+
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%7"]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"), [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-04"]])
+        self.assertFalse((self.project_dir / "workers" / "04").exists())
+
+    def test_a_hitl_branch_without_a_pr_yet_is_polled_once_a_minute_without_failing(self):
+        self.start_hitl()
+
+        def no_pr(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr='no pull requests found for branch "afk/widgets-04"')
+
+        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-04")] = no_pr
+
+        self.afk("tick")
+        self.now += 30
+        self.afk("tick")
+        self.assertEqual(len(self.pr_polls()), 1)
+        self.now += 30
+        self.afk("tick")
+
+        self.assertEqual(len(self.pr_polls()), 2)
+        self.assertEqual((self.phase("04"), self.status("04")["state"]), ("hitl", "yours"))
+
 
 class LimitsTest(unittest.TestCase):
     """Runaway limits, one pure tick() at a time with an injected clock."""

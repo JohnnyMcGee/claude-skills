@@ -59,6 +59,8 @@ A task type's keys:
 | `skill` | none | Skill invoked with the first prompt, such as `/tdd`. |
 | `prompt` | none | Repo-relative template appended to the implement prompt. `{{ticket}}` and `{{ticket_path}}` are filled in, so it can point at links in the ticket, such as Figma designs. |
 
+`hitl` is built in: a ticket of that type gets a guide-mode worker that isn't driven through phases (see [SKILL.md](SKILL.md#hitl-tickets)). It needs no entry, but `task_types.hitl` can still set its model, effort, skill or prompt.
+
 A ticket's type is its `Type:` line, else `default_type`. Override it at start time with `afk start <ticket> --type <name>`. An unknown type or agent fails the start before anything is created.
 
 ## Prose
