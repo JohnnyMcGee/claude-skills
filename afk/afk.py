@@ -401,7 +401,7 @@ class Afk:
                     pr_ready = ticket_closed = False
                     if before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
                         pr_state, pr_url, pr_ready = self.pr_state(before)
-                        ticket_closed = self.tracker().get(before["ticket"]).done
+                        ticket_closed = self.ticket_closed(before["ticket"])
                     given.update(pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
                     blocker = self.cleanup_blocker(before) if ending(before, pr_state, ticket_closed) else None
                     status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
@@ -551,6 +551,13 @@ class Afk:
         if datetime.fromisoformat(pr["createdAt"]).timestamp() < status.get("started_at", float("-inf")):
             return "NONE", None, False
         return pr["state"], pr["url"], any(label["name"] == READY_LABEL for label in pr.get("labels", []))
+
+    def ticket_closed(self, ticket_id):
+        """Whether the tracker has the ticket closed. One gone from the tracker isn't, so it can't stop the watcher."""
+        try:
+            return self.tracker().get(ticket_id).done
+        except SystemExit:
+            return False
 
     def agent_running(self, pane):
         return self.pane_command(pane) == "claude"

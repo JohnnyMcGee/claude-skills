@@ -2383,6 +2383,14 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual((self.phase("04"), self.status("04")["state"]), ("hitl", "yours"))
 
+    def test_a_worker_whose_ticket_is_gone_from_the_tracker_does_not_stop_the_watcher(self):
+        self.start_hitl()
+        (self.scratch / "issues" / "04-spike.md").unlink()
+
+        self.afk("tick")
+
+        self.assertEqual((self.phase("04"), self.status("04")["state"]), ("hitl", "yours"))
+
     def test_a_hitl_worker_whose_ticket_is_closed_without_a_pr_is_cleaned_up_once_safe(self):
         self.start_hitl()
 
