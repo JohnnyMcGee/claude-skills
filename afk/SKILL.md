@@ -2,7 +2,7 @@
 name: afk
 description: Orchestrate AFK agent workers for one project in this tmux session — find unblocked tickets, start workers in their own worktree and tmux window, and track their status.
 disable-model-invocation: true
-argument-hint: <init <spec> | frontier | start <ticket> | watch | status>
+argument-hint: <init <spec> | frontier | start <ticket> [--type <type>] | watch | status>
 ---
 
 # AFK
@@ -15,13 +15,13 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 
 - **`afk init <spec>`** — create the project from a local spec directory (`.scratch/<slug>/` or its `spec.md`), or from a GitHub spec issue URL whose sub-issues are the tickets (run it from inside that repo's clone), and bind it to the current tmux session. Run once per project.
 - **`afk frontier`** — list open, unclaimed tickets whose blockers are all resolved/done/closed. On GitHub a ticket is claimed when it has any assignee, blockers are its native blocked-by dependencies (else its `## Blocked by` section), and a `Repo: owner/name` line shows as `(owner/name)`; without one the repo is unresolved.
-- **`afk start <ticket>`** — claim the ticket (on GitHub, assign it to you), create a worktree and branch `afk/<project>-<ticket>`, open a tmux window `<ticket>-<abbrev>` split agent-left / shell-right, and launch an interactive `claude` worker in auto permission mode with per-session hooks and a deny list (no force-push, no push to base, no `gh pr merge`, no worktree removal).
+- **`afk start <ticket> [--type <type>]`** — claim the ticket (on GitHub, assign it to you), create a worktree and branch `afk/<project>-<ticket>` from the repo's base branch, copy its gitignored files in and run its bootstrap commands, allocate a slot (`AFK_SLOT`, `AFK_PORT_BASE`), open a tmux window `<ticket>-<abbrev>` split agent-left / shell-right, and launch an interactive `claude` worker in auto permission mode with per-session hooks and a deny list (no force-push, no push to base, no `gh pr merge`, no worktree removal). The ticket's task type picks the model, effort, skill and prompt template. All of this comes from the repo's `docs/agents/afk.md`; see [repo-config.md](repo-config.md).
 - **`afk watch`** — the watcher: run it in the orchestrator window's right pane. Every couple of seconds it advances workers through their phases, redraws the dashboard (ticket, phase, state, time in phase, PR), marks each worker's tmux window with its state, and notifies (bell, tmux message, `notify-send`) when a worker needs the human. It needs no LLM. `afk tick` runs one step of it.
 - **`afk status`** — every worker's ticket, phase, state and last message.
 
 ## Handling the argument
 
-- `init <spec>`, `frontier`, `start <ticket>`, `status`: run `afk $ARGUMENTS` and show the output.
+- `init <spec>`, `frontier`, `start <ticket> [--type <type>]`, `status`: run `afk $ARGUMENTS` and show the output.
 - `watch`: it runs forever, so don't run it yourself. Tell the user to run `afk watch` in the orchestrator window's right pane.
 - No argument: run `afk status`, then `afk frontier`, and ask which ticket to start.
 
@@ -29,7 +29,7 @@ Never start a ticket the user has not named or approved.
 
 ## Phases
 
-The watcher drives each worker through `implement → verify → prepr → pr → review`, pasting the next phase's prompt (`phase-<name>.md` in this folder) into the worker's pane. It sends a prompt only after the worker has reported `done` *and* its session has stopped, so it never types into a busy worker. Reaching `review` means the PR is Ready; the review prompt gives standing instructions for handling feedback the user types into the pane.
+The watcher drives each worker through `implement → verify → prepr → pr → review`, pasting the next phase's prompt (`phase-<name>.md` in this folder) into the worker's pane. It sends a prompt only after the worker has reported `done` *and* its session has stopped, so it never types into a busy worker. If the repo sets `verify_concurrency`, a worker due to verify while the slots are full waits with state `queued` and is started when one frees. Reaching `review` means the PR is Ready; the review prompt gives standing instructions for handling feedback the user types into the pane.
 
 ## Worker protocol
 

@@ -4,6 +4,7 @@
 stdlib only. Every external command (tmux, git, gh, claude) goes through run().
 """
 
+import bisect
 import fcntl
 import json
 import os
@@ -16,6 +17,7 @@ import time
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import reduce
 from pathlib import Path
 
 
@@ -23,8 +25,8 @@ AFK_BIN = os.path.realpath(__file__)
 SKILL_DIR = Path(AFK_BIN).parent
 
 
-def default_run(cmd, input=None):
-    return subprocess.run(cmd, input=input, capture_output=True, text=True, check=True).stdout
+def default_run(cmd, input=None, cwd=None):
+    return subprocess.run(cmd, input=input, cwd=cwd, capture_output=True, text=True, check=True).stdout
 
 
 class Afk:
@@ -59,7 +61,7 @@ class Afk:
         session = self.run(["tmux", "display-message", "-p", "#{session_name}"]).strip()
         pdir = self.project_dir(project)
         pdir.mkdir(parents=True, exist_ok=True)
-        config = {"spec": str(spec), "tracker": tracker, "repo": str(repo), "session": session, "base": "main"}
+        config = {"spec": str(spec), "tracker": tracker, "repo": str(repo), "session": session}
         (pdir / "config.toml").write_text(to_toml(config))
         self.run(["tmux", "set-option", "-t", session, "@afk_project", project])
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
@@ -68,30 +70,47 @@ class Afk:
         for ticket in self.tracker().frontier():
             self.out(f"{ticket.id}  {ticket.title}" + (f"  ({ticket.repo})" if ticket.repo else ""))
 
-    def cmd_start(self, ticket_id):
+    def cmd_start(self, ticket_id, *options):
         project = self.current_project()
         config = self.config()
+        if options and (len(options) != 2 or options[0] != "--type"):
+            raise SystemExit("afk: usage: afk start <ticket> [--type <type>]")
         tracker = self.tracker()
         ticket = tracker.get(ticket_id)
+        type_name = options[1] if options else ticket.type
         pdir = self.project_dir(project)
         worktree = pdir / "worktrees" / ticket.id
         worker_dir = pdir / "workers" / ticket.id
+        # Checked before openness: a ticket this orchestrator started is now claimed. claim_worker settles races.
         if worker_dir.exists():
             raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
         if not ticket.open:
             raise SystemExit(f"afk: ticket {ticket.id} is not open (it is {ticket.status})")
+        repo_config = self.repo_config()
+        type_name = type_name or repo_config.get("default_type")
+        task_types = repo_config.get("task_types", {})
+        if type_name and type_name not in task_types:
+            raise SystemExit(f"afk: unknown task type '{type_name}'; docs/agents/afk.md defines: {', '.join(task_types) or 'none'}")
+        task_type = task_types.get(type_name, {})
+        if task_type.get("agent", "claude") not in AGENTS:
+            raise SystemExit(f"afk: task type '{type_name}' uses agent '{task_type['agent']}'; supported: {', '.join(AGENTS)}")
+        base = repo_config.get("base", "main")
+        slot = self.claim_worker(worker_dir)
+        slot_env = [f"AFK_SLOT={slot}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * slot}"]
         branch = f"afk/{project}-{ticket.id}"
-        try:
-            worker_dir.mkdir(parents=True)  # atomic: of two racing starts, only one owns the worker
-        except FileExistsError:
-            raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
         undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
         try:
             tracker.claim(ticket)
             undo.append(lambda: tracker.release(ticket))
-            self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree)])
+            self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree), base])
             undo.append(lambda: self.run(["git", "-C", config["repo"], "branch", "-D", branch]))
             undo.append(lambda: self.run(["git", "-C", config["repo"], "worktree", "remove", "--force", str(worktree)]))
+            for name in repo_config.get("copy", []):
+                target = worktree / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(Path(config["repo"]) / name, target)
+            for command in repo_config.get("bootstrap", []):
+                self.run(["env", *slot_env, "sh", "-c", command], cwd=worktree)
 
             pane = self.run(
                 ["tmux", "new-window", "-d", "-t", config["session"] + ":", "-n", window_name(ticket),
@@ -101,16 +120,17 @@ class Afk:
             self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree)])
 
             settings = worker_dir / "settings.json"
-            settings.write_text(json.dumps(worker_settings(config.get("base", "main")), indent=2) + "\n")
+            settings.write_text(json.dumps(worker_settings(base), indent=2) + "\n")
             launch = [
-                "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}",
+                "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
-                self.phase_prompt(ticket.id, "implement"),
+                *[arg for key in ("model", "effort") if key in task_type for arg in (f"--{key}", task_type[key])],
+                self.implement_prompt(ticket, task_type),
             ]
             write_json(
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "phase": "implement", "state": "working", "message": "",
-                 "pane": pane, "window": window_name(ticket), "phase_started_at": self.clock()},
+                 "pane": pane, "window": window_name(ticket), "slot": slot, "type": type_name, "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
@@ -122,6 +142,20 @@ class Afk:
                     pass
             raise
         self.out(f"started {ticket.id} in {worktree} on {branch}")
+
+    def claim_worker(self, worker_dir):
+        """Create the worker's dir and claim the lowest slot no active worker holds; removing the dir frees it."""
+        workers = worker_dir.parent
+        workers.mkdir(parents=True, exist_ok=True)
+        with locked(workers):
+            try:
+                worker_dir.mkdir()
+            except FileExistsError:
+                raise SystemExit(f"afk: ticket {worker_dir.name} is already started; see `afk status`")
+            taken = {int(p.read_text()) for p in workers.glob("*/slot")}
+            slot = next(n for n in range(1, len(taken) + 2) if n not in taken)
+            (worker_dir / "slot").write_text(f"{slot}\n")
+        return slot
 
     def cmd_report(self, state, message=""):
         if state not in REPORT_STATES:
@@ -163,17 +197,27 @@ class Afk:
             return 0
 
     def cmd_tick(self):
+        # One tick at a time, so an overlapping tick (say `afk tick` beside `afk watch`) can't act on a stale snapshot.
+        self.workers_dir().mkdir(parents=True, exist_ok=True)
+        with locked(self.workers_dir()):
+            return self.tick_workers()
+
+    def tick_workers(self):
         now = self.clock()
         shown, failures = [], []
+        paths = sorted(self.workers_dir().glob("*/status.json"))
+        # Only ticks change phases and ticks don't overlap, so a snapshot of them stays true for the whole tick.
+        verify = VerifyQueue(self.repo_config().get("verify_concurrency"), [read_json(p) for p in paths])
         # Each worker is read, acted on and persisted under its lock, so a report or hook can't land in between,
         # a failure can't make a later tick repeat another worker's effects, and one failing worker fails alone.
-        for path in sorted(self.workers_dir().glob("*/status.json")):
+        for path in paths:
             with locked(path.parent):
                 before = read_json(path)
-                status, effects = tick(path.parent.name, before, now)
+                may_verify = verify.may_start(before)
+                status, effects = tick(path.parent.name, before, now, may_verify=may_verify)
                 if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
                     # Pasting into a bare shell would run the prompt's markdown as commands.
-                    status, effects = tick(path.parent.name, before, now, agent_running=False)
+                    status, effects = tick(path.parent.name, before, now, agent_running=False, may_verify=may_verify)
                 try:
                     for effect in effects:
                         self.perform(*effect)
@@ -183,6 +227,7 @@ class Afk:
                     continue
                 if status != before:
                     write_json(path, status)
+                verify.update(before, status)
                 shown.append(status)
         for line in dashboard(shown, now):
             self.out(line)
@@ -219,8 +264,18 @@ class Afk:
             SKILL_DIR / f"phase-{phase}.md",
             ticket=ticket.id,
             ticket_path=ticket.path,
-            base=self.config().get("base", "main"),
+            base=self.repo_config().get("base", "main"),
         )
+
+    def implement_prompt(self, ticket, task_type):
+        """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
+        prompt = self.phase_prompt(ticket.id, "implement")
+        if "prompt" in task_type:
+            template = Path(self.config()["repo"]) / task_type["prompt"]
+            prompt += "\n" + render(template, ticket=ticket.id, ticket_path=ticket.path)
+        if "skill" in task_type:
+            prompt = f"{task_type['skill']} {prompt}"
+        return prompt
 
     def agent_running(self, pane):
         try:
@@ -268,6 +323,13 @@ class Afk:
     def config(self):
         return tomllib.loads((self.project_dir(self.current_project()) / "config.toml").read_text())
 
+    def repo_config(self):
+        """The repo's AFK config: docs/agents/afk.md, then gitignored afk.local.md, then the project's [overrides]."""
+        config = self.config()
+        docs = Path(config["repo"]) / "docs" / "agents"
+        layers = [frontmatter(p.read_text()) for p in (docs / "afk.md", docs / "afk.local.md") if p.is_file()]
+        return reduce(deep_merge, [*layers, config.get("overrides", {})], {})
+
     def tracker(self):
         config = self.config()
         if config["tracker"] == "github":
@@ -277,26 +339,31 @@ class Afk:
 
 REPORT_STATES = ("done", "blocked", "question")
 
+AGENTS = ("claude",)
+
 PHASES = ("implement", "verify", "prepr", "pr", "review")
 
 # Appended to a worker's window name so its state shows even without afk's tmux status format.
 WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "review": "✓"}
 
 
-def tick(ticket, status, now, agent_running=True):
+def tick(ticket, status, now, agent_running=True, may_verify=True):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
+    may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
     """
-    status, effects = advance(ticket, status, now, agent_running)
+    status, effects = advance(ticket, status, now, agent_running, may_verify)
     if status["state"] != status.get("shown"):
         status = {**status, "shown": status["state"]}
         effects.append(("window", status["pane"], status["window"], status["state"]))
     return status, effects
 
 
-def advance(ticket, status, now, agent_running):
+def advance(ticket, status, now, agent_running, may_verify):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
+    if state == "queued" and may_verify:
+        state = "done"  # its turn to verify: advance as if it had just finished
     if state == "done" and status.get("idle") and not agent_running:
         state, message = "attention", "claude is no longer running in its pane"
         status = {**status, "state": state, "message": message, "reports": status.get("reports", 0) + 1}
@@ -305,6 +372,9 @@ def advance(ticket, status, now, agent_running):
         if phase == "review":
             return {**status, "state": "review"}, [("notify", f"{ticket} addressed review feedback: {message}")]
         phase = PHASES[PHASES.index(phase) + 1]
+        if phase == "verify" and not may_verify:
+            # Stays in its finished phase, so if it needs attention while queued, done still leads to verify.
+            return {**status, "state": "queued", "queued_at": now}, []
         status = {**status, "phase": phase, "state": "working", "message": "", "idle": False, "phase_started_at": now}
         effects = [("prompt", ticket, status["pane"], phase)]
         if phase == "review":
@@ -316,6 +386,29 @@ def advance(ticket, status, now, agent_running):
         label = "needs attention" if state == "attention" else state
         return {**status, "notified": status.get("reports")}, [("notify", f"{ticket} {label}: {message}")]
     return status, []
+
+
+class VerifyQueue:
+    """Holds workers back from verify, first come first served, while the repo's verify_concurrency slots are full."""
+
+    def __init__(self, limit, statuses):
+        self.limit = limit
+        self.verifying = sum(s["phase"] == "verify" for s in statuses)
+        self.queue = sorted((s["queued_at"], s["ticket"]) for s in statuses if s["state"] == "queued")
+
+    def may_start(self, status):
+        if self.limit is None or self.verifying >= self.limit:
+            return self.limit is None
+        if status["state"] == "queued":
+            return self.queue[0][1] == status["ticket"]
+        return not self.queue
+
+    def update(self, before, after):
+        self.verifying += (after["phase"] == "verify") - (before["phase"] == "verify")
+        if before["state"] == "queued":
+            self.queue.remove((before["queued_at"], before["ticket"]))
+        if after["state"] == "queued":
+            bisect.insort(self.queue, (after["queued_at"], after["ticket"]))
 
 
 DONE_STATUSES = {"resolved", "done", "closed"}
@@ -330,6 +423,7 @@ class Ticket:
     status: str
     blocked_by: list
     path: Path
+    type: str
     repo: str | None = None  # owner/name; None leaves it for Gate 1 to resolve
 
     @property
@@ -396,7 +490,7 @@ class GithubTracker:
         repo = re.fullmatch(r"[\w.-]+/[\w.-]+", field(body, "Repo"))
         return Ticket(
             id=str(issue["number"]), title=issue["title"], status=status, blocked_by=blocked_by, path=issue["html_url"],
-            repo=repo and repo.group(0),
+            type=field(body, "Type"), repo=repo and repo.group(0),
         )
 
     def get(self, ticket_id):
@@ -439,6 +533,7 @@ def parse_ticket(path):
         status=field(text, "Status").lower(),
         blocked_by=[n.zfill(len(number)) for n in re.findall(r"(?:^|,)\s*#?(\d+)\b", field(text, "Blocked by"))],
         path=path,
+        type=field(text, "Type"),
     )
 
 
@@ -492,6 +587,19 @@ def render(template, **values):
     for key, value in values.items():
         text = text.replace("{{" + key + "}}", str(value))
     return text
+
+
+def frontmatter(text):
+    """TOML between a leading pair of +++ lines, as in Hugo and Zola."""
+    match = re.match(r"\+\+\+\n(.*?)^\+\+\+$", text, re.DOTALL | re.MULTILINE)
+    return tomllib.loads(match.group(1)) if match else {}
+
+
+def deep_merge(base, override):
+    merged = dict(base)
+    for key, value in override.items():
+        merged[key] = deep_merge(merged[key], value) if isinstance(value, dict) and isinstance(merged.get(key), dict) else value
+    return merged
 
 
 def field(text, name):
