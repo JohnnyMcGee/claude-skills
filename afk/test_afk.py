@@ -2058,6 +2058,22 @@ class WatchTest(AfkTestCase):
         self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
         self.assertIn("03  Widget UI", self.afk("frontier").splitlines())
 
+    def test_a_closed_pr_reopened_while_cleanup_is_pending_keeps_its_worker(self):
+        self.reach_review()
+        self.close(shell="vim")
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("OPEN")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+        self.now += 60
+
+        self.afk("tick")
+        self.now += 60
+        self.afk("tick")
+
+        self.assertEqual(self.cleanup_commands(), ([], [], []))
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+
     def reach_pr(self):
         for message in ["Implemented", "Verified", "Checks pass"]:
             self.finish_phase(message)

@@ -681,9 +681,10 @@ WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "stuck": "!",
 def ending(status, pr_state, ticket_closed=False):
     """How the worker's work ended: its PR "merged" or "closed", or its "ticket closed"; None while it goes on.
 
-    A closed ticket outranks a closed PR, so cleanup never releases a ticket that is already closed.
+    A closed ticket outranks a closed PR, so cleanup never releases a ticket that is already closed. A pending
+    worker keeps its ending between polls; a fresh poll decides it again, as a closed PR can be reopened.
     """
-    if status["state"] == "cleanup-pending":
+    if status["state"] == "cleanup-pending" and pr_state is None:
         return status.get("ended", "merged")  # workers left pending before closed PRs were cleaned up had merged
     if pr_state == "MERGED":
         return "merged"
@@ -714,10 +715,15 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
         status = {**status, "pr_polled_at": now}
     if pr_url:
         status = {**status, "pr": pr_url}
+    if not ended and status["state"] == "cleanup-pending":
+        # Its PR was reopened, so it carries on as it was when the PR closed.
+        resumes = status.get("resumes", {"state": "working", "message": ""})
+        status = {k: v for k, v in status.items() if k not in ("ended", "resumes")} | resumes
     if ended:
         # Checked again every tick, but the human hears about it once.
         effects = [] if status["state"] == "cleanup-pending" else [("notify", f"{ticket} {ended}; cleanup pending: {cleanup_blocker}")]
-        status = {**status, "state": "cleanup-pending", "ended": ended, "message": cleanup_blocker}
+        resumes = status.get("resumes", {"state": status["state"], "message": status.get("message", "")})
+        status = {**status, "state": "cleanup-pending", "ended": ended, "resumes": resumes, "message": cleanup_blocker}
     elif status["phase"] == "hitl":
         # The human drives it, so there's nothing to advance, no limit to hold it to, and no report to act on.
         status, effects = {**status, "state": "yours"}, []
