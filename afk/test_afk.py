@@ -594,6 +594,34 @@ class VerifyQueueTest(AfkTestCase):
         self.assertEqual(self.state("05"), ("implement", "attention"))
         self.assertFalse(self.verify_prompted("05"))
 
+    def test_overlapping_ticks_still_admit_one_verifier(self):
+        self.finish("05")
+        self.finish("07")
+        results = []
+
+        def second_tick():
+            out = io.StringIO()
+            try:
+                results.append(afk.main(["tick"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out, clock=lambda: self.now))
+            except Exception as error:
+                results.append(error)
+
+        other = threading.Thread(target=second_tick)
+
+        def another_tick_starts_mid_paste(cmd):
+            if cmd[cmd.index("-t") + 1] == "%6" and not other.is_alive() and not results:
+                other.start()
+                other.join(timeout=0.2)  # without a tick-wide lock it snapshots the state before this tick writes it
+            return ""
+
+        self.run_fake.responses[("tmux", "paste-buffer")] = another_tick_starts_mid_paste
+        self.afk("tick")
+        other.join()
+
+        self.assertEqual(results, [0])
+        self.assertEqual([self.state("05"), self.state("07")], [("verify", "working"), ("implement", "queued")])
+        self.assertFalse(self.verify_prompted("07"))
+
     def test_without_verify_concurrency_workers_verify_in_parallel(self):
         self.repo_config("")
         self.finish("03")

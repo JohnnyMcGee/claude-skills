@@ -184,10 +184,16 @@ class Afk:
             return 0
 
     def cmd_tick(self):
+        # One tick at a time, so an overlapping tick (say `afk tick` beside `afk watch`) can't act on a stale snapshot.
+        self.workers_dir().mkdir(parents=True, exist_ok=True)
+        with locked(self.workers_dir()):
+            return self.tick_workers()
+
+    def tick_workers(self):
         now = self.clock()
         shown, failures = [], []
         paths = sorted(self.workers_dir().glob("*/status.json"))
-        # Only the watcher changes phases, so a snapshot of them stays true for the whole tick.
+        # Only ticks change phases and ticks don't overlap, so a snapshot of them stays true for the whole tick.
         verify = VerifyQueue(self.repo_config().get("verify_concurrency"), [read_json(p) for p in paths])
         # Each worker is read, acted on and persisted under its lock, so a report or hook can't land in between,
         # a failure can't make a later tick repeat another worker's effects, and one failing worker fails alone.
