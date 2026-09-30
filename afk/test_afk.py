@@ -516,6 +516,26 @@ class GithubStartTest(GithubTestCase):
         [send] = self.run_fake.find("tmux", "send-keys")
         self.assertIn("https://github.com/acme/web/issues/4", shlex.split(send[4])[-1])
 
+    def test_a_worker_whose_issue_is_closed_while_its_pr_is_open_is_cleaned_up_leaving_both_as_they_are(self):
+        self.issue(7, "Widget spike", body="Type: hitl\n")
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+        self.afk("start", "7")
+        self.afk("tick")
+        self.assertTrue((self.project_dir / "workers" / "7").exists())  # its PR is open and its issue too
+        self.issues[7]["state"] = "closed"
+        self.now += 60
+
+        self.afk("tick")
+
+        worktree = str(self.project_dir / "worktrees" / "7")
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"), [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-2-7"]])
+        self.assertFalse((self.project_dir / "workers" / "7").exists())
+        # Neither the closed issue nor the open PR is touched: only the claim at start edits GitHub.
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [["gh", "issue", "edit", "7", "--repo", "acme/widgets", "--add-assignee", "@me"]])
+        self.assertEqual({tuple(c[:3]) for c in self.run_fake.find("gh", "pr")}, {("gh", "pr", "view")})
+
     def test_worker_is_pointed_at_the_issue_url(self):
         self.afk("start", "4")
 
@@ -1915,6 +1935,11 @@ class WatchTest(AfkTestCase):
         self.run_fake.responses[("git", "-C", worktree, "status")] = worktree_status
         self.now += 60
 
+    def close(self, **merge_options):
+        """GitHub reports the PR closed without being merged; the panes and worktree are as for merge()."""
+        self.merge(**merge_options)
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("CLOSED")
+
     def cleanup_commands(self):
         worktree = str(self.project_dir / "worktrees" / "03")
         return (
@@ -2003,6 +2028,32 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
         self.assertEqual(self.afk("status").splitlines()[1:], [])
+
+    def test_closed_pr_with_idle_shell_and_clean_worktree_is_cleaned_up_and_its_ticket_offered_again(self):
+        self.reach_review()
+        self.close()
+
+        self.afk("tick")
+
+        self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
+        self.assertEqual(self.afk("status").splitlines()[1:], [])
+        self.assertTrue(any("03 closed and cleaned up" in n for n in self.desktop_notifications()))
+        self.assertIn("03  Widget UI", self.afk("frontier").splitlines())
+
+    def test_closed_pr_with_a_busy_shell_pane_waits_then_is_cleaned_up_and_its_ticket_offered_again(self):
+        self.reach_review()
+        self.close(shell="vim")
+        self.afk("tick")
+        self.afk("tick")
+        self.assertEqual(self.cleanup_commands(), ([], [], []))
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertEqual([n for n in self.desktop_notifications() if "03 closed; cleanup pending" in n and "vim" in n], [self.desktop_notifications()[-1]])
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+
+        self.afk("tick")
+
+        self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
+        self.assertIn("03  Widget UI", self.afk("frontier").splitlines())
 
     def reach_pr(self):
         for message in ["Implemented", "Verified", "Checks pass"]:
@@ -2298,6 +2349,27 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual(len(self.pr_polls()), 2)
         self.assertEqual((self.phase("04"), self.status("04")["state"]), ("hitl", "yours"))
+
+    def test_a_hitl_worker_whose_ticket_is_closed_without_a_pr_is_cleaned_up_once_safe(self):
+        self.start_hitl()
+
+        def no_pr(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr='no pull requests found for branch "afk/widgets-04"')
+
+        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-04")] = no_pr
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%8")] = "bash\n"
+        path = self.scratch / "issues" / "04-spike.md"
+        path.write_text(path.read_text().replace("**Status:** ready-for-agent", "**Status:** closed"))
+
+        self.afk("tick")
+
+        worktree = str(self.project_dir / "worktrees" / "04")
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%7"]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"), [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-04"]])
+        self.assertFalse((self.project_dir / "workers" / "04").exists())
+        self.assertIn("04 ticket closed and cleaned up", self.desktop_notifications()[-1])
+        self.assertIn("**Status:** closed", path.read_text())  # the tracker already has it as closed
 
 
 class LimitsTest(unittest.TestCase):
