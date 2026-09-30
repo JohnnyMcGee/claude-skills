@@ -757,6 +757,9 @@ class VerifyQueue:
 
 DONE_STATUSES = {"resolved", "done", "closed"}
 
+# `#<number>` links an issue in the body's own repo, `<owner>/<name>#<number>` one in any repo.
+BLOCKER_REF = re.compile(r"(?<![\w/.-])((?:[\w.-]+/[\w.-]+)?)#(\d+)\b")
+
 GITHUB_ISSUE = re.compile(r"https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)/?$")
 
 
@@ -836,12 +839,37 @@ class GithubTracker:
     def __init__(self, run, spec_url):
         self.run = run
         issue = GITHUB_ISSUE.match(spec_url)
+        self.owner = issue["owner"]
         self.repo = f"{issue['owner']}/{issue['repo']}"
         self.spec_number = issue["number"]
 
-    def api(self, path):
-        pages = json.loads(self.run(["gh", "api", "--paginate", "--slurp", f"repos/{self.repo}/{path}"]))
+    def api(self, path, repo=None):
+        pages = json.loads(self.run(["gh", "api", "--paginate", "--slurp", f"repos/{repo or self.repo}/{path}"]))
         return [item for page in pages for item in page]
+
+    def name(self, issue):
+        """A ticket's id: its number in the spec's repo, `<repo>#<number>` for a sub-issue in another of the owner's repos."""
+        repo = self.repo_of(issue)
+        if repo == self.repo:
+            return str(issue["number"])
+        owner, name = repo.split("/")
+        if owner != self.owner:
+            raise SystemExit(f"afk: sub-issue {repo}#{issue['number']} is outside {self.owner}; move it to one of {self.owner}'s repos")
+        return f"{name}#{issue['number']}"
+
+    @staticmethod
+    def repo_of(issue):
+        return issue["repository_url"].removeprefix("https://api.github.com/repos/")
+
+    def ref(self, issue, repo=None):
+        """How a body in `repo` (the spec's by default) links to the issue: `#<number>` within its own repo."""
+        own = self.repo_of(issue)
+        return f"{'' if own == (repo or self.repo) else own}#{issue['number']}"
+
+    def locate(self, ticket_id):
+        """The repo and number a ticket id names."""
+        name, _, number = ticket_id.rpartition("#")
+        return (f"{self.owner}/{name}" if name else self.repo), number
 
     def tickets(self):
         return [self.ticket(issue) for issue in self.api(f"issues/{self.spec_number}/sub_issues")]
@@ -854,16 +882,19 @@ class GithubTracker:
         else:
             status = "open"
         body = issue.get("body") or ""
-        blocked_by = re.findall(r"(?<![\w/])#(\d+)\b", section(body, "Blocked by"))
+        id = self.name(issue)
+        blocked_by = [f"{repo or self.repo_of(issue)}#{n}" for repo, n in BLOCKER_REF.findall(section(body, "Blocked by"))]
         repo = re.fullmatch(r"[\w.-]+/[\w.-]+", field(body, "Repo"))
+        own = self.locate(id)[0]
         return Ticket(
-            id=str(issue["number"]), title=issue["title"], status=status, blocked_by=blocked_by, path=issue["html_url"],
-            type=field(body, "Type"), repo=repo and repo.group(0),
+            id=id, title=issue["title"], status=status, blocked_by=blocked_by, path=issue["html_url"],
+            type=field(body, "Type"), repo=repo.group(0) if repo else own if own != self.repo else None,
         )
 
     def get(self, ticket_id):
         try:
-            return self.ticket(json.loads(self.run(["gh", "api", f"repos/{self.repo}/issues/{ticket_id}"])))
+            repo, number = self.locate(ticket_id)
+            return self.ticket(json.loads(self.run(["gh", "api", f"repos/{repo}/issues/{number}"])))
         except subprocess.CalledProcessError as error:
             if "Not Found" not in (error.stderr or ""):
                 raise
@@ -871,24 +902,28 @@ class GithubTracker:
 
     def claim(self, ticket):
         """Assignment is the cross-orchestrator lock: a claimed ticket drops out of every frontier."""
-        self.run(["gh", "issue", "edit", ticket.id, "--repo", self.repo, "--add-assignee", "@me"])
+        repo, number = self.locate(ticket.id)
+        self.run(["gh", "issue", "edit", number, "--repo", repo, "--add-assignee", "@me"])
 
     def release(self, ticket):
-        self.run(["gh", "issue", "edit", ticket.id, "--repo", self.repo, "--remove-assignee", "@me"])
+        repo, number = self.locate(ticket.id)
+        self.run(["gh", "issue", "edit", number, "--repo", repo, "--remove-assignee", "@me"])
 
     def complete(self, ticket):
         """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it."""
 
     def blockers(self, ticket):
         """Native blocked-by dependencies; failing those, the issues the body's "Blocked by" section names."""
-        native = self.api(f"issues/{ticket.id}/dependencies/blocked_by")
+        repo, number = self.locate(ticket.id)
+        native = self.api(f"issues/{number}/dependencies/blocked_by", repo)
         if native:
             return native
-        return [json.loads(self.run(["gh", "api", f"repos/{self.repo}/issues/{n}"])) for n in ticket.blocked_by]
+        refs = (ref.rpartition("#") for ref in ticket.blocked_by)
+        return [json.loads(self.run(["gh", "api", f"repos/{repo}/issues/{n}"])) for repo, _, n in refs]
 
     def split(self, ticket, parts):
         """Create the parts as sub-issues of the spec, point the ticket's dependents at them, then close the ticket."""
-        blocked_by = "\n".join(f"- #{b['number']}" for b in self.blockers(ticket)) or "None — can start immediately"
+        blocked_by = "\n".join(f"- {self.ref(b)}" for b in self.blockers(ticket)) or "None — can start immediately"
         created = []
         for part in parts:
             # Repo line and Blocked by section first, as the first match wins; the heading after them ends the section.
@@ -898,20 +933,22 @@ class GithubTracker:
             )))
             self.run(["gh", "api", f"repos/{self.repo}/issues/{self.spec_number}/sub_issues", "-X", "POST",
                       "-F", f"sub_issue_id={created[-1]['id']}"])
-        numbers = ", ".join(f"#{issue['number']}" for issue in created)
-        for dependent in self.api(f"issues/{ticket.id}/dependencies/blocking"):
+        repo, number = self.locate(ticket.id)
+        for dependent in self.api(f"issues/{number}/dependencies/blocking", repo):
             for issue in created:
-                self.run(["gh", "api", f"repos/{self.repo}/issues/{dependent['number']}/dependencies/blocked_by", "-X", "POST",
+                self.run(["gh", "api", f"repos/{self.repo_of(dependent)}/issues/{dependent['number']}/dependencies/blocked_by", "-X", "POST",
                           "-F", f"issue_id={issue['id']}"])
         for dependent in self.api(f"issues/{self.spec_number}/sub_issues"):
             body = dependent.get("body") or ""
             blockers = section(body, "Blocked by")
-            rewired = re.sub(rf"(?<![\w/])#{ticket.id}\b", numbers, blockers)
+            own = self.repo_of(dependent)
+            parts = ", ".join(self.ref(issue, own) for issue in created)
+            rewired = BLOCKER_REF.sub(lambda ref: parts if (ref[1] or own, ref[2]) == (repo, number) else ref[0], blockers)
             if rewired != blockers:
-                self.run(["gh", "api", f"repos/{self.repo}/issues/{dependent['number']}", "-X", "PATCH",
+                self.run(["gh", "api", f"repos/{own}/issues/{dependent['number']}", "-X", "PATCH",
                           "-f", f"body={body.replace(blockers, rewired, 1)}"])
-        self.run(["gh", "issue", "close", ticket.id, "--repo", self.repo, "--reason", "not planned",
-                  "--comment", f"Split into {numbers}, one per repo."])
+        self.run(["gh", "issue", "close", number, "--repo", repo, "--reason", "not planned",
+                  "--comment", f"Split into {', '.join(self.ref(issue, repo) for issue in created)}, one per repo."])
         return [str(issue["number"]) for issue in created]
 
     def frontier(self):

@@ -129,25 +129,36 @@ class GithubTestCase(AfkTestCase):
         self.run_fake.responses[("tmux", "show-options")] = "widgets-2\n"
         self.run_fake.responses[("gh", "api")] = self.gh_api
 
+    @staticmethod
+    def key(repo, number):
+        """How the fake files an issue: by number in the spec's repo, else by `name#number`, as afk names tickets."""
+        number = int(number)
+        return number if repo == "acme/widgets" else f"{repo.split('/')[1]}#{number}"
+
+    def key_of(self, path):
+        _, owner, name, _, number, *_ = path.split("/")
+        return self.key(f"{owner}/{name}", number)
+
     def gh_api(self, cmd):
         path = next(arg for arg in cmd[2:] if arg.startswith("repos/"))
         if path == "repos/acme/widgets/issues/2/sub_issues":
             result = list(self.issues.values())
         elif path.endswith("/dependencies/blocked_by"):
-            result = [self.issues[n] for n in self.native_blockers.get(int(path.split("/")[4]), [])]
+            result = [self.issues[k] for k in self.native_blockers.get(self.key_of(path), [])]
         else:
-            result = self.issues[int(path.split("/")[4])]
+            result = self.issues[self.key_of(path)]
         return json.dumps([result] if "--slurp" in cmd else result)  # --slurp wraps each page in one array
 
-    def issue(self, number, title, state="open", assignees=(), body=""):
-        self.issues[number] = {
-            "id": 1000 + number,
+    def issue(self, number, title, state="open", assignees=(), body="", repo="acme/widgets"):
+        self.issues[self.key(repo, number)] = {
+            "id": (1000 if repo == "acme/widgets" else 5000) + number,
             "number": number,
             "title": title,
             "state": state,
             "assignees": [{"login": login} for login in assignees],
             "body": body,
-            "html_url": f"https://github.com/acme/widgets/issues/{number}",
+            "html_url": f"https://github.com/{repo}/issues/{number}",
+            "repository_url": f"https://api.github.com/repos/{repo}",
         }
 
     @property
@@ -204,6 +215,29 @@ class GithubFrontierTest(GithubTestCase):
 
         self.assertEqual(output.splitlines(), ["4  Widget API", "6  Widget export"])
 
+    def test_a_sub_issue_from_another_owner_is_refused(self):
+        self.issue(4, "Widget API")
+        self.issue(7, "Upstream fix", repo="upstream/lib")
+        self.afk("init", self.SPEC)
+
+        out = io.StringIO()
+        code = afk.main(["frontier"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("upstream/lib#7 is outside acme", out.getvalue())
+
+    def test_a_blocked_by_ref_is_read_in_the_issues_own_repo_unless_it_names_one(self):
+        self.issue(3, "Widget schema", state="closed")
+        self.issue(3, "Widget styles", repo="acme/web")
+        self.issue(4, "Widget API", body="## Blocked by\n\n- acme/web#3\n")
+        self.issue(5, "Widget page", repo="acme/web", body="## Blocked by\n\n- #3\n")
+        self.issue(6, "Widget tour", repo="acme/web", body="## Blocked by\n\n- acme/widgets#3\n")
+        self.afk("init", self.SPEC)
+
+        output = self.afk("frontier")
+
+        self.assertEqual(output.splitlines(), ["web#3  Widget styles  (acme/web)", "web#6  Widget tour  (acme/web)"])
+
     def test_a_repo_line_resolves_the_tickets_repo_and_its_absence_leaves_it_unresolved(self):
         self.issue(4, "Widget API", body="## What to build\n\nThe API.\n\n**Repo:** acme/widgets-api\n")
         self.issue(5, "Widget UI", body="Repo: acme/widgets-web\n")
@@ -216,6 +250,17 @@ class GithubFrontierTest(GithubTestCase):
             output.splitlines(),
             ["4  Widget API  (acme/widgets-api)", "5  Widget UI  (acme/widgets-web)", "6  Widget export"],
         )
+
+    def test_a_sub_issue_from_another_repo_is_named_by_repo_and_number_and_checked_against_its_own_repo(self):
+        self.issue(3, "Widget schema")
+        self.issue(4, "Widget API")
+        self.issue(4, "Widget page", repo="acme/web")  # shares its number with the spec repo's #4
+        self.native_blockers = {4: [3]}
+        self.afk("init", self.SPEC)
+
+        output = self.afk("frontier")
+
+        self.assertEqual(output.splitlines(), ["3  Widget schema", "web#4  Widget page  (acme/web)"])
 
 
 class GithubNextTest(GithubTestCase):
@@ -267,9 +312,9 @@ class GithubSplitTest(GithubTestCase):
         method = cmd[cmd.index("-X") + 1] if "-X" in cmd else "GET"
         fields = dict(cmd[i + 1].split("=", 1) for i, arg in enumerate(cmd) if arg in ("-f", "-F"))
         by_id = lambda id: next(n for n, issue in self.issues.items() if issue["id"] == int(id))
-        number = lambda: int(path.split("/")[4])
+        number = lambda: self.key_of(path)
         if (method, path) == ("POST", "repos/acme/widgets/issues"):
-            created = max(self.issues) + 1
+            created = max(n for n in self.issues if isinstance(n, int)) + 1
             self.issue(created, fields["title"], body=fields["body"])
             self.not_sub_issues.add(created)
             return json.dumps(self.issues[created])
@@ -289,8 +334,32 @@ class GithubSplitTest(GithubTestCase):
         return super().gh_api(cmd)
 
     def gh_issue_close(self, cmd):
-        self.issues[int(cmd[3])]["state"] = "closed"
+        self.issues[self.key(cmd[cmd.index("--repo") + 1], cmd[3])]["state"] = "closed"
         return ""
+
+    def test_a_sub_issue_from_another_repo_is_closed_there_and_its_dependents_rewired_in_their_own_repo(self):
+        self.issue(3, "Widget styles", repo="acme/web")
+        self.issue(5, "Widget page", repo="acme/web")
+        self.issue(6, "Widget tour", repo="acme/web")
+        self.native_blockers = {"web#5": ["web#3"], "web#6": ["web#5"]}
+
+        self.afk("split", "web#5", stdin=json.dumps(SPLIT_PARTS))
+
+        [close] = self.run_fake.find("gh", "issue", "close")
+        self.assertEqual(close[3:6], ["5", "--repo", "acme/web"])
+        self.assertEqual(self.native_blockers["web#6"], ["web#5", 8, 9])
+        self.assertIn("## Blocked by\n\n- acme/web#3\n", self.issues[8]["body"])
+
+    def test_blocked_by_refs_to_a_split_sub_issue_from_another_repo_are_rewired_relative_to_each_dependent(self):
+        self.issue(5, "Widget page", repo="acme/web")
+        self.issue(6, "Widget tour", repo="acme/web", body="## Blocked by\n\n- #5\n")
+        self.issue(8, "Widget onboarding", body="## Blocked by\n\n- acme/web#5\n")
+
+        self.afk("split", "web#5", stdin=json.dumps(SPLIT_PARTS))
+
+        self.assertEqual(self.issues["web#6"]["body"], "## Blocked by\n\n- acme/widgets#9, acme/widgets#10\n")
+        self.assertEqual(self.issues[8]["body"], "## Blocked by\n\n- #9, #10\n")
+        self.assertEqual(self.issues[7]["body"], "## Blocked by\n\n- #5\n")  # the spec repo's own #5
 
     def test_repo_and_blocked_by_in_a_parts_body_do_not_override_its_own(self):
         self.issue(4, "Widget config")
@@ -354,6 +423,23 @@ class GithubStartTest(GithubTestCase):
                 ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--remove-assignee", "@me"],
             ],
         )
+
+    def test_a_sub_issue_from_another_repo_is_claimed_there_and_worked_on_in_its_clone(self):
+        web = self.tmp / "web"
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write(f'\n[repos]\n"acme/web" = "{web}"\n')
+        self.issue(4, "Widget page", repo="acme/web")
+
+        self.afk("start", "web#4")
+
+        self.assertEqual(
+            self.run_fake.find("gh", "issue", "edit"),
+            [["gh", "issue", "edit", "4", "--repo", "acme/web", "--add-assignee", "@me"]],
+        )
+        [add] = [c for c in self.run_fake.find("git", "-C") if c[3:5] == ["worktree", "add"]]
+        self.assertEqual(add[2], str(web))
+        [send] = self.run_fake.find("tmux", "send-keys")
+        self.assertIn("https://github.com/acme/web/issues/4", shlex.split(send[4])[-1])
 
     def test_worker_is_pointed_at_the_issue_url(self):
         self.afk("start", "4")
