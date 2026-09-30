@@ -150,14 +150,24 @@ class Afk:
         workers = {p.parent.name: read_json(p) for p in sorted(self.workers_dir().glob("*/status.json"))}
         now = self.clock()
         updated = tick(workers, now)
-        # Persist each worker right after its own effects, so a failure can't make a later tick repeat them.
+        shown, failures = [], []
+        # Persist each worker right after its own effects, so a failure can't make a later tick repeat them,
+        # and let one failing worker (say, its pane is gone) fail alone.
         for ticket, (status, effects) in updated.items():
-            for effect in effects:
-                self.perform(*effect)
+            try:
+                for effect in effects:
+                    self.perform(*effect)
+            except subprocess.CalledProcessError as error:
+                failures.append(error)
+                shown.append(workers[ticket])
+                continue
             if status != workers[ticket]:
                 write_json(self.workers_dir() / ticket / "status.json", status)
-        for line in dashboard([status for status, _ in updated.values()], now):
+            shown.append(status)
+        for line in dashboard(shown, now):
             self.out(line)
+        if failures:
+            raise failures[0]
 
     def perform(self, kind, *args):
         if kind == "prompt":

@@ -612,6 +612,27 @@ class WatchTest(AfkTestCase):
         self.assertEqual(len(self.prompts_sent("%7")), 2)  # the failed paste, then its retry
         self.assertEqual((self.phase("03"), self.phase("05")), ("verify", "verify"))
 
+    def test_a_worker_whose_pane_is_gone_does_not_hold_up_the_others(self):
+        self.ticket("05-export", "Widget export")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.afk("start", "05")
+        for ticket in ("03", "05"):
+            self.report("done", "Implemented", ticket=ticket)
+            self.stop(ticket=ticket)
+
+        def pane_gone(cmd):
+            if "%5" in cmd:
+                raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %5")
+            return ""
+
+        self.run_fake.responses[("tmux", "paste-buffer")] = pane_gone
+        out = io.StringIO()
+        code = afk.main(["tick"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("can't find pane: %5", out.getvalue())
+        self.assertEqual((self.phase("03"), self.phase("05")), ("implement", "verify"))
+
 
 if __name__ == "__main__":
     unittest.main()
