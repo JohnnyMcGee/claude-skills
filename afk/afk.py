@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -64,26 +65,40 @@ class Afk:
         pdir = self.project_dir(project)
         worktree = pdir / "worktrees" / ticket.id
         worker_dir = pdir / "workers" / ticket.id
-        worker_dir.mkdir(parents=True, exist_ok=True)
-
+        if worker_dir.exists():
+            raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
         branch = f"afk/{project}-{ticket.id}"
-        self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree)])
+        undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
+        try:
+            worker_dir.mkdir(parents=True, exist_ok=True)
+            self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree)])
+            undo.append(lambda: self.run(["git", "-C", config["repo"], "branch", "-D", branch]))
+            undo.append(lambda: self.run(["git", "-C", config["repo"], "worktree", "remove", "--force", str(worktree)]))
 
-        pane = self.run(
-            ["tmux", "new-window", "-d", "-t", config["session"] + ":", "-n", window_name(ticket),
-             "-c", str(worktree), "-P", "-F", "#{pane_id}"]
-        ).strip()
-        self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree)])
+            pane = self.run(
+                ["tmux", "new-window", "-d", "-t", config["session"] + ":", "-n", window_name(ticket),
+                 "-c", str(worktree), "-P", "-F", "#{pane_id}"]
+            ).strip()
+            undo.append(lambda: self.run(["tmux", "kill-window", "-t", pane]))
+            self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree)])
 
-        settings = worker_dir / "settings.json"
-        settings.write_text(json.dumps(worker_settings(config.get("base", "main")), indent=2) + "\n")
-        launch = [
-            "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}",
-            "claude", "--permission-mode", "auto", "--settings", str(settings),
-            worker_prompt(ticket),
-        ]
-        write_json(worker_dir / "status.json", {"ticket": ticket.id, "phase": "implement", "state": "working", "message": ""})
-        self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
+            settings = worker_dir / "settings.json"
+            settings.write_text(json.dumps(worker_settings(config.get("base", "main")), indent=2) + "\n")
+            launch = [
+                "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}",
+                "claude", "--permission-mode", "auto", "--settings", str(settings),
+                worker_prompt(ticket),
+            ]
+            write_json(worker_dir / "status.json", {"ticket": ticket.id, "phase": "implement", "state": "working", "message": ""})
+            self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
+        except Exception:
+            # Roll back so a plain retry of `afk start` works.
+            for step in reversed(undo):
+                try:
+                    step()
+                except Exception:
+                    pass
+            raise
         self.out(f"started {ticket.id} in {worktree} on {branch}")
 
     def cmd_report(self, state, message=""):
@@ -269,6 +284,9 @@ def main(argv, run=None, env=None, stdin=None, stdout=None):
         return 2
     try:
         return handler(*args) or 0
+    except subprocess.CalledProcessError as error:
+        app.out(f"afk: `{shlex.join(error.cmd)}` failed: {(error.stderr or '').strip()}")
+        return 1
     except SystemExit as exit:
         if isinstance(exit.code, str):
             app.out(exit.code)

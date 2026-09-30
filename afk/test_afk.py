@@ -2,6 +2,7 @@ import io
 import json
 import os
 import shlex
+import subprocess
 import tempfile
 import tomllib
 import unittest
@@ -179,6 +180,41 @@ class StartTest(AfkTestCase):
         status = json.loads((self.project_dir / "workers" / "03" / "status.json").read_text())
         self.assertEqual(status["session_id"], "early")
         self.assertEqual(status["state"], "working")
+
+    def test_failed_start_rolls_back_window_worktree_and_branch(self):
+        def split_fails(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="no space for new pane")
+
+        self.run_fake.responses[("tmux", "split-window")] = split_fails
+        out = io.StringIO()
+        code = afk.main(["start", "03"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("no space for new pane", out.getvalue())
+        worktree = str(self.project_dir / "worktrees" / "03")
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%5"]])
+        self.assertEqual(
+            self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"),
+            [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]],
+        )
+        self.assertEqual(
+            self.run_fake.find("git", "-C", str(self.repo), "branch"),
+            [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-03"]],
+        )
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+    def test_starting_an_already_started_ticket_leaves_the_running_worker_alone(self):
+        self.afk("start", "03")
+        calls_before = len(self.run_fake.calls)
+
+        out = io.StringIO()
+        code = afk.main(["start", "03"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("already started", out.getvalue())
+        later = self.run_fake.calls[calls_before:]
+        self.assertFalse([c for c in later if c[0] == "git" or c[:2] in (["tmux", "new-window"], ["tmux", "kill-window"])])
+        self.assertTrue((self.project_dir / "workers" / "03" / "status.json").is_file())
 
     def settings(self):
         self.afk("start", "03")
