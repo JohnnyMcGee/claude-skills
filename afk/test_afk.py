@@ -154,6 +154,31 @@ class StartTest(AfkTestCase):
         self.assertIn(str(self.scratch / "issues" / "03-ui.md"), claude[-1])
         self.assertIn('afk report', claude[-1])
 
+    def settings(self):
+        self.afk("start", "03")
+        launch = self.launch_command()
+        return json.loads(Path(launch[launch.index("--settings") + 1]).read_text())
+
+    def test_settings_deny_force_push_push_to_base_pr_merge_and_worktree_removal(self):
+        deny = self.settings()["permissions"]["deny"]
+
+        for rule in [
+            "Bash(git push *--force*)",
+            "Bash(git push * main)",
+            "Bash(git push * HEAD:main)",
+            "Bash(gh pr merge *)",
+            "Bash(git worktree remove *)",
+        ]:
+            self.assertIn(rule, deny)
+
+    def test_settings_wire_status_hooks_to_afk_hook(self):
+        hooks = self.settings()["hooks"]
+
+        for event, arg in [("SessionStart", "session-start"), ("Stop", "stop"), ("Notification", "notification")]:
+            command = shlex.split(hooks[event][0]["hooks"][0]["command"])
+            self.assertEqual(command[-2:], ["hook", arg])
+            self.assertTrue(os.access(command[0], os.X_OK), command[0])
+
 
 if __name__ == "__main__":
     unittest.main()

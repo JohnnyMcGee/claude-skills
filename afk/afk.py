@@ -4,6 +4,7 @@
 stdlib only. Every external command (tmux, git, gh, claude) goes through run().
 """
 
+import json
 import os
 import re
 import shlex
@@ -12,6 +13,9 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+
+
+AFK_BIN = os.path.realpath(__file__)
 
 
 def default_run(cmd, input=None):
@@ -44,7 +48,7 @@ class Afk:
         session = self.run(["tmux", "display-message", "-p", "#{session_name}"]).strip()
         pdir = self.project_dir(project)
         pdir.mkdir(parents=True, exist_ok=True)
-        config = {"spec": str(spec), "tracker": "local", "repo": str(repo), "session": session}
+        config = {"spec": str(spec), "tracker": "local", "repo": str(repo), "session": session, "base": "main"}
         (pdir / "config.toml").write_text(to_toml(config))
         self.run(["tmux", "set-option", "-t", session, "@afk_project", project])
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
@@ -72,7 +76,7 @@ class Afk:
         self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree)])
 
         settings = worker_dir / "settings.json"
-        settings.write_text("{}\n")
+        settings.write_text(json.dumps(worker_settings(config.get("base", "main")), indent=2) + "\n")
         launch = [
             "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}",
             "claude", "--permission-mode", "auto", "--settings", str(settings),
@@ -156,6 +160,32 @@ def parse_ticket(path):
 def window_name(ticket):
     abbrev = re.sub(r"[^a-z0-9]+", "-", ticket.title.lower()).strip("-")[:10].rstrip("-")
     return f"{ticket.id}-{abbrev}"
+
+
+def worker_settings(base):
+    """Per-session Claude settings: status hooks plus a deny list against irreversible damage."""
+    hook = lambda event: [{"hooks": [{"type": "command", "command": f"{shlex.quote(AFK_BIN)} hook {event}"}]}]
+    return {
+        "permissions": {
+            "deny": [
+                "Bash(git push *--force*)",
+                "Bash(git push * -f)",
+                "Bash(git push * -f *)",
+                "Bash(git push * +*)",
+                f"Bash(git push * {base})",
+                f"Bash(git push * HEAD:{base})",
+                f"Bash(git push * *:{base})",
+                "Bash(gh pr merge *)",
+                "Bash(git worktree remove *)",
+                "Bash(git worktree prune *)",
+            ]
+        },
+        "hooks": {
+            "SessionStart": hook("session-start"),
+            "Stop": hook("stop"),
+            "Notification": hook("notification"),
+        },
+    }
 
 
 def worker_prompt(ticket):
