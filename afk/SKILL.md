@@ -53,14 +53,14 @@ A ticket of the built-in `hitl` type is the user's to work on. `afk start` sets 
 
 ## Merge and cleanup
 
-The watcher looks up each `pr`, `review` and `hitl` worker's PR by its branch (`afk/<project>-<ticket>`) with `gh pr view` about once a minute, so a PR is found whoever opened it and whether or not its URL was reported. A worker stopped in `pr` (`blocked`, `attention` or `stuck`) whose branch has an open PR moves on to `review`. A `review` worker whose branch has no PR needs attention until one is found. It never merges a PR or requests reviewers: merging is the user's call. Once the PR is merged, it removes the worker's window, worktree and local branch, which frees its slot, and notifies the user to run `/afk next` for the next batch. It does this only when the worker's shell pane is idle at a shell prompt and the worktree has no uncommitted changes. Otherwise the worker becomes `cleanup-pending` and the user is notified once. The watcher checks again every tick and cleans up as soon as it's safe. Tell the user what is holding cleanup up. Don't clean up by hand.
+The watcher looks up each `pr`, `review` and `hitl` worker's PR by its branch (`afk/<project>-<ticket>`) with `gh pr view` about once a minute, so a PR is found whoever opened it and whether or not its URL was reported. A worker stopped in `pr` without reporting `done` moves on to `review` only once its open PR carries the `Ready for Review` label, which `/open-pr` adds when the automated gates are clear. An open PR alone isn't enough, because `/open-pr` stops between turns while it waits on checks and reviewers. If you opened or finished a stuck worker's PR yourself, add the label to hand it over. A `review` worker whose branch has no PR needs attention until one is found. It never merges a PR or requests reviewers: merging is the user's call. Once the PR is merged, it removes the worker's window, worktree and local branch, which frees its slot, and notifies the user to run `/afk next` for the next batch. It does this only when the worker's shell pane is idle at a shell prompt and the worktree has no uncommitted changes. Otherwise the worker becomes `cleanup-pending` and the user is notified once. The watcher checks again every tick and cleans up as soon as it's safe. Tell the user what is holding cleanup up. Don't clean up by hand.
 
 ## Worker protocol
 
 Workers end every phase with `afk report <done|blocked|question> "<message>"`. That, plus the hooks, is what `afk status` shows.
 
 - `question` or `blocked`: the watcher notifies and does not advance. Tell the user which window needs them — do not answer on the worker's behalf.
-- A worker that stops without reporting since its last phase prompt is marked `attention` (window suffix `!`). It has stalled silently and needs the user.
+- A worker that stops without reporting since its last phase prompt stays `working`, since workers end turns to wait on background tasks (a review subagent, CI checks, reviewer bots) and resume when they land. If its session stays quiet past `idle_minutes`, it is marked `attention` (window suffix `!`): it has stalled silently and needs the user.
 - A worker due its next phase whose pane no longer runs `claude` (it exited, or the pane was killed) is also marked `attention`; the watcher never pastes a prompt into a bare shell.
 
 ## Limits
@@ -75,7 +75,7 @@ idle_minutes = 20   # working, but its transcript hasn't changed
 fix_loops = 3       # review rounds (feedback → fix → done) before stopping to look
 ```
 
-A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, where it has already stopped), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A limit trips at most once per phase, so a stuck worker that is nudged and later reports `done` moves on as usual.
+A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, where it has already stopped, nor for a worker that stopped without reporting and went quiet, which is marked `attention` instead), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A limit trips at most once per phase, so a stuck worker that is nudged and later reports `done` moves on as usual.
 
 ## Setup
 

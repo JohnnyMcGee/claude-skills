@@ -179,7 +179,7 @@ Watch the dashboard, and don't type into 01's agent pane unless it asks.
 - [ ] implement: it commits and reports `done`. The watcher waits until its session has stopped, then pastes the verify prompt.
 - [ ] verify: it starts `app.py` on its `$AFK_PORT_BASE`, curls `/health` and an unhappy path, stops the server and reports `done`
 - [ ] prepr: it runs `/pre-pr`, merges `origin/main`, runs a review subagent and reports `done`
-- [ ] pr: it pushes and runs `/open-pr main`. With no CI or bot reviewers, `/open-pr` should reach Ready without waiting forever. It reports `done`, and the watcher finds the PR by its branch.
+- [ ] pr: it pushes and runs `/open-pr main`. With no CI or bot reviewers, `/open-pr` should reach Ready without waiting forever. While it waits on checks or reviewers between turns, the dashboard keeps it in `pr` `working`, with no attention notification and no review prompt. It adds the `Ready for Review` label, reports `done`, and the watcher finds the PR by its branch.
 - [ ] review: the dashboard shows the PR, the window is marked Ready, and you get a "PR ready for review" notification (bell, tmux message and `notify-send`). The worker replies "Standing by."
 - [ ] Review feedback: type a small request into 01's agent pane, such as "also return `Content-Length`". It fixes, re-runs the prepr steps, pushes, and reports `done`. You're notified, and it stays in review.
 - [ ] `afk status` matches the dashboard at every step
