@@ -332,7 +332,9 @@ def enforce(ticket, status, now, limits, last_activity):
 
     last_activity is when the worker's session last wrote anything; a phase prompt counts as activity.
     """
-    if status["state"] != "working":
+    # A worker that reported done but hasn't stopped is still running. Review has no phase clock: it waits on the human.
+    running = status["state"] == "working" or (status["state"] == "done" and not status.get("idle"))
+    if not running or status["phase"] == "review":
         return status, []
     reason = None
     if now - status["phase_started_at"] > limits["phase_minutes"] * 60:

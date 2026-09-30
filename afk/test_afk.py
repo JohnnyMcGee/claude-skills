@@ -823,6 +823,20 @@ class LimitsTest(unittest.TestCase):
 
         self.assertEqual((status["state"], effects), ("working", []))
 
+    def test_a_worker_that_reported_done_but_keeps_running_is_still_held_to_the_limits(self):
+        status, effects = afk.tick(
+            "03", self.worker(state="done", idle=False), 61 * 60, limits=self.limits, last_activity=61 * 60
+        )
+
+        self.assertEqual(status["state"], "stuck")
+        self.assertIn(("interrupt", "%5"), effects)
+
+    def test_a_review_round_reported_before_its_stop_is_not_held_to_the_phase_clock(self):
+        worker = self.worker(phase="review", state="done", idle=False, shown="review")
+        status, effects = afk.tick("03", worker, 600 * 60, limits=self.limits, last_activity=600 * 60)
+
+        self.assertEqual((status["state"], effects), ("done", [("window", "%5", "03-widget-ui", "done")]))
+
     def review_round(self, status, now):
         """The human gives feedback in the pane; the worker fixes it, reports done and stops."""
         return afk.tick("03", {**status, "state": "done", "message": "Fixed", "idle": True}, now, limits=self.limits)
