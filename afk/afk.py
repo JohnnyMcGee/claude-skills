@@ -16,6 +16,7 @@ import time
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import reduce
 from pathlib import Path
 
 
@@ -23,8 +24,8 @@ AFK_BIN = os.path.realpath(__file__)
 SKILL_DIR = Path(AFK_BIN).parent
 
 
-def default_run(cmd, input=None):
-    return subprocess.run(cmd, input=input, capture_output=True, text=True, check=True).stdout
+def default_run(cmd, input=None, cwd=None):
+    return subprocess.run(cmd, input=input, cwd=cwd, capture_output=True, text=True, check=True).stdout
 
 
 class Afk:
@@ -54,7 +55,7 @@ class Afk:
         session = self.run(["tmux", "display-message", "-p", "#{session_name}"]).strip()
         pdir = self.project_dir(project)
         pdir.mkdir(parents=True, exist_ok=True)
-        config = {"spec": str(spec), "tracker": "local", "repo": str(repo), "session": session, "base": "main"}
+        config = {"spec": str(spec), "tracker": "local", "repo": str(repo), "session": session}
         (pdir / "config.toml").write_text(to_toml(config))
         self.run(["tmux", "set-option", "-t", session, "@afk_project", project])
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
@@ -63,22 +64,37 @@ class Afk:
         for ticket in self.tracker().frontier():
             self.out(f"{ticket.id}  {ticket.title}")
 
-    def cmd_start(self, ticket_id):
+    def cmd_start(self, ticket_id, *options):
         project = self.current_project()
         config = self.config()
         ticket = self.tracker().get(ticket_id)
+        type_name = options[1] if options[:1] == ("--type",) else ticket.type
         pdir = self.project_dir(project)
         worktree = pdir / "worktrees" / ticket.id
         worker_dir = pdir / "workers" / ticket.id
-        if worker_dir.exists():
-            raise SystemExit(f"afk: ticket {ticket.id} is already started; see `afk status`")
+        repo_config = self.repo_config()
+        type_name = type_name or repo_config.get("default_type")
+        task_types = repo_config.get("task_types", {})
+        if type_name and type_name not in task_types:
+            raise SystemExit(f"afk: unknown task type '{type_name}'; docs/agents/afk.md defines: {', '.join(task_types) or 'none'}")
+        task_type = task_types.get(type_name, {})
+        if task_type.get("agent", "claude") not in AGENTS:
+            raise SystemExit(f"afk: task type '{type_name}' uses agent '{task_type['agent']}'; supported: {', '.join(AGENTS)}")
+        base = repo_config.get("base", "main")
+        slot = self.claim_worker(worker_dir)
+        slot_env = [f"AFK_SLOT={slot}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * slot}"]
         branch = f"afk/{project}-{ticket.id}"
         undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
         try:
-            worker_dir.mkdir(parents=True, exist_ok=True)
-            self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree)])
+            self.run(["git", "-C", config["repo"], "worktree", "add", "-b", branch, str(worktree), base])
             undo.append(lambda: self.run(["git", "-C", config["repo"], "branch", "-D", branch]))
             undo.append(lambda: self.run(["git", "-C", config["repo"], "worktree", "remove", "--force", str(worktree)]))
+            for name in repo_config.get("copy", []):
+                target = worktree / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(Path(config["repo"]) / name, target)
+            for command in repo_config.get("bootstrap", []):
+                self.run(["env", *slot_env, "sh", "-c", command], cwd=worktree)
 
             pane = self.run(
                 ["tmux", "new-window", "-d", "-t", config["session"] + ":", "-n", window_name(ticket),
@@ -88,16 +104,17 @@ class Afk:
             self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree)])
 
             settings = worker_dir / "settings.json"
-            settings.write_text(json.dumps(worker_settings(config.get("base", "main")), indent=2) + "\n")
+            settings.write_text(json.dumps(worker_settings(base), indent=2) + "\n")
             launch = [
-                "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}",
+                "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
-                self.phase_prompt(ticket.id, "implement"),
+                *[arg for key in ("model", "effort") if key in task_type for arg in (f"--{key}", task_type[key])],
+                self.implement_prompt(ticket, task_type),
             ]
             write_json(
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "phase": "implement", "state": "working", "message": "",
-                 "pane": pane, "window": window_name(ticket), "phase_started_at": self.clock()},
+                 "pane": pane, "window": window_name(ticket), "slot": slot, "type": type_name, "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
@@ -109,6 +126,20 @@ class Afk:
                     pass
             raise
         self.out(f"started {ticket.id} in {worktree} on {branch}")
+
+    def claim_worker(self, worker_dir):
+        """Create the worker's dir and claim the lowest slot no active worker holds; removing the dir frees it."""
+        workers = worker_dir.parent
+        workers.mkdir(parents=True, exist_ok=True)
+        with locked(workers):
+            try:
+                worker_dir.mkdir()
+            except FileExistsError:
+                raise SystemExit(f"afk: ticket {worker_dir.name} is already started; see `afk status`")
+            taken = {int(p.read_text()) for p in workers.glob("*/slot")}
+            slot = next(n for n in range(1, len(taken) + 2) if n not in taken)
+            (worker_dir / "slot").write_text(f"{slot}\n")
+        return slot
 
     def cmd_report(self, state, message=""):
         if state not in REPORT_STATES:
@@ -206,8 +237,18 @@ class Afk:
             SKILL_DIR / f"phase-{phase}.md",
             ticket=ticket.id,
             ticket_path=ticket.path,
-            base=self.config().get("base", "main"),
+            base=self.repo_config().get("base", "main"),
         )
+
+    def implement_prompt(self, ticket, task_type):
+        """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
+        prompt = self.phase_prompt(ticket.id, "implement")
+        if "prompt" in task_type:
+            template = Path(self.config()["repo"]) / task_type["prompt"]
+            prompt += "\n" + render(template, ticket=ticket.id, ticket_path=ticket.path)
+        if "skill" in task_type:
+            prompt = f"{task_type['skill']} {prompt}"
+        return prompt
 
     def agent_running(self, pane):
         try:
@@ -255,11 +296,20 @@ class Afk:
     def config(self):
         return tomllib.loads((self.project_dir(self.current_project()) / "config.toml").read_text())
 
+    def repo_config(self):
+        """The repo's AFK config: docs/agents/afk.md, then gitignored afk.local.md, then the project's [overrides]."""
+        config = self.config()
+        docs = Path(config["repo"]) / "docs" / "agents"
+        layers = [frontmatter(p.read_text()) for p in (docs / "afk.md", docs / "afk.local.md") if p.is_file()]
+        return reduce(deep_merge, [*layers, config.get("overrides", {})], {})
+
     def tracker(self):
         return LocalTracker(Path(self.config()["spec"]))
 
 
 REPORT_STATES = ("done", "blocked", "question")
+
+AGENTS = ("claude",)
 
 PHASES = ("implement", "verify", "prepr", "pr", "review")
 
@@ -312,6 +362,7 @@ class Ticket:
     status: str
     blocked_by: list
     path: Path
+    type: str
 
     @property
     def done(self):
@@ -356,6 +407,7 @@ def parse_ticket(path):
         status=field(text, "Status").lower(),
         blocked_by=[n.zfill(len(number)) for n in re.findall(r"(?:^|,)\s*#?(\d+)\b", field(text, "Blocked by"))],
         path=path,
+        type=field(text, "Type"),
     )
 
 
@@ -409,6 +461,19 @@ def render(template, **values):
     for key, value in values.items():
         text = text.replace("{{" + key + "}}", str(value))
     return text
+
+
+def frontmatter(text):
+    """TOML between a leading pair of +++ lines, as in Hugo and Zola."""
+    match = re.match(r"\+\+\+\n(.*?)^\+\+\+$", text, re.DOTALL | re.MULTILINE)
+    return tomllib.loads(match.group(1)) if match else {}
+
+
+def deep_merge(base, override):
+    merged = dict(base)
+    for key, value in override.items():
+        merged[key] = deep_merge(merged[key], value) if isinstance(value, dict) and isinstance(merged.get(key), dict) else value
+    return merged
 
 
 def field(text, name):
