@@ -498,6 +498,107 @@ class SlotTest(AfkTestCase):
         self.assertEqual(self.launches(), [["AFK_SLOT=1", "AFK_PORT_BASE=4100"]])
 
 
+class VerifyQueueTest(AfkTestCase):
+    PANES = {"03": "%5", "05": "%6", "07": "%7"}
+
+    def setUp(self):
+        super().setUp()
+        for name, title in [("03-ui", "Widget UI"), ("05-export", "Widget export"), ("07-import", "Widget import")]:
+            self.ticket(name, title)
+        self.afk("init", str(self.scratch))
+        self.repo_config("verify_concurrency = 1")
+        panes = iter(self.PANES.values())
+        self.run_fake.responses[("tmux", "new-window")] = lambda cmd: next(panes) + "\n"
+        for ticket in self.PANES:
+            self.afk("start", ticket)
+
+    def finish(self, ticket):
+        env = {"AFK_PROJECT": "widgets", "AFK_TICKET": ticket}
+        self.afk("report", "done", "Done", env=env)
+        self.afk("hook", "stop", stdin=json.dumps({"hook_event_name": "Stop"}), env=env)
+        self.now += 60
+
+    def state(self, ticket):
+        status = json.loads((self.project_dir / "workers" / ticket / "status.json").read_text())
+        return status["phase"], status["state"]
+
+    def verify_prompted(self, ticket):
+        pane = self.PANES[ticket]
+        pastes = [c for c in self.run_fake.find("tmux", "paste-buffer") if c[c.index("-t") + 1] == pane]
+        buffers = [i for c, i in zip(self.run_fake.calls, self.run_fake.inputs) if c[:2] == ["tmux", "load-buffer"]]
+        return len(pastes) > 0 and any(b.startswith(f"AFK phase: verify — ticket {ticket}") for b in buffers)
+
+    def test_second_worker_is_queued_while_another_verifies(self):
+        self.finish("03")
+        self.afk("tick")
+        self.finish("05")
+
+        self.afk("tick")
+
+        self.assertEqual(self.state("03"), ("verify", "working"))
+        self.assertEqual(self.state("05"), ("implement", "queued"))
+        self.assertFalse(self.verify_prompted("05"))
+
+    def test_queued_worker_starts_verifying_once_the_slot_frees(self):
+        self.finish("03")
+        self.afk("tick")
+        self.finish("05")
+        self.afk("tick")
+
+        self.finish("03")
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual(self.state("03"), ("prepr", "working"))
+        self.assertEqual(self.state("05"), ("verify", "working"))
+        self.assertTrue(self.verify_prompted("05"))
+
+    def test_workers_finishing_in_the_same_tick_verify_one_at_a_time(self):
+        self.finish("03")
+        self.finish("05")
+
+        self.afk("tick")
+
+        self.assertEqual([self.state("03")[1], self.state("05")[1]], ["working", "queued"])
+
+    def test_queue_is_first_come_first_served(self):
+        self.finish("03")
+        self.afk("tick")
+        self.finish("07")
+        self.afk("tick")
+        self.finish("05")
+        self.afk("tick")
+
+        self.finish("03")
+        self.afk("tick")
+        self.afk("tick")
+
+        self.assertEqual(self.state("07"), ("verify", "working"))
+        self.assertEqual(self.state("05"), ("implement", "queued"))
+
+    def test_queued_worker_whose_agent_exited_needs_attention_without_skipping_verify(self):
+        self.finish("03")
+        self.afk("tick")
+        self.finish("05")
+        self.afk("tick")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = lambda cmd: "claude\n" if cmd[4] == "%5" else "bash\n"
+
+        self.finish("03")
+        self.afk("tick")
+
+        self.assertEqual(self.state("05"), ("implement", "attention"))
+        self.assertFalse(self.verify_prompted("05"))
+
+    def test_without_verify_concurrency_workers_verify_in_parallel(self):
+        self.repo_config("")
+        self.finish("03")
+        self.finish("05")
+
+        self.afk("tick")
+
+        self.assertEqual([self.state("03"), self.state("05")], [("verify", "working")] * 2)
+
+
 class WorkerStatusTest(AfkTestCase):
     def setUp(self):
         super().setUp()

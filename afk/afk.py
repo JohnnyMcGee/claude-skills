@@ -4,6 +4,7 @@
 stdlib only. Every external command (tmux, git, gh, claude) goes through run().
 """
 
+import bisect
 import fcntl
 import json
 import os
@@ -183,15 +184,19 @@ class Afk:
     def cmd_tick(self):
         now = self.clock()
         shown, failures = [], []
+        paths = sorted(self.workers_dir().glob("*/status.json"))
+        # Only the watcher changes phases, so a snapshot of them stays true for the whole tick.
+        verify = VerifyQueue(self.repo_config().get("verify_concurrency"), [read_json(p) for p in paths])
         # Each worker is read, acted on and persisted under its lock, so a report or hook can't land in between,
         # a failure can't make a later tick repeat another worker's effects, and one failing worker fails alone.
-        for path in sorted(self.workers_dir().glob("*/status.json")):
+        for path in paths:
             with locked(path.parent):
                 before = read_json(path)
-                status, effects = tick(path.parent.name, before, now)
+                may_verify = verify.may_start(before)
+                status, effects = tick(path.parent.name, before, now, may_verify=may_verify)
                 if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
                     # Pasting into a bare shell would run the prompt's markdown as commands.
-                    status, effects = tick(path.parent.name, before, now, agent_running=False)
+                    status, effects = tick(path.parent.name, before, now, agent_running=False, may_verify=may_verify)
                 try:
                     for effect in effects:
                         self.perform(*effect)
@@ -201,6 +206,7 @@ class Afk:
                     continue
                 if status != before:
                     write_json(path, status)
+                verify.update(before, status)
                 shown.append(status)
         for line in dashboard(shown, now):
             self.out(line)
@@ -317,20 +323,23 @@ PHASES = ("implement", "verify", "prepr", "pr", "review")
 WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "review": "✓"}
 
 
-def tick(ticket, status, now, agent_running=True):
+def tick(ticket, status, now, agent_running=True, may_verify=True):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
+    may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
     """
-    status, effects = advance(ticket, status, now, agent_running)
+    status, effects = advance(ticket, status, now, agent_running, may_verify)
     if status["state"] != status.get("shown"):
         status = {**status, "shown": status["state"]}
         effects.append(("window", status["pane"], status["window"], status["state"]))
     return status, effects
 
 
-def advance(ticket, status, now, agent_running):
+def advance(ticket, status, now, agent_running, may_verify):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
+    if state == "queued" and may_verify:
+        state = "done"  # its turn to verify: advance as if it had just finished
     if state == "done" and status.get("idle") and not agent_running:
         state, message = "attention", "claude is no longer running in its pane"
         status = {**status, "state": state, "message": message, "reports": status.get("reports", 0) + 1}
@@ -339,6 +348,9 @@ def advance(ticket, status, now, agent_running):
         if phase == "review":
             return {**status, "state": "review"}, [("notify", f"{ticket} addressed review feedback: {message}")]
         phase = PHASES[PHASES.index(phase) + 1]
+        if phase == "verify" and not may_verify:
+            # Stays in its finished phase, so if it needs attention while queued, done still leads to verify.
+            return {**status, "state": "queued", "queued_at": now}, []
         status = {**status, "phase": phase, "state": "working", "message": "", "idle": False, "phase_started_at": now}
         effects = [("prompt", ticket, status["pane"], phase)]
         if phase == "review":
@@ -350,6 +362,29 @@ def advance(ticket, status, now, agent_running):
         label = "needs attention" if state == "attention" else state
         return {**status, "notified": status.get("reports")}, [("notify", f"{ticket} {label}: {message}")]
     return status, []
+
+
+class VerifyQueue:
+    """Holds workers back from verify, first come first served, while the repo's verify_concurrency slots are full."""
+
+    def __init__(self, limit, statuses):
+        self.limit = limit
+        self.verifying = sum(s["phase"] == "verify" for s in statuses)
+        self.queue = sorted((s["queued_at"], s["ticket"]) for s in statuses if s["state"] == "queued")
+
+    def may_start(self, status):
+        if self.limit is None or self.verifying >= self.limit:
+            return self.limit is None
+        if status["state"] == "queued":
+            return self.queue[0][1] == status["ticket"]
+        return not self.queue
+
+    def update(self, before, after):
+        self.verifying += (after["phase"] == "verify") - (before["phase"] == "verify")
+        if before["state"] == "queued":
+            self.queue.remove((before["queued_at"], before["ticket"]))
+        if after["state"] == "queued":
+            bisect.insort(self.queue, (after["queued_at"], after["ticket"]))
 
 
 DONE_STATUSES = {"resolved", "done", "closed"}
