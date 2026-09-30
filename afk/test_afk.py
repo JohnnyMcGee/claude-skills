@@ -445,6 +445,25 @@ class StartTest(AfkTestCase):
         self.assertEqual(codes, [1])
         self.assertFalse((self.project_dir / "workers" / "05").exists())
 
+    def test_a_hitl_worker_still_being_set_up_does_not_count_toward_the_max(self):
+        self.ticket("04-spike", "Widget spike", type="hitl")
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write("\n[limits]\nmax_workers = 1\n")
+        codes = []
+
+        def afk_start_arrives_mid_hitl_setup(cmd):
+            if not codes:
+                codes.append(None)  # the nested start runs git too
+                out = io.StringIO()
+                codes[0] = afk.main(["start", "03"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+                codes.append(out.getvalue())
+            return ""
+
+        self.run_fake.responses[("git", "-C")] = afk_start_arrives_mid_hitl_setup
+        self.afk("start", "04")
+
+        self.assertEqual(codes[0], 0, codes[1])
+
     def settings(self):
         self.afk("start", "03")
         launch = self.launch_command()

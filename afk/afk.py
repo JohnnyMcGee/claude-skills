@@ -229,13 +229,15 @@ class Afk:
             max_workers = {**LIMITS, **self.config().get("limits", {})}["max_workers"]
             # Workers in review are parked on the human and hitl workers are the human's, so neither counts;
             # one still starting has no status yet.
-            active = [d for d in workers.glob("*/slot") if counts_toward_max(d.parent / "status.json")]
+            active = [d for d in workers.glob("*/slot") if counts_toward_max(d.parent)]
             if counted and len(active) >= max_workers:
                 raise SystemExit(f"afk: {len(active)} workers already active (max_workers = {max_workers}); see `afk status`")
             worker_dir.mkdir()
             taken = {int(p.read_text()) for p in workers.glob("*/slot")}
             slot = next(n for n in range(1, len(taken) + 2) if n not in taken)
             (worker_dir / "slot").write_text(f"{slot}\n")
+            if not counted:
+                (worker_dir / "uncounted").touch()  # before it has a status, so a start racing its setup sees it
         return slot
 
     def cmd_report(self, state, message=""):
@@ -911,9 +913,11 @@ def locked(worker_dir):
         yield
 
 
-def counts_toward_max(status_path):
+def counts_toward_max(worker_dir):
+    if (worker_dir / "uncounted").exists():
+        return False
     try:
-        return read_json(status_path)["phase"] not in ("review", "hitl")
+        return read_json(worker_dir / "status.json")["phase"] not in ("review", "hitl")
     except FileNotFoundError:
         return True
 
