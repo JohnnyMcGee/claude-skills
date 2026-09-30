@@ -5,8 +5,11 @@ stdlib only. Every external command (tmux, git, gh, claude) goes through run().
 """
 
 import os
+import re
 import subprocess
 import sys
+import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -44,6 +47,87 @@ class Afk:
         (pdir / "config.toml").write_text(to_toml(config))
         self.run(["tmux", "set-option", "-t", session, "@afk_project", project])
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
+
+    def cmd_frontier(self):
+        for ticket in self.tracker().frontier():
+            self.out(f"{ticket.id}  {ticket.title}")
+
+    def current_project(self):
+        project = self.env.get("AFK_PROJECT") or self.run(
+            ["tmux", "show-options", "-v", "@afk_project"]
+        ).strip()
+        if not project:
+            raise SystemExit("afk: no project for this tmux session; run `afk init <spec>` first")
+        return project
+
+    def config(self):
+        return tomllib.loads((self.project_dir(self.current_project()) / "config.toml").read_text())
+
+    def tracker(self):
+        return LocalTracker(Path(self.config()["spec"]))
+
+
+DONE_STATUSES = {"resolved", "done", "closed"}
+
+
+@dataclass
+class Ticket:
+    id: str
+    title: str
+    status: str
+    blocked_by: list
+    path: Path
+
+    @property
+    def done(self):
+        return self.status in DONE_STATUSES
+
+    @property
+    def open(self):
+        return not self.done and self.status != "claimed"
+
+
+class LocalTracker:
+    """Tickets as `.scratch/<slug>/issues/<NN>-<slug>.md` files, as written by /to-tickets."""
+
+    def __init__(self, spec_dir):
+        self.issues_dir = spec_dir / "issues"
+
+    def tickets(self):
+        return [parse_ticket(p) for p in sorted(self.issues_dir.glob("*.md"))]
+
+    def get(self, ticket_id):
+        for ticket in self.tickets():
+            if ticket.id == ticket_id:
+                return ticket
+        raise SystemExit(f"afk: no ticket '{ticket_id}'")
+
+    def frontier(self):
+        tickets = self.tickets()
+        done = {t.id for t in tickets if t.done}
+        return [t for t in tickets if t.open and all(b in done for b in t.blocked_by)]
+
+
+def parse_ticket(path):
+    number = path.name.split("-", 1)[0]
+    text = path.read_text()
+    title = path.stem
+    heading = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
+    if heading:
+        title = re.sub(r"^\d+\s*[—–-]\s*", "", heading.group(1)).strip()
+    return Ticket(
+        id=number,
+        title=title,
+        status=field(text, "Status").lower(),
+        blocked_by=[n.zfill(len(number)) for n in re.findall(r"\b(\d+)\b", field(text, "Blocked by"))],
+        path=path,
+    )
+
+
+def field(text, name):
+    """Value of a `Name: value` line, tolerating markdown bold around the label."""
+    match = re.search(rf"^\W*{re.escape(name)}\W*:\**\s*(.*)$", text, re.MULTILINE | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
 
 
 def to_toml(flat):

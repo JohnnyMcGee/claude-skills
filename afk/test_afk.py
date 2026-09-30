@@ -91,5 +91,20 @@ class InitTest(AfkTestCase):
         )
 
 
+class FrontierTest(AfkTestCase):
+    def test_frontier_lists_open_tickets_whose_blockers_are_all_done(self):
+        self.ticket("01-schema", "Widget schema", status="resolved")
+        self.ticket("02-api", "Widget API", status="done", blocked_by="01")
+        self.ticket("03-ui", "Widget UI", blocked_by="01, 02")
+        self.ticket("04-search", "Widget search", blocked_by="03")
+        self.ticket("05-export", "Widget export")
+        self.ticket("06-import", "Widget import", status="claimed")
+        self.afk("init", str(self.scratch))
+
+        output = self.afk("frontier")
+
+        self.assertEqual(output.splitlines(), ["03  Widget UI", "05  Widget export"])
+
+
 if __name__ == "__main__":
     unittest.main()
