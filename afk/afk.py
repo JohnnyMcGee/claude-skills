@@ -154,12 +154,7 @@ class Afk:
             self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), base])
             undo.append(lambda: self.run(["git", "-C", str(clone), "branch", "-D", branch]))
             undo.append(lambda: self.run(["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)]))
-            for name in repo_config.get("copy", []):
-                target = worktree / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(clone / name, target)
-            for command in repo_config.get("bootstrap", []):
-                self.run(["env", *slot_env, "sh", "-c", command], cwd=worktree)
+            self.prepare_worktree(clone, worktree, repo_config, slot_env)
 
             pane = self.run(
                 ["tmux", "new-window", "-d", "-t", config["session"] + ":", "-n", window_name(ticket),
@@ -192,6 +187,82 @@ class Afk:
                     pass
             raise
         self.out(f"started {ticket.id} in {worktree} on {branch}")
+
+    def prepare_worktree(self, repo, worktree, repo_config, slot_env, step=lambda label: None):
+        """Copy the repo's gitignored files into a new worktree, then run its bootstrap; step(label) announces each."""
+        for name in repo_config.get("copy", []):
+            step(f"copy {name}")
+            target = worktree / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(repo / name, target)
+        for command in repo_config.get("bootstrap", []):
+            step(f"bootstrap `{command}`")
+            self.run(["env", *slot_env, "sh", "-c", command], cwd=worktree)
+
+    def cmd_check(self, repo=None):
+        """Validate a repo's docs/agents/afk.md (plus afk.local.md) against what `afk start` reads."""
+        repo = Path(repo or self.run(["git", "rev-parse", "--show-toplevel"]).strip()).resolve()
+        errors, warnings = check_repo_config(repo, self.branch_exists)
+        for warning in warnings:
+            self.out(f"warning: {warning}")
+        for error in errors:
+            self.out(f"error: {error}")
+        if errors:
+            return 1
+        self.out(f"{repo / 'docs' / 'agents' / 'afk.md'} is valid")
+
+    def branch_exists(self, repo, branch):
+        try:
+            self.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"])
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    def cmd_trial(self, *args):
+        """Prove a repo's config as `afk start` would use it: a scratch worktree, copied files and bootstrap.
+
+        The worktree is left for the caller to start the dev server in; `afk trial --teardown` removes it.
+        """
+        teardown = "--teardown" in args
+        rest = [a for a in args if a != "--teardown"]
+        if len(rest) > 1:
+            raise SystemExit("afk: usage: afk trial [<repo>] [--teardown]")
+        repo = Path(rest[0] if rest else self.run(["git", "rev-parse", "--show-toplevel"]).strip()).resolve()
+        worktree = self.state_root() / ".trial" / repo.name  # dot-named: no project dir can be it
+        self.remove_trial(repo, worktree)
+        if teardown:
+            self.out(f"removed trial worktree {worktree} and branch {TRIAL_BRANCH}")
+            return
+        if self.cmd_check(str(repo)):
+            return 1
+        repo_config = reduce(deep_merge, repo_config_layers(repo), {})
+        base = repo_config.get("base", "main")
+        slot_env = [f"AFK_SLOT={TRIAL_SLOT}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * TRIAL_SLOT}"]
+        label = f"worktree {worktree} on {TRIAL_BRANCH} from {base}"
+        try:
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            self.run(["git", "-C", str(repo), "worktree", "add", "-B", TRIAL_BRANCH, str(worktree), base])
+            self.out(f"ok   {label}")
+
+            def step(next_label):
+                nonlocal label
+                label = next_label
+                self.out(f"...  {label}")
+
+            self.prepare_worktree(repo, worktree, repo_config, slot_env, step)
+        except (OSError, subprocess.CalledProcessError) as error:
+            detail = (getattr(error, "stderr", None) or getattr(error, "stdout", None) or str(error)).strip()
+            code = f" (exit {error.returncode})" if isinstance(error, subprocess.CalledProcessError) else ""
+            self.out(f"FAIL {label}{code}: {detail}")
+            self.remove_trial(repo, worktree)
+            return 1
+        self.out(f"worktree ready: cd {shlex.quote(str(worktree))} && export {' '.join(slot_env)}")
+
+    def remove_trial(self, repo, worktree):
+        self.best_effort(["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)])
+        shutil.rmtree(worktree, ignore_errors=True)
+        self.best_effort(["git", "-C", str(repo), "worktree", "prune"])
+        self.best_effort(["git", "-C", str(repo), "branch", "-D", TRIAL_BRANCH])
 
     def claim_worker(self, worker_dir):
         """Create the worker's dir and claim the lowest slot no active worker holds; removing the dir frees it."""
@@ -470,9 +541,7 @@ class Afk:
     def repo_config(self, clone=None):
         """A repo's AFK config: docs/agents/afk.md, then gitignored afk.local.md, then the project's [overrides]."""
         config = self.config()
-        docs = Path(clone or config["repo"]) / "docs" / "agents"
-        layers = [frontmatter(p.read_text()) for p in (docs / "afk.md", docs / "afk.local.md") if p.is_file()]
-        return reduce(deep_merge, [*layers, config.get("overrides", {})], {})
+        return reduce(deep_merge, [*repo_config_layers(Path(clone or config["repo"])), config.get("overrides", {})], {})
 
     def tracker(self):
         config = self.config()
@@ -499,6 +568,25 @@ PR_POLL_SECONDS = 60
 
 # A shell pane running one of these at its prompt is idle, so closing it loses nothing.
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh"}
+
+# `afk trial` works in a scratch worktree on this branch, on a slot clear of the low ones real workers take.
+TRIAL_BRANCH = "afk/trial"
+TRIAL_SLOT = 9
+
+# The frontmatter `afk start` reads, key -> (type, description of the type).
+REPO_KEYS = {
+    "base": (str, "a string"),
+    "copy": (list, "a list of strings"),
+    "bootstrap": (list, "a list of strings"),
+    "port_base": (int, "an integer"),
+    "verify_concurrency": (int, "an integer of at least 1"),
+    "default_type": (str, "a string"),
+    "task_types": (dict, "a table of task types"),
+}
+TASK_TYPE_KEYS = ("agent", "model", "effort", "skill", "prompt")
+
+# Prose sections workers are pointed at.
+REPO_SECTIONS = ("Pre-PR skill", "Dev server", "Verification recipes")
 
 # Appended to a worker's window name so its state shows even without afk's tmux status format.
 WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "stuck": "!", "review": "✓"}
@@ -868,6 +956,76 @@ def frontmatter(text):
     return tomllib.loads(match.group(1)) if match else {}
 
 
+def repo_config_layers(repo):
+    docs = repo / "docs" / "agents"
+    return [frontmatter(p.read_text()) for p in (docs / "afk.md", docs / "afk.local.md") if p.is_file()]
+
+
+def check_repo_config(repo, branch_exists):
+    """(errors, warnings) for a repo's AFK config, as `afk start` would read it."""
+    docs = repo / "docs" / "agents"
+    main = docs / "afk.md"
+    if not main.is_file():
+        return [f"{main} not found"], []
+    errors, warnings, layers = [], [], []
+    for path in (main, docs / "afk.local.md"):
+        if not path.is_file():
+            continue
+        text = path.read_text()
+        if not re.match(r"\+\+\+\n(.*?)^\+\+\+$", text, re.DOTALL | re.MULTILINE):
+            errors.append(f"{path.name}: no TOML frontmatter between leading +++ lines")
+            continue
+        try:
+            layers.append(frontmatter(text))
+        except tomllib.TOMLDecodeError as error:
+            errors.append(f"{path.name}: invalid TOML: {error}")
+    config = reduce(deep_merge, layers, {})
+
+    for key, value in config.items():
+        if key not in REPO_KEYS:
+            errors.append(f"unknown key '{key}'; known keys: {', '.join(REPO_KEYS)}")
+            continue
+        kind, description = REPO_KEYS[key]
+        if (
+            not isinstance(value, kind)
+            or isinstance(value, bool)
+            or (kind is list and not all(isinstance(v, str) for v in value))
+            or (key == "verify_concurrency" and value < 1)
+        ):
+            errors.append(f"'{key}' must be {description}")
+    task_types = config.get("task_types", {}) if isinstance(config.get("task_types"), dict) else {}
+    for name, task_type in task_types.items():
+        if not isinstance(task_type, dict):
+            errors.append(f"task_types.{name} must be a table")
+            continue
+        for key, value in task_type.items():
+            if key not in TASK_TYPE_KEYS:
+                errors.append(f"task_types.{name}: unknown key '{key}'; known keys: {', '.join(TASK_TYPE_KEYS)}")
+            elif not isinstance(value, str):
+                errors.append(f"task_types.{name}.{key} must be a string")
+        if task_type.get("agent", "claude") not in AGENTS:
+            errors.append(f"task_types.{name}: unsupported agent '{task_type['agent']}'; supported: {', '.join(AGENTS)}")
+        prompt = task_type.get("prompt")
+        if isinstance(prompt, str) and not (repo / prompt).is_file():
+            errors.append(f"task_types.{name}: prompt template {prompt} not found in the repo")
+    default_type = config.get("default_type")
+    if isinstance(default_type, str) and default_type not in task_types:
+        errors.append(f"default_type '{default_type}' is not a task type; defined: {', '.join(task_types) or 'none'}")
+    if isinstance(config.get("copy"), list):
+        for name in config["copy"]:
+            if isinstance(name, str) and not (repo / name).is_file():
+                errors.append(f"copy: {name} not found in {repo}")
+    base = config.get("base", "main")
+    if isinstance(base, str) and not branch_exists(repo, base):
+        errors.append(f"base branch '{base}' does not exist in {repo}")
+
+    prose = re.sub(r"\A\+\+\+\n.*?^\+\+\+$", "", main.read_text(), count=1, flags=re.DOTALL | re.MULTILINE)
+    for heading in REPO_SECTIONS:
+        if not re.search(rf"^#+\s*{re.escape(heading)}\s*$", prose, re.MULTILINE | re.IGNORECASE):
+            warnings.append(f"afk.md has no '## {heading}' section; workers look for it")
+    return errors, warnings
+
+
 def deep_merge(base, override):
     merged = dict(base)
     for key, value in override.items():
@@ -943,7 +1101,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|status|hook> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|status|hook|check|trial> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)

@@ -754,6 +754,198 @@ class TaskTypeTest(AfkTestCase):
         self.assertTrue(claude[-1].startswith("AFK phase: implement"))
 
 
+PROSE = "# AFK\n\n## Pre-PR skill\n\n`/pre-pr`\n\n## Dev server\n\n`npm run dev`\n\n## Verification recipes\n\nCurl it.\n"
+
+
+class CheckTest(AfkTestCase):
+    """`afk check` validates a repo's config outside any project, as /afk-setup does."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_fake.responses[("git", "rev-parse", "--show-toplevel")] = f"{self.repo}\n"
+
+    def check(self, *argv):
+        out = io.StringIO()
+        code = afk.main(["check", *argv], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+        return code, out.getvalue()
+
+    def test_a_complete_config_is_valid(self):
+        (self.repo / ".env").write_text("X=1\n")
+        self.repo_config('copy = [".env"]\nbootstrap = ["npm ci"]\nverify_concurrency = 1\n' + TASK_TYPES, body=PROSE)
+        prompts = self.repo / "docs" / "agents" / "prompts"
+        prompts.mkdir()
+        (prompts / "frontend.md").write_text("Design: see ticket.\n")
+
+        code, out = self.check()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out, f"{self.repo / 'docs' / 'agents' / 'afk.md'} is valid\n")
+
+    def test_checks_the_repo_it_is_given_or_else_the_current_checkout(self):
+        self.repo_config('base = "main"', body=PROSE)
+
+        self.assertEqual(self.check(str(self.repo))[0], 0)
+        self.assertEqual(self.check()[0], 0)
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "rev-parse", "--verify")[0][-1], "main^{commit}")
+
+    def test_a_missing_config_file_is_an_error(self):
+        code, out = self.check()
+
+        self.assertEqual(code, 1)
+        self.assertIn("afk.md not found", out)
+
+    def test_a_file_without_frontmatter_or_with_bad_toml_is_an_error(self):
+        path = self.repo / "docs" / "agents" / "afk.md"
+        path.parent.mkdir(parents=True)
+        path.write_text("# AFK\n")
+        self.assertIn("no TOML frontmatter", self.check()[1])
+
+        self.repo_config('base = main')
+        code, out = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("afk.md: invalid TOML", out)
+
+    def test_every_schema_problem_is_reported_at_once(self):
+        self.repo_config(
+            'bootstrap = "npm ci"\nport_base = "4000"\nverify_concurrency = 0\ncopy = [".env"]\n'
+            'default_type = "infra"\nsurprise = 1\n'
+            '[task_types.backend]\nagent = "grok"\nmodle = "opus"\nprompt = "missing.md"\n',
+            body=PROSE,
+        )
+
+        code, out = self.check()
+
+        self.assertEqual(code, 1)
+        for problem in (
+            "'bootstrap' must be a list of strings",
+            "'port_base' must be an integer",
+            "'verify_concurrency' must be an integer of at least 1",
+            "unknown key 'surprise'",
+            "default_type 'infra' is not a task type",
+            "task_types.backend: unsupported agent 'grok'",
+            "task_types.backend: unknown key 'modle'",
+            "task_types.backend: prompt template missing.md not found",
+            "copy: .env not found",
+        ):
+            self.assertIn(problem, out)
+
+    def test_the_local_override_file_is_checked_as_merged(self):
+        self.repo_config("[task_types.backend]\nmodel = \"opus\"", body=PROSE)
+        self.repo_config('[task_types.backend]\nagent = "grok"', name="afk.local.md")
+
+        self.assertIn("unsupported agent 'grok'", self.check()[1])
+
+    def test_a_missing_base_branch_is_an_error(self):
+        def no_branch(cmd):
+            raise subprocess.CalledProcessError(1, cmd)
+
+        self.run_fake.responses[("git", "-C", str(self.repo), "rev-parse")] = no_branch
+        self.repo_config('base = "develop"', body=PROSE)
+
+        code, out = self.check()
+
+        self.assertEqual(code, 1)
+        self.assertIn("base branch 'develop' does not exist", out)
+
+    def test_missing_prose_sections_warn_without_failing(self):
+        self.repo_config('base = "main"', body="# AFK\n\n## Dev server\n\n`npm run dev`\n")
+
+        code, out = self.check()
+
+        self.assertEqual(code, 0)
+        self.assertIn("warning: afk.md has no '## Pre-PR skill' section", out)
+        self.assertIn("warning: afk.md has no '## Verification recipes' section", out)
+        self.assertNotIn("Dev server' section", out)
+
+
+class TrialTest(AfkTestCase):
+    """`afk trial` proves the config through the same copy and bootstrap `afk start` uses."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_fake.responses[("git", "rev-parse", "--show-toplevel")] = f"{self.repo}\n"
+        self.worktree = self.state_home / "afk" / ".trial" / "repo"
+        (self.repo / ".env").write_text("SECRET=1\n")
+
+        def add_worktree(cmd):
+            Path(cmd[-2]).mkdir(parents=True)
+            return ""
+
+        self.run_fake.responses[("git", "-C", str(self.repo), "worktree", "add")] = add_worktree
+
+    def trial(self, *argv):
+        out = io.StringIO()
+        code = afk.main(["trial", *argv], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+        return code, out.getvalue()
+
+    def bootstraps(self):
+        return [(cmd, cwd) for cmd, cwd in zip(self.run_fake.calls, self.run_fake.cwds) if cmd[-3:-1] == ["sh", "-c"]]
+
+    def test_trial_creates_a_scratch_worktree_from_base_copies_files_and_bootstraps_on_a_trial_slot(self):
+        self.repo_config('base = "develop"\nport_base = 5000\ncopy = [".env"]\nbootstrap = ["npm ci", "make db"]', body=PROSE)
+
+        code, out = self.trial()
+
+        self.assertEqual(code, 0, out)
+        [add] = self.run_fake.find("git", "-C", str(self.repo), "worktree", "add")
+        self.assertEqual(add[-3:], ["afk/trial", str(self.worktree), "develop"])
+        self.assertEqual((self.worktree / ".env").read_text(), "SECRET=1\n")
+        self.assertEqual(
+            self.bootstraps(),
+            [
+                (["env", "AFK_SLOT=9", "AFK_PORT_BASE=5900", "sh", "-c", "npm ci"], str(self.worktree)),
+                (["env", "AFK_SLOT=9", "AFK_PORT_BASE=5900", "sh", "-c", "make db"], str(self.worktree)),
+            ],
+        )
+        self.assertIn("AFK_SLOT=9 AFK_PORT_BASE=5900", out.splitlines()[-1])
+        self.assertIn(str(self.worktree), out.splitlines()[-1])
+
+    def test_a_failed_step_is_named_with_its_output_and_the_trial_is_torn_down(self):
+        def make_fails(cmd):
+            if cmd[-1] == "make db":
+                raise subprocess.CalledProcessError(2, cmd, stderr="make: *** No rule to make target 'db'.")
+            return ""
+
+        self.run_fake.responses[("env",)] = make_fails
+        self.repo_config('bootstrap = ["npm ci", "make db"]', body=PROSE)
+
+        code, out = self.trial()
+
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL bootstrap `make db` (exit 2): make: *** No rule to make target 'db'.", out)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D")[-1][-1], "afk/trial")
+
+    def test_an_invalid_config_is_reported_before_anything_is_created(self):
+        self.repo_config('bootstrap = "npm ci"', body=PROSE)
+
+        code, out = self.trial()
+
+        self.assertEqual(code, 1)
+        self.assertIn("'bootstrap' must be a list of strings", out)
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "add"), [])
+
+    def test_teardown_removes_the_worktree_and_branch(self):
+        self.repo_config('base = "main"', body=PROSE)
+        self.trial()
+
+        code, out = self.trial("--teardown")
+
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.worktree.exists())
+        self.assertIn(["git", "-C", str(self.repo), "worktree", "remove", "--force", str(self.worktree)], self.run_fake.calls)
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D")[-1][-1], "afk/trial")
+
+    def test_a_leftover_trial_is_cleared_before_a_new_one(self):
+        self.repo_config('base = "main"', body=PROSE)
+        self.trial()
+
+        code, out = self.trial()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.run_fake.find("git", "-C", str(self.repo), "worktree", "add")), 2)
+
+
 class SlotTest(AfkTestCase):
     def setUp(self):
         super().setUp()

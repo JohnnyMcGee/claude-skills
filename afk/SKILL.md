@@ -75,4 +75,4 @@ A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, 
 
 ## Setup
 
-`afk` must be on PATH for workers and the user — see this repo's README.
+Run `/afk-setup` once in each repo first: it writes the repo's `docs/agents/afk.md`, proves it, and on a new machine puts `afk` on PATH for workers and the user.
