@@ -1892,6 +1892,21 @@ class WatchTest(AfkTestCase):
         self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
         self.assertEqual(len(self.desktop_notifications()), 2)
 
+    def test_a_missing_pr_does_not_replace_a_review_workers_own_question(self):
+        self.reach_review()
+        self.report("question", "Should the endpoint be versioned?")
+        self.stop()
+        self.github(None)
+        self.now += 60
+        self.afk("tick")
+
+        self.github("OPEN")
+        self.now += 60
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "question")
+        self.assertEqual(self.status()["message"], "Should the endpoint be versioned?")
+
     def test_cleaning_up_a_merged_worker_prompts_for_the_next_batch(self):
         self.reach_review()
         self.merge()

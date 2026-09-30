@@ -665,9 +665,10 @@ def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=Non
         effects = [("prompt", ticket, status["pane"], "review")] if agent_running else []
         return enter_review(ticket, status, now, effects)
     if phase == "review":
-        # Only this attention clears itself: any other still needs the human to look.
+        # Only a worker otherwise just waiting on review is flagged, and only this attention clears itself: any
+        # other state the worker is in still needs the human to look.
         missing = state == "attention" and message == NO_PR
-        if pr_state == "NONE" and not missing:
+        if pr_state == "NONE" and state == "review":
             status = {**status, "state": "attention", "message": NO_PR, "notified": status.get("reports")}
             return status, [("notify", f"{ticket} needs attention: {NO_PR}")]
         if pr_state == "OPEN" and missing:
