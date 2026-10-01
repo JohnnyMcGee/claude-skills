@@ -357,6 +357,10 @@ class Afk:
                 # About to use a tool, so no longer stopped: it resumed, say when a background task it waited on
                 # landed. Nothing may be pasted into it until it stops again.
                 changes["idle"] = False
+            elif event == "prompt" and waiting_on_human(status):
+                # The human answered or nudged it, so it's working again. Time spent waiting on them isn't the
+                # worker's: its phase clock restarts, and its limits apply afresh.
+                changes.update(state="working", message="", idle=False, phase_started_at=self.clock())
             return changes
 
         self.update_status(changes)
@@ -691,6 +695,13 @@ REPO_SECTIONS = ("Pre-PR skill", "Dev server", "Verification recipes")
 
 # Appended to a worker's window name so its state shows even without afk's tmux status format.
 WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "stuck": "!", "review": "✓"}
+
+
+def waiting_on_human(status):
+    """Whether the worker waits on the human to answer or nudge it in its pane: a question, a blocker, a tripped
+    limit or a silent stall. Not a missing PR, nor a pane whose agent has exited, which a prompt doesn't fix."""
+    return status.get("state") in ("question", "blocked", "stuck") or (
+        status.get("state") == "attention" and status.get("message") == NO_REPORT)
 
 
 def ending(status, pr_state, ticket_closed=False):
@@ -1146,6 +1157,7 @@ def worker_settings(base):
             "PreToolUse": hook("activity"),
             "Stop": hook("stop"),
             "Notification": hook("notification"),
+            "UserPromptSubmit": hook("prompt"),
         },
     }
 

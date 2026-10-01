@@ -786,7 +786,7 @@ class StartTest(AfkTestCase):
         hooks = self.settings()["hooks"]
 
         for event, arg in [("SessionStart", "session-start"), ("PreToolUse", "activity"), ("Stop", "stop"),
-                           ("Notification", "notification")]:
+                           ("Notification", "notification"), ("UserPromptSubmit", "prompt")]:
             command = shlex.split(hooks[event][0]["hooks"][0]["command"])
             self.assertEqual(command[-2:], ["hook", arg])
             self.assertTrue(os.access(command[0], os.X_OK), command[0])
@@ -1852,6 +1852,70 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual((self.phase(), self.status()["state"]), ("verify", "working"))
         self.assertEqual(len(self.interrupts()), 1)
+
+    def answer(self, ticket="03"):
+        """The human types into the worker's pane."""
+        payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "UserPromptSubmit"}
+        self.afk("hook", "prompt", stdin=json.dumps(payload), env=self.worker_env(ticket))
+
+    def test_an_answered_question_puts_the_worker_back_to_work(self):
+        for state in ("question", "blocked"):
+            with self.subTest(state):
+                self.report(state, "Which database?")
+                self.stop()
+                self.afk("tick")
+
+                self.answer()
+                self.afk("tick")
+
+                self.assertEqual((self.phase(), self.status()["state"]), ("implement", "working"))
+                self.assertEqual(self.window(), ("03-widget-ui", "working"))
+
+    def test_time_waiting_on_an_answer_does_not_count_against_the_phase_limit(self):
+        # A question answered hours later, then done reported before the worker's session stops.
+        self.limit(phase_minutes=90)
+        self.report("question", "Which database?")
+        self.stop()
+        self.afk("tick")
+        self.now += 12 * 3600
+
+        self.answer()
+        self.active()
+        self.report("done", "Implemented")
+        self.afk("tick")
+        self.stop()
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("verify", "working"))
+        self.assertEqual(self.interrupts(), [])
+
+    def test_an_answered_worker_that_runs_past_the_limit_again_is_stuck_again(self):
+        self.limit(phase_minutes=5)
+        self.now += 6 * 60
+        self.active()
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "stuck")
+
+        self.answer()
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "working")
+        self.now += 6 * 60
+        self.active()
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "stuck")
+        self.assertEqual(len(self.interrupts()), 2)
+
+    def test_feedback_typed_into_a_review_worker_missing_its_pr_does_not_clear_the_attention(self):
+        self.reach_review()
+        self.github(None)
+        self.now += 60
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "attention")
+
+        self.answer()
+
+        self.assertEqual(self.status()["state"], "attention")
 
     def test_a_worker_whose_transcript_goes_quiet_past_the_idle_limit_is_interrupted_and_stuck(self):
         self.limit(idle_minutes=10)
