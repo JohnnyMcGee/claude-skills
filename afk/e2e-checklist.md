@@ -217,7 +217,14 @@ Set `[limits] idle_minutes = 1` in the project's `config.toml`, then start a fre
 
 Restore the limit after.
 
-## 10. Tear down
+## 10. Closed without merging (optional)
+
+Re-open 02's ticket as `Status: ready-for-agent` again and start it.
+
+- [ ] Once it has a PR, close the PR on GitHub without merging. Within about a minute 02 is cleaned up, you're notified "02 closed and cleaned up", its ticket still reads `Status: ready-for-agent`, and `afk frontier` lists it.
+- [ ] Start 02 once more as a guide-mode worker (`afk start 02 --type hitl`), since only a worker in `pr`, `review` or `hitl` is polled. It isn't cleaned up for the PR the last attempt closed. With no PR, set its ticket to `Status: closed`. Within about a minute it's cleaned up, you're notified "02 ticket closed and cleaned up", and its ticket still reads `Status: closed`.
+
+## 11. Tear down
 
 - [ ] Stop `afk watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e`, the tmux session, `~/code/afk-e2e`, and the GitHub repo (`gh repo delete afk-e2e`).
 

@@ -17,6 +17,7 @@ import time
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from functools import reduce
 from pathlib import Path
 
@@ -220,7 +221,7 @@ class Afk:
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "title": ticket.title, "phase": phase, "state": state, "message": "",
                  "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "repo": repo, **choices,
-                 "phase_started_at": self.clock()},
+                 "started_at": self.clock(), "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
@@ -397,12 +398,14 @@ class Afk:
                              last_activity=last_write(before.get("transcript_path")))
                 try:
                     pr_state = pr_url = None
-                    pr_ready = False
+                    pr_ready = ticket_closed = False
                     if before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
                         pr_state, pr_url, pr_ready = self.pr_state(before)
-                    given.update(pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready)
-                    merged = pr_state == "MERGED" or before["state"] == "cleanup-pending"
-                    blocker = self.cleanup_blocker(before) if merged else None
+                        ticket = self.find_ticket(before["ticket"])
+                        ticket_closed = bool(ticket and ticket.done)
+                    given.update(pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
+                    ended = ending(before, pr_state, ticket_closed)
+                    blocker = self.cleanup_blocker(before, ended) if ended else None
                     status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
                     if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
                         # Pasting into a bare shell would run the prompt's markdown as commands.
@@ -467,8 +470,11 @@ class Afk:
         elif kind == "cleanup":
             self.clean_up(*args)
 
-    def cleanup_blocker(self, status):
-        """Why cleaning up this worker could lose the human's work, or None if it's safe."""
+    def cleanup_blocker(self, status, ended):
+        """Why cleaning up this worker could lose the human's work, or None if it's safe.
+
+        Unless it merged, its branch may hold commits that were never pushed, which deleting the branch would lose.
+        """
         if "shell_pane" not in status:
             return "its shell pane is unknown (it was started by an older afk)"
         command = self.pane_command(status["shell_pane"])
@@ -476,16 +482,26 @@ class Afk:
             return "its shell pane is gone"
         if command not in SHELLS:
             return f"its shell pane is running {command}"
-        if self.run(["git", "-C", str(self.worktree(status["ticket"])), "status", "--porcelain"]).strip():
+        worktree = str(self.worktree(status["ticket"]))
+        if self.run(["git", "-C", worktree, "status", "--porcelain"]).strip():
             return "its worktree has uncommitted changes"
+        if ended != "merged" and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
+            return "its branch has unpushed commits"
         return None
 
-    def clean_up(self, ticket_id, pane):
-        """Remove a merged worker's window, worktree, local branch and state; removing its dir frees its slot."""
+    def clean_up(self, ticket_id, pane, ended):
+        """Remove an ended worker's window, worktree, local branch and state; removing its dir frees its slot.
+
+        A merged ticket is completed. One whose PR was closed unmerged is released, back onto the frontier. A closed
+        ticket is left as it is, as is one gone from the tracker.
+        """
         project = self.current_project()
         repo = str(self.clone(read_json(self.workers_dir() / ticket_id / "status.json").get("repo")))
-        tracker = self.tracker()
-        tracker.complete(tracker.get(ticket_id))
+        tracker, ticket = self.tracker(), self.find_ticket(ticket_id)
+        if ticket and ended == "merged":
+            tracker.complete(ticket)
+        elif ticket and ended == "closed":
+            tracker.release(ticket)
         self.run(["tmux", "kill-window", "-t", pane])
         self.run(["git", "-C", repo, "worktree", "remove", str(self.worktree(ticket_id))])
         self.run(["git", "-C", repo, "branch", "-D", f"afk/{project}-{ticket_id}"])
@@ -530,16 +546,26 @@ class Afk:
         whether it carries /open-pr's READY_LABEL.
 
         afk only ever reads PRs; merging is the human's call. Whoever opened the PR, the worker or the human, it is
-        found by the worker's branch, so afk never depends on a URL being reported.
+        found by the worker's branch, so afk never depends on a URL being reported. A PR opened before the worker
+        started, from an earlier attempt at the ticket on the same branch, is none of this worker's.
         """
         branch = f"afk/{self.current_project()}-{status['ticket']}"
         try:
-            pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url,labels"], cwd=self.worktree(status["ticket"])))
+            pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url,labels,createdAt"], cwd=self.worktree(status["ticket"])))
         except subprocess.CalledProcessError as error:
             if "no pull requests found" not in (error.stderr or ""):
                 raise
             return "NONE", None, False
+        if datetime.fromisoformat(pr["createdAt"]).timestamp() < status.get("started_at", float("-inf")):
+            return "NONE", None, False
         return pr["state"], pr["url"], any(label["name"] == READY_LABEL for label in pr.get("labels", []))
+
+    def find_ticket(self, ticket_id):
+        """The worker's ticket, or None once it's gone from the tracker, so a missing ticket can't stop the watcher."""
+        try:
+            return self.tracker().get(ticket_id)
+        except SystemExit:
+            return None
 
     def agent_running(self, pane):
         return self.pane_command(pane) == "claude"
@@ -667,31 +693,52 @@ REPO_SECTIONS = ("Pre-PR skill", "Dev server", "Verification recipes")
 WINDOW_MARKS = {"question": "?", "blocked": "!", "attention": "!", "stuck": "!", "review": "✓"}
 
 
+def ending(status, pr_state, ticket_closed=False):
+    """How the worker's work ended: its PR "merged" or "closed", or its "ticket closed"; None while it goes on.
+
+    A closed ticket outranks a closed PR, so cleanup never releases a ticket that is already closed. A pending
+    worker keeps its ending between polls; a fresh poll decides it again, as a closed PR can be reopened.
+    """
+    if status["state"] == "cleanup-pending" and pr_state is None:
+        return status.get("ended", "merged")  # workers left pending before closed PRs were cleaned up had merged
+    if pr_state == "MERGED":
+        return "merged"
+    if ticket_closed:
+        return "ticket closed"
+    return "closed" if pr_state == "CLOSED" else None
+
+
 def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None,
-         pr_state=None, pr_url=None, pr_ready=False, cleanup_blocker=None):
+         pr_state=None, pr_url=None, pr_ready=False, ticket_closed=False, cleanup_blocker=None):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
     pr_state is GitHub's state for the worker's PR when this tick polled it, else None; pr_url is the PR's URL, if any.
     pr_ready says the polled PR carries READY_LABEL.
-    cleanup_blocker, for a merged PR, says why cleaning up now could lose the human's work.
+    ticket_closed says the tracker, polled with the PR, has the worker's ticket closed.
+    cleanup_blocker, for a merged or closed PR or a closed ticket, says why cleaning up now could lose the human's work.
     A status of None out means the worker is cleaned up and gone.
     """
-    merged = pr_state == "MERGED" or status["state"] == "cleanup-pending"
-    if merged and cleanup_blocker is None:
+    ended = ending(status, pr_state, ticket_closed)
+    if ended and cleanup_blocker is None:
         return None, [
-            ("cleanup", ticket, status["pane"]),
-            ("notify", f"{ticket} merged and cleaned up; run `/afk next` to propose the next batch"),
+            ("cleanup", ticket, status["pane"], ended),
+            ("notify", f"{ticket} {ended} and cleaned up; run `/afk next` to propose the next batch"),
         ]
     if pr_state is not None:
         status = {**status, "pr_polled_at": now}
     if pr_url:
         status = {**status, "pr": pr_url}
-    if merged:
+    if not ended and status["state"] == "cleanup-pending":
+        # Its PR was reopened, so it carries on as it was when the PR closed.
+        resumes = status.get("resumes", {"state": "working", "message": ""})
+        status = {k: v for k, v in status.items() if k not in ("ended", "resumes")} | resumes
+    if ended:
         # Checked again every tick, but the human hears about it once.
-        effects = [] if status["state"] == "cleanup-pending" else [("notify", f"{ticket} merged; cleanup pending: {cleanup_blocker}")]
-        status = {**status, "state": "cleanup-pending", "message": cleanup_blocker}
+        effects = [] if status["state"] == "cleanup-pending" else [("notify", f"{ticket} {ended}; cleanup pending: {cleanup_blocker}")]
+        resumes = status.get("resumes", {"state": status["state"], "message": status.get("message", "")})
+        status = {**status, "state": "cleanup-pending", "ended": ended, "resumes": resumes, "message": cleanup_blocker}
     elif status["phase"] == "hitl":
         # The human drives it, so there's nothing to advance, no limit to hold it to, and no report to act on.
         status, effects = {**status, "state": "yours"}, []
