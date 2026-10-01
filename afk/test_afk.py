@@ -1871,6 +1871,16 @@ class WatchTest(AfkTestCase):
                 self.assertEqual((self.phase(), self.status()["state"]), ("implement", "working"))
                 self.assertEqual(self.window(), ("03-widget-ui", "working"))
 
+    def test_a_nudged_silently_stalled_worker_is_back_at_work(self):
+        self.stall()
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "attention")
+
+        self.answer()
+        self.afk("tick")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("implement", "working"))
+
     def test_time_waiting_on_an_answer_does_not_count_against_the_phase_limit(self):
         # A question answered hours later, then done reported before the worker's session stops.
         self.limit(phase_minutes=90)
