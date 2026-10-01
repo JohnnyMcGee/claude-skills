@@ -62,6 +62,7 @@ Workers end every phase with `afk report <done|blocked|question> "<message>"`. T
 - `question` or `blocked`: the watcher notifies and does not advance. Tell the user which window needs them — do not answer on the worker's behalf.
 - A worker that stops without reporting since its last phase prompt stays `working`, since workers end turns to wait on background tasks (a review subagent, CI checks, reviewer bots) and resume when they land. If its session stays quiet past `idle_minutes`, it is marked `attention` (window suffix `!`): it has stalled silently and needs the user.
 - A worker due its next phase whose pane no longer runs `claude` (it exited, or the pane was killed) is also marked `attention`; the watcher never pastes a prompt into a bare shell.
+- Once the user types into a worker that is `question`, `blocked`, `stuck` or silently stalled, it is `working` again and its phase clock restarts, so time spent waiting on the user never counts against its limits.
 
 ## Limits
 
@@ -75,7 +76,7 @@ idle_minutes = 20   # working, but its transcript hasn't changed
 fix_loops = 3       # review rounds (feedback → fix → done) before stopping to look
 ```
 
-A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, where it has already stopped, nor for a worker that stopped without reporting: only `idle_minutes` applies to it, and once it trips the worker is marked `attention` instead), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A limit trips at most once per phase, so a stuck worker that is nudged and later reports `done` moves on as usual.
+A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, where it has already stopped, nor for a worker that stopped without reporting: only `idle_minutes` applies to it, and once it trips the worker is marked `attention` instead), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A limit trips at most once per phase clock. A stuck worker that reports `done` moves on as usual. One the user nudges in its pane gets a fresh clock, so a limit can trip again only if it runs away again.
 
 ## Setup
 
