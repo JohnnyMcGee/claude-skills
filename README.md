@@ -24,11 +24,11 @@ A turn-based coding loop: plan a feature as a checklist of atomic commits, then 
 
 Invoke with `/atomic-commits <issue id or description of the work>`.
 
-### brief-me
+### dossier
 
-Builds a four-section dossier (Business Context, Technical Context, Possible Approaches, Risks) on a PR, issue, or open-ended task using parallel research subagents, then walks you through it as a user-paced tour. Useful for getting up to speed before reviewing or starting work on something.
+Builds a dossier: a prioritized, verified reading list that makes you an expert in a problem space before any planning starts. You describe the problem and the direction (or give a Linear issue id); it fixes the scope (general best practice, or that plus the internal system), fans out one research agent per area of interest, opens every link, and publishes a Claude Doc with a where-to-start path, a tiered source table per area, "easy to get wrong" gotchas, and the open questions the reading answers. It makes no decisions and never asks you to: the reading is what lets you plan.
 
-Invoke with `/brief-me <PR number, ticket id, or task description>`.
+Invoke with `/dossier <problem and direction, or issue id>`.
 
 ### open-pr
 
@@ -42,10 +42,10 @@ Copy the skill folders into your skills directory:
 
 ```bash
 # Personal (all projects)
-cp -r afk afk-setup atomic-commits brief-me open-pr ~/.claude/skills/
+cp -r afk afk-setup atomic-commits dossier open-pr ~/.claude/skills/
 
 # Or per-project
-cp -r afk afk-setup atomic-commits brief-me open-pr <project>/.claude/skills/
+cp -r afk afk-setup atomic-commits dossier open-pr <project>/.claude/skills/
 ```
 
 Each skill is a folder containing a `SKILL.md` (plus any supporting files) — see the [skills documentation](https://code.claude.com/docs/en/skills) for details.
