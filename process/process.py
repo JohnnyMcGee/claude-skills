@@ -104,7 +104,7 @@ def validate(value, kind):
 # in a sweep or triage allowlist, unless it only reads (get_/list_/search_/read_ prefixes, a _read suffix).
 SEND_WORDS = re.compile(
     r"send|reply|post|comment|review|rsvp|respond|event|merge|approve|submit|forward|publish|schedule|share|invite"
-    r"|write|delete|push|create|update|add_|reaction|assign|trash|spam"
+    r"|write|delete|push|create|update|add_|reaction|assign|trash|spam|upload|copy|label"
 )
 READ_ONLY = re.compile(r"__(slack_)?(get|list|search|read|fetch)_|_read$")
 # The silent writes the PRD allows: triage performs them on my own things. A sweeper only reads, so never holds one.
@@ -137,11 +137,11 @@ def forbidden_tool(tool):
     return not READ_ONLY.search(tool) and bool(SEND_WORDS.search(tool.lower()))
 
 
-# Never actions, or what reaches one: merging, approving, deleting, deploying, and pushing (the executor pushes only
+# Never actions, or what reaches one: merging, approving, deleting or trashing, deploying, and pushing (the executor pushes only
 # through `process execute push`, which checks the branch is my PR's). No phase may hold these, the executor included.
 EXECUTE_STEPS = {"plan", "review", "reply", "checkout", "git", "push", "result"}
 # A review tool is one too: its event can be APPROVE, so reviews go through `process execute review`, which pins it.
-NEVER_WORDS = re.compile(r"merge|approve|review_write|delete|deploy|release|push|create_or_update_file|transfer|fork|secret")
+NEVER_WORDS = re.compile(r"merge|approve|review_write|delete|trash|spam|deploy|release|push|create_or_update_file|transfer|fork|secret")
 # The executor pushes code, so it reads only its worktree (granted per run): nothing else can end up in a commit.
 EXECUTOR_UNSCOPED = {"Read", "Glob", "Grep"}
 
@@ -174,6 +174,7 @@ DENIED_TOOLS = [
     "mcp__github__add_reply_to_pull_request_comment",
     "mcp__slack__slack_send_message",
     "mcp__slack__slack_schedule_message",
+    "mcp__slack__slack_complete_file_upload",
     "mcp__claude_ai_Gmail__send_message",
     "mcp__claude_ai_Gmail__reply",
     "mcp__claude_ai_Gmail__forward",
