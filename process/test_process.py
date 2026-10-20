@@ -579,6 +579,36 @@ class BriefTest(TriageTestCase):
         self.assertIn("https://example.com/new", delta)
         self.assertNotIn("https://example.com/old", delta)
 
+    def test_a_result_recorded_after_the_last_brief_of_the_day_shows_the_next_morning(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.process("brief")
+        self.now += 3600  # late: I work the queue in proc, and no brief runs again today
+        self.decide_and_execute(review, "success", link="https://example.com/late")
+        self.now += 24 * 3600
+
+        self.process("brief")
+
+        self.assertIn("https://example.com/late", (self.state / "brief.md").read_text())
+
+    def test_a_brief_narrowed_to_one_project_does_not_swallow_another_projects_results(self):
+        self.write_profile("side")
+        self.emit(item(summary="Side review"), profile="side")
+        [side] = self.triage("side")
+        self.process("brief", "--delta")
+        self.now += 60
+        with (self.state / "decisions.jsonl").open("a") as f:
+            f.write(json.dumps({"entry_id": side["id"], "verdict": "approve", "at": process.iso(self.now)}) + "\n")
+        self.process("execute")
+        self.process("execute", "result", "side", side["id"], "success", "--link", "https://example.com/side")
+        self.now += 300
+        self.process("brief", "--delta", "--project", "acme")
+        self.now += 3600
+
+        self.process("brief", "--delta")
+
+        self.assertIn("https://example.com/side", (self.state / "brief.md").read_text())
+
     def test_a_brief_before_any_run_says_nothing_new(self):
         self.process("brief")
 
@@ -763,6 +793,22 @@ class LearningTest(ExecuteTestCase):
 
         self.assertEqual(self.profile_text(), before)
         self.assertEqual(before.count("Lesson ("), 1)
+
+    def test_a_profile_that_cannot_be_rewritten_is_reported_and_the_other_decisions_still_apply(self):
+        path = self.tmp / "config" / "process" / "profiles" / "acme.md"
+        text = path.read_text().replace("[autonomy]\nsilent = []\n", "")
+        path.write_text(text.replace('sources = ["github", "linear"]', 'sources = ["github", "linear"]\nautonomy = { silent = [] }'))
+        self.emit(self.comment(1), self.comment(2))
+        promoted, skipped = self.triage()
+        before = self.profile_text()
+        self.decide(promoted, promote_to_silent=True)
+        self.decide(skipped, "skip")
+
+        out = self.process("execute")
+
+        self.assertIn("could not rewrite autonomy.silent", out)
+        self.assertEqual(self.profile_text(), before)
+        self.assertEqual(self.entry(skipped["id"])["status"], "skipped")
 
     def test_a_review_is_never_promoted_to_silent(self):
         self.emit(item())

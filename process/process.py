@@ -278,8 +278,8 @@ class Process:
 
     def cmd_run(self, *args):
         """Sweep every source, triage, then execute what triage approved silently, for each active profile (or
-        --project), each phase headless under its profile's model and allowlist; then render the brief. --fixtures points sweepers at fixture data and makes
-        triage a dry run."""
+        --project), each phase headless under its profile's model and allowlist; then render the brief. --fixtures
+        points sweepers at fixture data and makes triage and the executor dry runs."""
         opts = flags(args, "--delta", "--project", "--fixtures")
         dry = bool(opts.get("--fixtures"))
         if dry:
@@ -630,10 +630,13 @@ class Process:
             if (decision.get("promote_to_silent") or decision.get("reason", "").strip()) and self.real_profiles_in_dry_run():
                 self.out(f"process: dry run: {e['project']}'s profile is real, so no lesson or promotion is written")
                 continue
-            if decision.get("promote_to_silent"):
-                self.promote(e["project"], e["action"]["type"])
-            if decision.get("reason", "").strip():
-                self.learn(e, did, decision["reason"])
+            try:  # the profile is restored on a failed rewrite; the rest of the decisions still apply
+                if decision.get("promote_to_silent"):
+                    self.promote(e["project"], e["action"]["type"])
+                if decision.get("reason", "").strip():
+                    self.learn(e, did, decision["reason"])
+            except SystemExit as error:
+                self.out(f"{error.code}; edit the profile by hand")
 
     def real_profiles_in_dry_run(self):
         """A dry run may teach only scratch profiles: an XDG_CONFIG_HOME other than ~/.config."""
@@ -827,24 +830,24 @@ class Process:
         latest = run.get("id") or max((e["run"] for e in queue), default=None)
         now = datetime.fromtimestamp(self.clock()).astimezone()
         midnight = iso(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        # Executor results show in the next brief: a delta's since the last brief, a full brief's since midnight.
-        last = self.read_json(self.state_root() / "brief.json", {}).get("at", "")
-        new = (lambda at: at > last) if opts.get("--delta") else (lambda at: at >= midnight)
-        acted = {r["entry_id"] for r in self.read_jsonl(self.state_root() / "results.jsonl") if new(r["at"])}
-        if opts.get("--delta"):
-            shown = lambda e: e["run"] == latest or e["id"] in acted
-        else:
-            shown = lambda e: e["status"] in ("pending", "approved") or e["created"] >= midnight or e["id"] in acted
+        # An executor result shows until a brief of its own project has shown it; a full brief also shows today's.
+        last = self.read_json(self.state_root() / "brief.json", {})
+        results = self.read_jsonl(self.state_root() / "results.jsonl")
         mode = "delta" if opts.get("--delta") else "full"
         lines = [f"# Brief — {now:%a %Y-%m-%d %H:%M} · {mode}", ""]
         for name in names:
-            entries = [e for e in queue if e["project"] == name and e["status"] != "superseded" and shown(e)]
+            acted = {r["entry_id"] for r in results if r["at"] > last.get(name, "") or (mode == "full" and r["at"] >= midnight)}
+            if mode == "delta":
+                shown = [e for e in queue if e["run"] == latest or e["id"] in acted]
+            else:
+                shown = [e for e in queue if e["status"] in ("pending", "approved") or e["created"] >= midnight or e["id"] in acted]
+            entries = [e for e in shown if e["project"] == name and e["status"] != "superseded"]
             lines += [f"## {name}", ""] + [f"> ⚠ {p}" for p in run.get("problems", {}).get(name, [])]
             lines += render_project(entries, acted) or ["Nothing new.", ""]
         brief = "\n".join(lines).rstrip() + "\n"
         self.state_root().mkdir(parents=True, exist_ok=True)
         (self.state_root() / "brief.md").write_text(brief)
-        self.write_json(self.state_root() / "brief.json", {"at": iso(self.clock())})
+        self.write_json(self.state_root() / "brief.json", {**last, **{name: iso(self.clock()) for name in names}})
         archive = self.state_root() / "briefs" / f"{now:%Y-%m-%d}.md"
         archive.parent.mkdir(parents=True, exist_ok=True)
         with archive.open("a") as f:
