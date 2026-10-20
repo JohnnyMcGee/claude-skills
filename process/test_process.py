@@ -69,6 +69,7 @@ labels = ["deploy-blocking"]
 
 [autonomy]
 silent = {silent}
+{afk}
 
 [phases.sweep-github]
 model = "sonnet"
@@ -125,7 +126,7 @@ class ProcessTestCase(unittest.TestCase):
     def state(self):
         return self.tmp / "state" / "process"
 
-    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Bash(process execute plan:*)", "Bash(process execute result:*)"), text=None):
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Bash(process execute plan:*)", "Bash(process execute result:*)"), afk=None, text=None):
         path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -137,6 +138,7 @@ class ProcessTestCase(unittest.TestCase):
                 silent=json.dumps(list(silent)),
                 triage_tools=json.dumps(list(triage_tools)),
                 execute_tools=json.dumps(list(execute_tools)),
+                afk="[afk]\n" + "".join(f"{k} = {json.dumps(v)}\n" for k, v in afk.items()) if afk else "",
             )
         )
         return path
@@ -1207,6 +1209,45 @@ class NextWorkRankingTest(NextWorkTestCase):
         _, result = self.next_work(ticket("WID-1", state="in_staging", assignee="me", priority=1), ticket("WID-2"))
 
         self.assertEqual(self.picks(result), ["WID-2"])
+
+
+# Maxim's trivial rules.
+TRIVIAL = {"estimates": ["XS", "S"], "labels": ["Cleanup", "Technical Debt", "Coderabbit"], "exclude_labels": ["Decompose", "Needs Design", "wayfinder:grilling"]}
+
+
+class AfkListTest(NextWorkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(afk=TRIVIAL)
+
+    def test_trivial_unblocked_todo_tickets_go_to_a_separate_afk_list_queued_for_my_approval(self):
+        _, result = self.next_work(
+            ticket("WID-1", estimate="S", description="Rename the flag."),
+            ticket("WID-2", estimate="L", labels=["Cleanup"]),
+            ticket("WID-3", estimate="XS", labels=["Needs Design"]),
+            ticket("WID-4", estimate="XS", blocked=True),
+            ticket("WID-5", estimate="M"),
+        )
+
+        self.assertEqual(self.picks(result), ["WID-3", "WID-5"])  # the AFK list doesn't count against my 3
+        self.assertEqual([a["ref"] for a in result["afk"]], ["WID-1", "WID-2"])
+        self.assertEqual([a["reason"] for a in result["afk"]], ["Trivial: estimate S", "Trivial: labeled Cleanup"])
+        launches = [e for e in self.queue() if e["action"]["type"] == "afk_launch"]
+        self.assertEqual([e["id"] for e in launches], [a["entry_id"] for a in result["afk"]])
+        self.assertEqual({(e["status"], e["autonomy"]) for e in launches}, {("pending", "draft")})
+        self.assertIn("Rename the flag.", launches[0]["action"]["draft"])
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+        self.assertEqual(self.run_fake.calls, [])
+
+    def test_what_is_trivial_comes_from_the_profile(self):
+        self.write_profile(afk={**TRIVIAL, "estimates": ["M"]})
+
+        _, result = self.next_work(ticket("WID-1", estimate="S"), ticket("WID-5", estimate="M"))
+
+        self.assertEqual([a["ref"] for a in result["afk"]], ["WID-5"])
+        self.write_profile()  # no [afk] rules: nothing is trivial
+        _, result = self.next_work(ticket("WID-1", estimate="S"), ticket("WID-5", estimate="M"))
+        self.assertEqual((self.picks(result), result["afk"]), (["WID-1", "WID-5"], []))
 
 
 class ContractTest(ProcessTestCase):

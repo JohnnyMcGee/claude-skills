@@ -566,6 +566,8 @@ class Process:
         now = self.clock()
         free = [t for t in tickets if not t["blocked"]]
         todo = [t for t in free if t["state"] == "todo" and t["assignee"] != "other"]
+        afk = [(t, trivial(profile, t)) for t in todo if trivial(profile, t)]  # a separate list, not one of my 3
+        todo = [t for t in todo if not trivial(profile, t)]
         unblocked = [t for t in todo if t.get("unblocked_at", "") >= iso(now - UNBLOCKED_AGE)]
         tiers = [
             ("in_progress", [t for t in free if t["state"] == "in_progress" and t["assignee"] == "me"]),
@@ -581,7 +583,12 @@ class Process:
             action = {"type": "linear_promote", "params": ticket_ref(t), "draft": f"Move {t['identifier']} from Backlog to Todo. {pick['reason']}."}
             entries.append(self.next_entry(profile, action, f"Promote {t['identifier']} {t['title']} from Backlog to Todo", t))
             picks.append({**pick, "entry_id": entries[-1]["id"]})
-        result = {"profile": name, "at": iso(now), "recommendations": picks, "afk": []}
+        afk_list = []
+        for t, why in sorted(afk, key=lambda pair: ticket_order(pair[0])):
+            action = {"type": "afk_launch", "params": ticket_ref(t), "draft": (t.get("description") or "").strip() or f"No description: see {t['url']}."}
+            entries.append(self.next_entry(profile, action, f"Hand {t['identifier']} {t['title']} to an AFK worker", t))
+            afk_list.append({"tier": "afk", "ref": t["identifier"], "title": t["title"], "link": t["url"], "reason": why, "entry_id": entries[-1]["id"]})
+        result = {"profile": name, "at": iso(now), "recommendations": picks, "afk": afk_list}
         problems = validate(result, "next_work") + [f"{e['id']}: {p}" for e in entries for p in validate(e, "queue_entry")]
         if problems:
             raise SystemExit("process: nothing written:\n" + "\n".join(f"  {p}" for p in problems))
@@ -1127,6 +1134,17 @@ TIER_LEADS = {"in_progress": "Already in progress", "unblocked": "Unblocked {unb
 def ticket_order(t):
     """Priority (none last), then the project's target date (none last), then age (oldest first)."""
     return (t["priority"] or 5, t.get("target_date") or "9999-99-99", t["created"])
+
+
+def trivial(profile, t):
+    """Why a ticket meets the profile's trivial rules, or None: an estimate or label they name, none they exclude."""
+    rules = profile.get("afk", {})
+    if set(t["labels"]) & set(rules.get("exclude_labels", [])):
+        return None
+    if t.get("estimate") in rules.get("estimates", []):
+        return f"Trivial: estimate {t['estimate']}"
+    labels = [l for l in t["labels"] if l in rules.get("labels", [])]
+    return f"Trivial: labeled {', '.join(labels)}" if labels else None
 
 
 def ticket_ref(t):

@@ -265,6 +265,16 @@
             "labels": {"description": "Labels that make an item urgent (e.g. deploy-blocking).", "type": "array", "items": {"type": "string"}}
           }
         },
+        "afk": {
+          "description": "What makes a ticket trivial enough for an AFK worker: an estimate or a label from the first two lists, no label from exclude_labels, and unblocked. Without it, nothing is.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "estimates": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "labels": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "exclude_labels": {"type": "array", "items": {"type": "string", "minLength": 1}}
+          }
+        },
         "autonomy": {
           "type": "object",
           "required": ["silent"],
