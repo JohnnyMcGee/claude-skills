@@ -267,16 +267,42 @@ class Process:
                 phases.append(("triage", f"/triage {name}" + (" --dry-run" if dry else "")))
                 for phase, prompt in phases:
                     self.out(f"{name}: {phase}")
+                    before = self.watermarks(name)
                     try:
                         self.headless(profile, phase, prompt, dry)
+                        problem = self.phase_problem(name, phase, before)
                     except (subprocess.CalledProcessError, OSError) as error:  # OSError: no workdir, no claude
                         stderr = getattr(error, "stderr", None) or ""
-                        detail = (stderr.strip().splitlines() or [str(error)])[-1]
-                        run["problems"].setdefault(name, []).append(f"{phase} failed: {detail}")
+                        problem = f"{phase} failed: {(stderr.strip().splitlines() or [str(error)])[-1]}"
+                    if problem:
+                        run["problems"].setdefault(name, []).append(problem)
                         self.write_json(self.state_root() / "run.json", run)
             self.cmd_brief(*(["--delta"] if opts.get("--delta") else []), *(["--project", opts["--project"]] if opts.get("--project") else []))
         finally:
             (self.state_root() / "run.json").unlink()
+
+    def inbox(self, name):
+        """The one directory a phase may write: sweepers' item files and triage's drafts, each consumed on use."""
+        path = self.profile_state(name) / "inbox"
+        path.mkdir(exist_ok=True)
+        return path
+
+    def watermarks(self, name):
+        return self.read_json(self.state_root() / "profiles" / name / "watermarks.json", {})
+
+    def phase_problem(self, name, phase, before):
+        """A phase can exit 0 having done nothing (e.g. every tool denied). Judge it by its effect on the state."""
+        if phase.startswith("sweep-"):
+            source = phase.removeprefix("sweep-")
+            if self.watermarks(name).get(source) in (None, before.get(source)):
+                return f"{phase} stored nothing: its watermark did not move"
+        elif self.unhandled(name):
+            return f"triage left {len(self.unhandled(name))} item(s) unhandled"
+
+    def unhandled(self, name):
+        pdir = self.state_root() / "profiles" / name
+        handled = {line["item_id"] for line in self.read_jsonl(pdir / "ledger.jsonl")}
+        return [i for i in self.read_jsonl(pdir / "items.jsonl") if i["id"] not in handled]
 
     def guard_dry_run(self):
         """A dry run writes only to a scratch state directory: never the default one, never one a real run used."""
@@ -293,10 +319,18 @@ class Process:
         known send tools are denied by name too. A dry run gets no service (MCP) tools at all."""
         config = profile["phases"][phase]
         tools = [t for t in config["allowed_tools"] if not (dry and t.startswith("mcp__"))]
+        inbox = self.inbox(profile["name"])
+        tools.append(f"Edit(/{inbox}/**)")  # dontAsk refuses heredocs, so items and drafts travel as inbox files
         workdir = Path(profile["workdir"].replace("~", self.env["HOME"], 1) if profile["workdir"].startswith("~") else profile["workdir"])
         cmd = ["claude", "-p", prompt, "--model", config["model"], "--permission-mode", "dontAsk"]
-        cmd += ["--allowedTools", ",".join(tools), "--disallowedTools", ",".join(DENIED_TOOLS)]
+        cmd += ["--add-dir", str(inbox), "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(DENIED_TOOLS)]
         return self.run(cmd, cwd=workdir)
+
+    def cmd_profile(self, name):
+        """Print one validated profile, path first, so a phase reads it without guessing XDG_CONFIG_HOME."""
+        self.profile(name)
+        path = self.profiles_dir() / f"{name}.md"
+        self.out(f"{path}\ninbox: {self.inbox(name)}\n{path.read_text()}")
 
     def cmd_profiles(self):
         """List every profile, refusing if any is invalid or grants a send tool to a sweep or triage phase."""
@@ -328,6 +362,8 @@ class Process:
         marks = self.read_json(pdir / "watermarks.json", {})
         marks[source] = opts.get("--watermark") or iso(self.clock())
         self.write_json(pdir / "watermarks.json", marks)
+        if opts.get("--file"):
+            Path(opts["--file"]).unlink()  # consumed, so a later sweep can never re-send it
         self.out(f"stored {len(fresh)} new item(s) for {profile}/{source}; watermark {marks[source]}")
 
     def cmd_watermark(self, profile, source):
@@ -363,8 +399,7 @@ class Process:
         """Turn every unhandled item into proposed queue entries in plan.json, and print what needs drafting."""
         profile = self.profile(name)
         pdir = self.profile_state(name)
-        handled = {line["item_id"] for line in self.read_jsonl(pdir / "ledger.jsonl")}
-        items = [i for i in self.read_jsonl(pdir / "items.jsonl") if i["id"] not in handled]
+        items = self.unhandled(name)
         # The one-time clear-out happens on the first triage that sees Linear notifications, not merely the first triage.
         first_run = "bankrupt_at" not in self.read_json(pdir / "state.json", {}) and any(notification(i) for i in items)
         cutoff = iso(self.clock() - BANKRUPTCY_AGE)
@@ -400,10 +435,13 @@ class Process:
             raise SystemExit(f"process: no entry {entry_id} in the {name} plan")
         return plan, found[0]
 
-    def triage_draft(self, name, entry_id):
-        """Set an entry's draft from stdin."""
+    def triage_draft(self, name, entry_id, *args):
+        """Set an entry's draft from stdin, or from --file (consumed)."""
+        opts = flags(args, "--file")
         plan, e = self.plan_entry(name, entry_id)
-        e["action"]["draft"] = self.stdin.read().strip()
+        e["action"]["draft"] = (Path(opts["--file"]).read_text() if opts.get("--file") else self.stdin.read()).strip()
+        if opts.get("--file"):
+            Path(opts["--file"]).unlink()
         self.write_json(self.profile_state(name) / "plan.json", plan)
 
     def triage_silent(self, name, entry_id, outcome, note=None):
@@ -639,7 +677,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: process <run|emit|watermark|triage|brief|profiles|validate> ...")
+        app.out("usage: process <run|emit|watermark|triage|brief|profile|profiles|validate> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command.replace("-", "_"), None)

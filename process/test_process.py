@@ -155,6 +155,16 @@ class EmitTest(ProcessTestCase):
         self.assertEqual(self.process("validate", "item", str(self.profile_dir() / "items.jsonl")), "")
         self.assertEqual(self.process("watermark", "acme", "github").strip(), "2026-10-20T13:00:00Z")
 
+    def test_emit_consumes_an_inbox_file(self):
+        inbox = self.profile_dir() / "inbox"
+        inbox.mkdir(parents=True)
+        (inbox / "github.jsonl").write_text(json.dumps(item()) + "\n")
+
+        self.process("emit", "acme", "github", "--file", str(inbox / "github.jsonl"))
+
+        self.assertEqual(len(self.jsonl(self.profile_dir() / "items.jsonl")), 1)
+        self.assertFalse((inbox / "github.jsonl").exists())
+
     def test_a_missing_argument_prints_the_commands_usage(self):
         self.assertIn("usage: process emit <profile> <source>", self.process("emit", "acme", expect=2))
         self.assertIn("usage: process triage <step> <profile>", self.process("triage", "plan", expect=2))
@@ -280,6 +290,19 @@ class TriageRulesTest(TriageTestCase):
 
         self.assertIn("[draft]", self.process("triage", "plan", "acme"))
         self.assertIn("no draft", self.process("triage", "commit", "acme", expect=1))
+
+    def test_a_draft_can_come_from_an_inbox_file(self):
+        self.emit(item())
+        self.process("triage", "plan", "acme")
+        [review] = self.plan()["entries"]
+        draft = self.profile_dir() / "inbox" / f"{review['id']}.md"
+        draft.parent.mkdir(parents=True, exist_ok=True)
+        draft.write_text("Two questions on the export.\n")
+
+        self.process("triage", "draft", "acme", review["id"], "--file", str(draft))
+
+        self.assertEqual(self.plan()["entries"][0]["action"]["draft"], "Two questions on the export.")
+        self.assertFalse(draft.exists())
 
     def test_silent_outcomes_are_only_for_actions_triage_performs_itself(self):
         self.emit(item())
@@ -503,7 +526,9 @@ class RunTest(ProcessTestCase):
         profile = process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")
         for (cmd, cwd), phase in zip(calls, ["sweep-github", "sweep-linear", "triage"]):
             self.assertEqual(self.opt(cmd, "--model"), profile["phases"][phase]["model"])
-            self.assertEqual(self.opt(cmd, "--allowedTools").split(","), profile["phases"][phase]["allowed_tools"])
+            inbox = self.profile_dir("acme") / "inbox"
+            self.assertEqual(self.opt(cmd, "--allowedTools").split(","), profile["phases"][phase]["allowed_tools"] + [f"Edit(/{inbox}/**)"])
+            self.assertEqual(self.opt(cmd, "--add-dir"), str(inbox))  # the one place a phase may write files
             self.assertIn("mcp__github__merge_pull_request", self.opt(cmd, "--disallowedTools").split(","))
             self.assertEqual(self.opt(cmd, "--permission-mode"), "dontAsk")  # anything not allowlisted is denied
             self.assertEqual(cwd, str(self.tmp / "work" / "acme"))
@@ -558,6 +583,21 @@ class RunTest(ProcessTestCase):
         self.assertIn("/triage side", [c[2] for c, _ in self.claude_calls()])
         self.assertIn("> ⚠ triage failed: [Errno 2] No such file or directory", (self.state / "brief.md").read_text())
         self.assertFalse((self.state / "run.json").exists())
+
+    def test_a_phase_that_exits_cleanly_but_does_nothing_is_flagged_in_the_brief(self):
+        self.write_profile("acme")
+
+        def sweep_github(cmd):  # a sweeper that does its job
+            process.main(["emit", "acme", "github"], run=self.run_fake, env=self.env, stdin=io.StringIO(json.dumps(item()) + "\n"), stdout=io.StringIO(), clock=lambda: self.now)
+
+        self.run_fake.responses[("claude", "-p", "/sweep-github acme")] = sweep_github
+
+        self.process("run")  # the Linear sweeper and triage do nothing and exit 0
+
+        brief = (self.state / "brief.md").read_text()
+        self.assertNotIn("sweep-github", brief)
+        self.assertIn("> ⚠ sweep-linear stored nothing: its watermark did not move", brief)
+        self.assertIn("> ⚠ triage left 1 item(s) unhandled", brief)
 
     def test_a_dry_run_refuses_to_write_into_the_real_state_directory(self):
         self.write_profile("acme")
@@ -625,6 +665,14 @@ class ProfileTest(ProcessTestCase):
         "mcp__linear-server__create_comment",
         "mcp__claude_ai_Google_Calendar__create_event",
     ]
+
+    def test_profile_prints_one_profile_so_phases_never_guess_its_path(self):
+        path = self.write_profile("acme")
+
+        out = self.process("profile", "acme")
+
+        self.assertTrue(out.startswith(f"{path}\ninbox: {self.profile_dir('acme') / 'inbox'}\n"))
+        self.assertIn("## How to sweep", out)
 
     def test_profiles_lists_each_profile_with_its_sources(self):
         self.write_profile("acme")

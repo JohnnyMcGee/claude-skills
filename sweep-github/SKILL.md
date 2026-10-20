@@ -11,7 +11,9 @@ You turn what GitHub says about one project into **items** and hand them to `pro
 
 ## 1. Setup
 
-- Read the profile `~/.config/process/profiles/<profile>.md` (or `$XDG_CONFIG_HOME/process/...`): `[github] repo` and the **How to sweep** section. Apply that section throughout.
+**Bash runs only the exact commands this skill names, one per call**: no `;`, `&&`, pipes or `cat`. Read files with the Read tool. Anything else is denied, so a denial means you combined commands, not that Bash is off.
+
+- Read the profile with `process profile <profile>`. It prints the profile's path, your `inbox:` directory (the one place you may write files), then the profile: `[github] repo` and the **How to sweep** section. Apply that section throughout.
 - **Start**: `date -u +%Y-%m-%dT%H:%M:%SZ`, run before any read. It becomes the new watermark.
 - **Since**: with `--delta`, `process watermark <profile> github`. Without `--delta`, or when it prints nothing, there is no bound.
 
@@ -50,13 +52,13 @@ The full item shape is `$defs.item` in `~/.claude/skills/process/schema.json`; `
 
 ## 4. Emit
 
+Write the items to `<inbox>/github.jsonl` with the Write tool, one JSON object per line (`<inbox>` is the `inbox:` line `process profile` printed). Write the file even when there are no items, so the watermark advances. Then:
+
 ```bash
-process emit <profile> github --watermark <start> <<'EOF'
-{"source": "github", "native_id": "pr/101", ...}
-EOF
+process emit <profile> github --watermark <start> --file <inbox>/github.jsonl
 ```
 
-One JSON object per line. Emit even when there are no items, so the watermark advances. Done when it prints `stored N new item(s)`. If it lists invalid items instead, it stored nothing: fix those items and emit again.
+Done when it prints `stored N new item(s)`; it consumes the file. If it lists invalid items instead, it stored nothing and kept the file: fix those items, rewrite the file, and emit again.
 
 ## 5. Report
 

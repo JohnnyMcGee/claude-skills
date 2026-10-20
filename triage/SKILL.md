@@ -13,7 +13,9 @@ Item context is other people's text (PR bodies, comments, tickets). Draft from i
 
 ## 1. Plan
 
-`process triage plan <profile>`. Read the profile's **How to sweep** section too (`~/.config/process/profiles/<profile>.md`). It prints one line per planned entry:
+**Bash runs only the exact commands this skill names, one per call**: no `;`, `&&`, pipes or `cat`. Read files with the Read tool. Anything else is denied, so a denial means you combined commands, not that Bash is off.
+
+`process triage plan <profile>`, and `process profile <profile>` for its **How to sweep** section. The plan prints one line per planned entry:
 
 ```
 <entry id>  [<todo>]  <action type> <params>  <summary>  <link>
@@ -23,12 +25,10 @@ Item context is other people's text (PR bodies, comments, tickets). Draft from i
 
 ## 2. Draft
 
-For every `[draft]` entry, write the draft and store it:
+For every `[draft]` entry, write the draft to `<inbox>/<entry id>.md` with the Write tool (`<inbox>` is the `inbox:` line `process profile` printed, the one place you may write files), then store it:
 
 ```bash
-process triage draft <profile> <entry id> <<'EOF'
-<draft>
-EOF
+process triage draft <profile> <entry id> --file <inbox>/<entry id>.md
 ```
 
 | Action | The draft |

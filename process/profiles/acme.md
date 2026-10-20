@@ -31,6 +31,7 @@ model = "sonnet"
 allowed_tools = [
   "Read",
   "Bash(date -u:*)",
+  "Bash(process profile:*)",
   "Bash(process watermark:*)",
   "Bash(process emit:*)",
   "Bash(gh pr list:*)",
@@ -46,6 +47,7 @@ model = "sonnet"
 allowed_tools = [
   "Read",
   "Bash(date -u:*)",
+  "Bash(process profile:*)",
   "Bash(process watermark:*)",
   "Bash(process emit:*)",
   "mcp__linear-server__get_notifications",
@@ -59,6 +61,7 @@ allowed_tools = [
 model = "opus"
 allowed_tools = [
   "Read",
+  "Bash(process profile:*)",
   "Bash(process triage:*)",
   "mcp__linear-server__mark_notification",
   "mcp__linear-server__get_issue",
