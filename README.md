@@ -26,7 +26,7 @@ Invoke with `/atomic-commits <issue id or description of the work>`.
 
 ### brief
 
-The entry point of **process**, a pipeline that does the daily process chores (PR status and feedback, review requests, Linear inbox) and hands you one markdown brief. `/brief` runs `process run`, which takes every active project profile and runs each source's sweeper, triage, and then the executor for whatever triage approved silently, as headless `claude -p` phases. Each phase gets the profile's model and tool allowlist. Only the executor's may hold send tools, and no phase's may merge or approve. The brief groups each project into **Needs approval** (drafts queued for you), **Done silently** (what Claude did without asking) and a collapsed **FYI**. It is written to `$XDG_STATE_HOME/process/brief.md`, and every brief of the day is also archived in `briefs/<date>.md`. Drafts wait in the queue for you to approve, edit or skip in `proc`; the executor sends what you approved, and the next brief shows how it went.
+The entry point of **process**, a pipeline that does the daily process chores (PR status and feedback, review requests, Linear inbox, Slack, email, calendar invites, meeting action items) and hands you one markdown brief. `/brief` runs `process run`, which takes every active project profile and runs each source's sweeper, triage, and then the executor for whatever triage approved silently, as headless `claude -p` phases. Each phase gets the profile's model and tool allowlist. Only the executor's may hold send tools, and no phase's may merge or approve. The brief groups each project into **Needs approval** (drafts queued for you), **Done silently** (what Claude did without asking) and a collapsed **FYI**. Items from a shared Slack workspace or Google account that no profile claims go under **Unsorted**. It is written to `$XDG_STATE_HOME/process/brief.md`, and every brief of the day is also archived in `briefs/<date>.md`. Drafts wait in the queue for you to approve, edit or skip in `proc`; the executor sends what you approved, and the next brief shows how it went.
 
 Invoke with `/brief [--delta] [--project <name>] [--fixtures <dir>]`. `--delta` sweeps from each source's watermark and shows only what changed; `--fixtures process/fixtures` is a dry run with no network. Needs the `process` CLI on PATH and at least one profile (see below).
 
@@ -48,11 +48,23 @@ Opens a pull request and drives it to a human-reviewable state: resolves merge c
 
 Invoke with `/open-pr [base branch]`, or let an agent reach it by name (AFK workers use it in their pr phase).
 
+### sweep-calendar
+
+The Calendar sweeper of process. It reads the next 14 days and turns each invite waiting on my RSVP into an item, noting overlapping events I accepted, external guests and whether my manager is in it. Triage drafts the RSVP and never proposes declining a meeting with external guests or my manager. Read-only.
+
+Run by `process run` as `/sweep-calendar <profile> [--delta] [--fixtures <dir>]`.
+
 ### sweep-github
 
 The GitHub sweeper of process. For one profile it reads my open PRs (mergeability, checks, review state, new comments) and the PRs requesting my review, maps each ask to an **item**, and stores it with `process emit`, which advances the profile's GitHub watermark. Read-only.
 
 Run by `process run` as `/sweep-github <profile> [--delta] [--fixtures <dir>]`.
+
+### sweep-gmail
+
+The Gmail sweeper of process. It reads the inbox and classifies each thread by its latest message: an ask (triage drafts a reply), FYI, or noise (newsletters and notification mail, which triage labels and archives silently). Read-only. Gmail must be connected with modify scope for triage's archiving, and the profile's `noise_label` must already exist in Gmail.
+
+Run by `process run` as `/sweep-gmail <profile> [--delta] [--fixtures <dir>]`.
 
 ### sweep-linear
 
@@ -60,9 +72,21 @@ The Linear sweeper of process. For one profile it reads unread notifications, me
 
 Run by `process run` as `/sweep-linear <profile> [--delta] [--fixtures <dir>]`.
 
+### sweep-meetings
+
+The meetings sweeper of process. For meetings I attended in the last 48 hours it reads the "Notes by Gemini" doc (following Drive shortcuts) and emits the action items I own. Meetings without a notes doc are skipped. Triage makes each action item a ticket in the team's Triage state, assigned to me and linked to the notes. Read-only.
+
+Run by `process run` as `/sweep-meetings <profile> [--delta] [--fixtures <dir>]`.
+
+### sweep-slack
+
+The Slack sweeper of process. It reads mentions, DMs, unanswered questions in threads I posted in, and the profile's watchlist channels, and skips anything I already replied or reacted to. Triage turns immediate asks into Linear tickets assigned to me (silently, linking back) and drafts replies to questions. GitHub's review digest DM merges into the GitHub review requests. Read-only.
+
+Run by `process run` as `/sweep-slack <profile> [--delta] [--fixtures <dir>]`.
+
 ### triage
 
-The triage step of process. `process triage plan` applies every rule deterministically: it dedupes the same ask across sources, decides what needs me, sets autonomy and urgency, and never proposes a merge, an approving review or a prod action. The first run also clears Linear notifications older than 7 days. Claude then writes the drafts and marks processed Linear notifications read, and `process triage commit` validates everything against the shared schema before it writes the queue and the handled-item ledger. An item that changes after it was handled comes back as a new version.
+The triage step of process. `process triage plan` applies every rule deterministically: it dedupes the same ask across sources, decides what needs me, sets autonomy and urgency, and never proposes a merge, an approving review, a prod action or declining a meeting with external guests or my manager. The first run also clears Linear notifications older than 7 days. Claude then writes the drafts (review comments, PR fixes and replies, Slack and email replies, RSVPs) and does the silent actions: it marks processed Linear notifications read, creates tickets for Slack asks and meeting action items after checking none exists, and labels and archives Gmail noise. Then `process triage commit` validates everything against the shared schema before it writes the queue and the handled-item ledger. An item that changes after it was handled comes back as a new version.
 
 Run by `process run` as `/triage <profile> [--dry-run]`.
 
@@ -72,10 +96,10 @@ Copy the skill folders into your skills directory:
 
 ```bash
 # Personal (all projects)
-cp -r afk afk-setup atomic-commits brief dossier execute open-pr process sweep-github sweep-linear triage ~/.claude/skills/
+cp -r afk afk-setup atomic-commits brief dossier execute open-pr process sweep-calendar sweep-github sweep-gmail sweep-linear sweep-meetings sweep-slack triage ~/.claude/skills/
 
 # Or per-project
-cp -r afk afk-setup atomic-commits brief dossier execute open-pr process sweep-github sweep-linear triage <project>/.claude/skills/
+cp -r afk afk-setup atomic-commits brief dossier execute open-pr process sweep-calendar sweep-github sweep-gmail sweep-linear sweep-meetings sweep-slack triage <project>/.claude/skills/
 ```
 
 Each skill is a folder containing a `SKILL.md` (plus any supporting files) — see the [skills documentation](https://code.claude.com/docs/en/skills) for details.
@@ -94,7 +118,7 @@ Its tests run with `python3 -m unittest` from the `afk/` folder. [`afk/e2e-check
 
 ### Setting up process
 
-`brief`, `sweep-github`, `sweep-linear`, `triage` and `execute` drive the `process` CLI in the `process/` folder (Python 3.11+, stdlib only; `gh` and `claude` on PATH). It is not a skill itself, but it is copied alongside them. Put it on PATH, then give it a profile per project:
+`brief`, the `sweep-*` sweepers, `triage` and `execute` drive the `process` CLI in the `process/` folder (Python 3.11+, stdlib only; `gh` and `claude` on PATH). It is not a skill itself, but it is copied alongside them. Put it on PATH, then give it a profile per project:
 
 ```bash
 ln -sf ~/.claude/skills/process/process.py ~/.local/bin/process
@@ -103,4 +127,4 @@ cp ~/.claude/skills/process/profiles/acme.md ~/.config/process/profiles/<project
 process profiles   # validates every profile and refuses one that grants a send tool
 ```
 
-A profile is markdown with TOML front matter: the project's sources, repo, Linear team, Google account, urgency rules, autonomy overrides, and a model and tool allowlist per phase. Its body is a **How to sweep** section and a **Changelog**. `process/profiles/acme.md` is an example. Keep your real profiles in `~/.config/process/profiles/`, not in this repo. The contract between phases (item, queue entry, decision, result, profile) is `process/schema.json`. State lives in `$XDG_STATE_HOME/process/`: `queue.jsonl`, `decisions.jsonl` (appended by `proc`), `results.jsonl` (appended by the executor), the brief, and per profile its items, watermarks and ledger. Only a profile's `[phases.execute]` may grant send tools, and no phase may grant a merge, an approval, a delete or a raw push. Tests run with `python3 -m unittest` from the `process/` folder.
+A profile is markdown with TOML front matter: the project's sources, repo, Linear team, Slack workspace and watchlist, Google account and manager, match rules for attributing items from a Slack workspace or Google account that several profiles share (each shared source is swept once per run), urgency rules, autonomy overrides, and a model and tool allowlist per phase. Its body is a **How to sweep** section and a **Changelog**. `process/profiles/acme.md` is an example. Keep your real profiles in `~/.config/process/profiles/`, not in this repo. The contract between phases (item, queue entry, decision, result, profile) is `process/schema.json`. State lives in `$XDG_STATE_HOME/process/`: `queue.jsonl`, `decisions.jsonl` (appended by `proc`), `results.jsonl` (appended by the executor), the brief, and per profile its items, watermarks and ledger. Only a profile's `[phases.execute]` may grant send tools, and no phase may grant a merge, an approval, a delete or a raw push. Tests run with `python3 -m unittest` from the `process/` folder.

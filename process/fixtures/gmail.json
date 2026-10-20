@@ -1,0 +1,21 @@
+{
+  "me": {"email": "me@acme.example"},
+  "threads": [
+    {"id": "thread-1", "subject": "Security review", "labels": ["INBOX", "UNREAD"], "messages": [
+      {"id": "msg-11", "from": "cal@acme.example", "to": ["me@acme.example"], "cc": [], "date": "now", "headers": {}, "body": "Hi, when can we do the security review of the export endpoint? I'd like it before the 28th."}
+    ]},
+    {"id": "thread-2", "subject": "This week in widgets: 10 tips", "labels": ["INBOX", "UNREAD"], "messages": [
+      {"id": "msg-21", "from": "news@vendor.example", "to": ["me@acme.example"], "cc": [], "date": "now", "headers": {"List-Unsubscribe": "<https://vendor.example/unsubscribe>"}, "body": "Our weekly newsletter..."}
+    ]},
+    {"id": "thread-3", "subject": "[acme/widgets] Run failed: test - main", "labels": ["INBOX"], "messages": [
+      {"id": "msg-31", "from": "notifications@github.com", "to": ["me@acme.example"], "cc": [], "date": "now", "headers": {"List-Unsubscribe": "<https://github.com/notifications/unsubscribe>"}, "body": "The test workflow failed on main."}
+    ]},
+    {"id": "thread-4", "subject": "Q4 roadmap", "labels": ["INBOX"], "messages": [
+      {"id": "msg-41", "from": "dee@acme.example", "to": ["eng@acme.example"], "cc": ["me@acme.example"], "date": "now", "headers": {}, "body": "Sharing the Q4 roadmap for the team. No action needed."}
+    ]},
+    {"id": "thread-5", "subject": "Re: Export format", "labels": ["INBOX"], "messages": [
+      {"id": "msg-51", "from": "ana@acme.example", "to": ["me@acme.example"], "cc": [], "date": "now", "headers": {}, "body": "Should the export use ISO dates?"},
+      {"id": "msg-52", "from": "me@acme.example", "to": ["ana@acme.example"], "cc": [], "date": "now", "headers": {}, "body": "Yes, ISO 8601."}
+    ]}
+  ]
+}
