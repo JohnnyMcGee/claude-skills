@@ -252,7 +252,7 @@ def load_profile(path):
             problems += [f"phases.execute grants {t!r}, which can merge, approve, delete or push" for t in phase.get("allowed_tools", []) if never_tool(t)]
         else:
             problems += [f"phases.{name} grants {t!r}, which can send, review, RSVP or merge" for t in phase.get("allowed_tools", []) if forbidden_tool(t)]
-        if name.startswith("sweep-"):
+        if name.startswith("sweep-") or name == "next-work":  # next-work reads like a sweeper; `process next` queues
             problems += [f"phases.{name} grants {t!r}, a silent write only triage may hold" for t in phase.get("allowed_tools", []) if t in SILENT_WRITES]
     if problems:
         raise SystemExit(f"process: profile {path}:\n" + "\n".join(f"  {p}" for p in problems))
@@ -709,7 +709,8 @@ class Process:
         ]
         ranked = [(tier, t) for tier, group in tiers for t in sorted(group, key=ticket_order)]
         picks = (self.pr_fixes(name) + [recommend(tier, t, now) for tier, t in ranked])[:NEXT_SLOTS]
-        backlog = [t for t in free if t["state"] == "backlog" and t["assignee"] != "other" and not status("linear_promote", t)]
+        # A promotion I approved or skipped is settled; one that failed (Linear down) may be proposed again.
+        backlog = [t for t in free if t["state"] == "backlog" and t["assignee"] != "other" and status("linear_promote", t) in (None, "failed")]
         proposed = []
 
         def propose(action, summary, t):
@@ -861,6 +862,7 @@ class Process:
             if dry:
                 self.record(name, e, "skipped")
                 continue
+            path = None
             try:
                 project, spec = self.afk_project(profile)
                 if running is None:
@@ -868,9 +870,11 @@ class Process:
                 if running >= limit:  # still approved: the next executor run tries again
                     self.out(f"{e['id']}: waits for a free AFK slot ({running} of {limit} running)")
                     continue
-                number = self.afk_ticket(spec, e)
-                self.run(["env", f"AFK_PROJECT={project}", "afk", "start", number], cwd=self.workdir(profile))
-            except (subprocess.CalledProcessError, OSError, ValueError) as error:  # ValueError: afk printed no JSON
+                path = self.afk_ticket(spec, e)
+                self.run(["env", f"AFK_PROJECT={project}", "afk", "start", path.name.split("-", 1)[0]], cwd=self.workdir(profile))
+            except (subprocess.CalledProcessError, OSError, ValueError, KeyError) as error:  # ValueError, KeyError: not afk's JSON
+                if path:  # closed, so afk's frontier never offers a ticket whose launch failed
+                    path.write_text(path.read_text().replace("**Status:** ready-for-agent", "**Status:** closed", 1))
                 self.record(name, e, "failure", error=failure("afk", error).removeprefix("afk failed: "))
                 continue
             running += 1
@@ -894,7 +898,8 @@ class Process:
             # -e: the session's panes find their project even if the tmux server was started inside another afk project.
             pane = self.run(["tmux", "new-session", "-d", "-s", project, "-c", str(workdir), "-e", f"AFK_PROJECT={project}", "-P", "-F", "#{pane_id}"]).strip()
             try:
-                self.run(["env", f"TMUX_PANE={pane}", "afk", "init", str(spec)], cwd=workdir)  # binds the pane's session
+                # stdin is not the caller's: tmux takes a terminal's own pane over TMUX_PANE, so proc's would win.
+                self.run(["env", f"TMUX_PANE={pane}", "afk", "init", str(spec)], input="", cwd=workdir)
                 self.run(["tmux", "send-keys", "-t", pane, "afk watch", "Enter"])  # drives the workers through their phases
             except (subprocess.CalledProcessError, OSError):  # an unbound session would be taken as bound next time
                 self.run(["tmux", "kill-session", "-t", f"={project}"])
@@ -906,17 +911,20 @@ class Process:
         issues = sorted((spec / "issues").glob("*.md"))
         for path in issues:
             if re.search(rf"^\*\*Queue entry:\*\* {e['id']}$", path.read_text(), re.M):
-                return path.name.split("-", 1)[0]
+                return path
         number = str(max([int(p.name.split("-", 1)[0]) for p in issues if p.name.split("-", 1)[0].isdigit()], default=0) + 1).zfill(2)
         params = e["action"]["params"]
         title = " ".join(f"{params['ticket']} {params['title']}".split())
         slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:50].rstrip("-")
-        # afk reads a ticket's fields from their first match, so these come before the draft, which quotes Linear.
-        (spec / "issues" / f"{number}-{slug}.md").write_text(
+        # afk reads a ticket's fields from their first match, so these come before the draft, which quotes Linear. A
+        # line of the draft afk would read as a field it has no value for here (Type, Repo) is marked as Linear's.
+        draft = AFK_FIELD.sub(r"(Linear) \g<0>", e["action"]["draft"].strip())
+        path = spec / "issues" / f"{number}-{slug}.md"
+        path.write_text(
             f"# {number} — {title}\n\n**Status:** ready-for-agent\n\n**Blocked by:** None — can start immediately\n\n"
-            f"**Linear:** {params['url']}\n\n**Queue entry:** {e['id']}\n\n{e['action']['draft'].strip()}\n\n{AFK_PR.format(ticket=params['ticket'])}\n"
+            f"**Linear:** {params['url']}\n\n**Queue entry:** {e['id']}\n\n{draft}\n\n{AFK_PR.format(ticket=params['ticket'])}\n"
         )
-        return number
+        return path
 
     def apply_decisions(self, profiles):
         """Turn each decision on a still-pending entry into its new state. A decision on anything else is stale (the
@@ -1210,6 +1218,8 @@ MERGE_BASE = (
     "mechanical: both sides kept, nothing about behaviour decided. Otherwise abort and report the conflicting files."
 )
 AFK_MAX_WORKERS = 2
+# A line afk's field() reads as a ticket field: optional non-word characters, the name, then a colon.
+AFK_FIELD = re.compile(r"^\W*(status|blocked by|type|repo|split into)\W*:.*$", re.I | re.M)
 # How an AFK worker's PR differs from afk's default: it is a draft, so it reads as unreviewed.
 AFK_PR = """## Pull request
 
@@ -1334,7 +1344,7 @@ def render_next(result, queue):
     """The Next work section: my up to 3 recommendations, each with its reason, then the AFK list and where each stands."""
     if not result or not (result["recommendations"] or result["afk"]):
         return []
-    status = {e["id"]: e["status"] for e in queue}
+    status = {e["id"]: "approved, waits for a free AFK slot" if e["status"] == "approved" else e["status"] for e in queue}
     lines = ["### Next work", ""]
     lines += [f"{n}. {r['ref']} {r['title']} — {r['reason']} · {r['link']}" for n, r in enumerate(result["recommendations"], 1)]
     lines += [""] if result["recommendations"] else []

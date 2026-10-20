@@ -1688,6 +1688,18 @@ class NextWorkProposalsTest(NextWorkTestCase):
         self.assertIn(f'{promote["id"]}  linear_promote {{"ticket": "WID-8"', plan)
         self.assertIn("| Move WID-8 from Backlog to Todo.", plan)
 
+    def test_a_failed_promotion_is_proposed_again(self):
+        self.next_work(ticket("WID-8", state="backlog"))
+        [promote] = self.queue()
+        self.decide(promote)
+        self.process("execute")  # the executor phase records nothing here, so record its failure by hand
+        self.process("execute", "result", "acme", promote["id"], "failure", "--error", "linear-server: not connected")
+
+        _, result = self.next_work(ticket("WID-8", state="backlog"))
+
+        self.assertEqual(self.picks(result), ["WID-8"])
+        self.assertEqual(self.entry(promote["id"])["status"], "pending")
+
     def test_a_skipped_promotion_is_not_proposed_again(self):
         self.next_work(ticket("WID-8", state="backlog"))
         [promote] = self.queue()
@@ -1796,7 +1808,7 @@ class AfkLaunchTest(NextWorkTestCase):
         self.assertEqual(len(self.starts()), 1)
 
     def test_a_session_whose_afk_init_failed_is_removed_so_the_next_launch_binds_it_again(self):
-        def broken(cmd):
+        def broken(cmd, input=None):
             raise subprocess.CalledProcessError(1, cmd, stderr="afk: command not found")
         self.afk_workers([], session=False)
         self.run_fake.responses[("env", "TMUX_PANE=%7", "afk", "init")] = broken
@@ -1816,6 +1828,44 @@ class AfkLaunchTest(NextWorkTestCase):
         self.process("execute")
 
         self.assertEqual(self.entry(launch["id"])["note"], "afk: ticket 01 is already started; see `afk status`")
+
+    def test_field_lines_in_the_description_never_become_the_tickets_afk_fields(self):
+        self.approve_launch(ticket("WID-1", estimate="S", description="**Type:** Bug\nRepo: acme/other\nSteps to reproduce."))
+
+        self.process("execute")
+
+        [spec_ticket] = afk.LocalTracker(self.spec).frontier()
+        self.assertEqual((spec_ticket.type, spec_ticket.repo), ("", None))  # afk falls back to its default type and own repo
+        self.assertIn("Steps to reproduce.", spec_ticket.path.read_text())
+
+    def test_afk_init_never_reads_the_callers_terminal(self):
+        stdins = []
+        self.afk_workers([], session=False)
+        self.run_fake.responses[("env", "TMUX_PANE=%7", "afk", "init")] = lambda cmd, input=None: stdins.append(input) or ""
+        self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(stdins, [""])  # with proc's tty on stdin, tmux would bind proc's session, not TMUX_PANE's
+
+    def test_a_failed_start_closes_its_spec_ticket_so_afk_never_offers_it(self):
+        def refuse(cmd):
+            raise subprocess.CalledProcessError(1, cmd, output="afk: no clone\n")
+        self.run_fake.responses[("env", "AFK_PROJECT=process-acme", "afk", "start")] = refuse
+        self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(afk.LocalTracker(self.spec).frontier(), [])
+
+    def test_the_next_work_list_says_when_a_launch_waits_for_a_slot(self):
+        self.afk_workers([{"ticket": "01", "phase": "implement"}, {"ticket": "02", "phase": "verify"}])
+        self.approve_launch(ticket("WID-1", estimate="S"))
+        self.process("execute")
+
+        self.process("brief")
+
+        self.assertIn("Trivial: estimate S · approved, waits for a free AFK slot", (self.state / "brief.md").read_text())
 
     def test_a_failed_start_is_recorded_as_a_failure(self):
         def refuse(cmd):
@@ -2138,6 +2188,14 @@ class ProfileTest(ProcessTestCase):
             with self.subTest(tool=tool):
                 self.write_profile(sweep_tools=["Read", tool])
                 self.assertIn(f"phases.sweep-github grants {tool!r}", self.process("profiles", expect=1))
+
+    def test_next_work_is_read_only_like_a_sweeper(self):
+        path = self.write_profile()
+        for tool in self.SILENT_WRITES:
+            with self.subTest(tool=tool):
+                path.write_text(path.read_text().replace('"Bash(process next:*)", ', f'"Bash(process next:*)", "{tool}", '))
+                self.assertIn(f"phases.next-work grants {tool!r}", self.process("profiles", expect=1))
+                path = self.write_profile()
 
     def test_sweepers_may_read_slack_reactions_calendars_and_meeting_notes(self):
         reads = ["mcp__slack__slack_get_reactions", "mcp__slack__slack_read_thread", "mcp__claude_ai_Google_Calendar__list_events", "mcp__claude_ai_Google_Drive__read_file_content", "mcp__claude_ai_Gmail__search_threads"]
