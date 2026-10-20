@@ -1309,7 +1309,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: process <run|emit|watermark|triage|execute|brief|profile|profiles|validate> ...")
+        app.out("usage: process <run|emit|watermark|triage|next|execute|brief|profile|profiles|validate> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command.replace("-", "_"), None)

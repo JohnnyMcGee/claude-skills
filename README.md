@@ -26,7 +26,7 @@ Invoke with `/atomic-commits <issue id or description of the work>`.
 
 ### brief
 
-The entry point of **process**, a pipeline that does the daily process chores (PR status and feedback, review requests, Linear inbox) and hands you one markdown brief. `/brief` runs `process run`, which takes every active project profile and runs each source's sweeper, triage, and then the executor for whatever triage approved silently, as headless `claude -p` phases. Each phase gets the profile's model and tool allowlist. Only the executor's may hold send tools, and no phase's may merge or approve. The brief groups each project into **Needs approval** (drafts queued for you), **Done silently** (what Claude did without asking) and a collapsed **FYI**. It is written to `$XDG_STATE_HOME/process/brief.md`, and every brief of the day is also archived in `briefs/<date>.md`. Drafts wait in the queue for you to approve, edit or skip in `proc`; the executor sends what you approved, and the next brief shows how it went.
+The entry point of **process**, a pipeline that does the daily process chores (PR status and feedback, review requests, Linear inbox, choosing the next tickets) and hands you one markdown brief. `/brief` runs `process run`, which takes every active project profile and runs each source's sweeper, triage, next-work (full runs only), and then the executor for whatever was approved silently, as headless `claude -p` phases. Each phase gets the profile's model and tool allowlist. Only the executor's may hold send tools, and no phase's may merge or approve. The brief groups each project into **Needs approval** (drafts queued for you), **Done silently** (what Claude did without asking), a collapsed **FYI** and, in a full brief, **Next work**. It is written to `$XDG_STATE_HOME/process/brief.md`, and every brief of the day is also archived in `briefs/<date>.md`. Drafts wait in the queue for you to approve, edit or skip in `proc`; the executor sends what you approved, and the next brief shows how it went.
 
 Invoke with `/brief [--delta] [--project <name>] [--fixtures <dir>]`. `--delta` sweeps from each source's watermark and shows only what changed; `--fixtures process/fixtures` is a dry run with no network. Needs the `process` CLI on PATH and at least one profile (see below).
 
@@ -38,9 +38,15 @@ Invoke with `/dossier <problem and direction, or issue id>`.
 
 ### execute
 
-The executor of process: the one phase allowed to send. `process execute` (which `proc` runs when you quit it) first applies your decisions from `decisions.jsonl`: an approval, with your edit if you made one; a skip, which enters the handled-item ledger; promote-to-silent, which adds the action type to the profile's autonomy overrides; and a reason you typed, which goes into the profile's **How to sweep** section word for word, with a Changelog line. Then, for each profile with approved entries, it runs `/execute` headless. That submits approved reviews (never an approving one) and posts approved replies through `process execute review` and `reply`, which send exactly the approved text, and fixes your own PRs in a scratch worktree, pushing only to the PR's own branch and never with force. The executor holds no GitHub write tool of its own. It records each result (success with a link, or failure with the error) in `results.jsonl`, and the next brief shows them. `process run` also runs it after triage, so bot comments and collaborators' nits on your PRs, and conflicts that only need the base merged in, are fixed and pushed without asking. Human review comments get a drafted reply and fix for your approval.
+The executor of process: the one phase allowed to send. `process execute` (which `proc` runs when you quit it) first applies your decisions from `decisions.jsonl`: an approval, with your edit if you made one; a skip, which enters the handled-item ledger; promote-to-silent, which adds the action type to the profile's autonomy overrides; and a reason you typed, which goes into the profile's **How to sweep** section word for word, with a Changelog line. Then, for each profile with approved entries, it runs `/execute` headless. That submits approved reviews (never an approving one) and posts approved replies through `process execute review` and `reply`, which send exactly the approved text, and fixes your own PRs in a scratch worktree, pushing only to the PR's own branch and never with force. It moves Backlog tickets whose promotion you approved to Todo, and starts the AFK workers you approved (see `next-work`). The executor holds no GitHub write tool of its own. It records each result (success with a link, or failure with the error) in `results.jsonl`, and the next brief shows them. `process run` also runs it after triage, so bot comments and collaborators' nits on your PRs, and conflicts that only need the base merged in, are fixed and pushed without asking. Human review comments get a drafted reply and fix for your approval.
 
 Run by `process execute [--project <name>]` as `/execute <profile> [--dry-run]`.
+
+### next-work
+
+The next-work step of process: it proposes up to 3 tickets for you to start next, each with a one-line reason, and a separate AFK list of trivial tickets that doesn't count against them. Claude reads your Linear tickets (In Progress, Todo and Backlog, with their blockers and projects' target dates), and `process next` ranks them deterministically: fixes waiting on you on your own PRs first, then tickets In Progress or newly unblocked, then Todo by priority, the project's target date and age, and, only when Todo can't fill the slots, Backlog tickets proposed for promotion. In Staging tickets never take a slot. What counts as trivial comes from the profile's `[afk]` table (estimates and labels it names, none it excludes, unblocked). Promotions and AFK launches are queue entries for your approval in `proc`. Approving an AFK item makes the executor write it as a ticket in a local `afk` spec in the profile's workdir (`.scratch/process-<profile>/`), bind a tmux session of that name running `afk watch`, and `afk start` the worker, which opens a draft PR. At most `max_workers` (default 2) run at once; extra approvals wait for a free slot.
+
+Run by `process run` with the full brief as `/next-work <profile> [--fixtures <dir>]`, or by hand the same way.
 
 ### open-pr
 
@@ -72,10 +78,10 @@ Copy the skill folders into your skills directory:
 
 ```bash
 # Personal (all projects)
-cp -r afk afk-setup atomic-commits brief dossier execute open-pr process sweep-github sweep-linear triage ~/.claude/skills/
+cp -r afk afk-setup atomic-commits brief dossier execute next-work open-pr process sweep-github sweep-linear triage ~/.claude/skills/
 
 # Or per-project
-cp -r afk afk-setup atomic-commits brief dossier execute open-pr process sweep-github sweep-linear triage <project>/.claude/skills/
+cp -r afk afk-setup atomic-commits brief dossier execute next-work open-pr process sweep-github sweep-linear triage <project>/.claude/skills/
 ```
 
 Each skill is a folder containing a `SKILL.md` (plus any supporting files) — see the [skills documentation](https://code.claude.com/docs/en/skills) for details.
@@ -94,7 +100,7 @@ Its tests run with `python3 -m unittest` from the `afk/` folder. [`afk/e2e-check
 
 ### Setting up process
 
-`brief`, `sweep-github`, `sweep-linear`, `triage` and `execute` drive the `process` CLI in the `process/` folder (Python 3.11+, stdlib only; `gh` and `claude` on PATH). It is not a skill itself, but it is copied alongside them. Put it on PATH, then give it a profile per project:
+`brief`, `sweep-github`, `sweep-linear`, `triage`, `next-work` and `execute` drive the `process` CLI in the `process/` folder (Python 3.11+, stdlib only; `gh` and `claude` on PATH). It is not a skill itself, but it is copied alongside them. Put it on PATH, then give it a profile per project:
 
 ```bash
 ln -sf ~/.claude/skills/process/process.py ~/.local/bin/process
@@ -103,4 +109,4 @@ cp ~/.claude/skills/process/profiles/acme.md ~/.config/process/profiles/<project
 process profiles   # validates every profile and refuses one that grants a send tool
 ```
 
-A profile is markdown with TOML front matter: the project's sources, repo, Linear team, Google account, urgency rules, autonomy overrides, and a model and tool allowlist per phase. Its body is a **How to sweep** section and a **Changelog**. `process/profiles/acme.md` is an example. Keep your real profiles in `~/.config/process/profiles/`, not in this repo. The contract between phases (item, queue entry, decision, result, profile) is `process/schema.json`. State lives in `$XDG_STATE_HOME/process/`: `queue.jsonl`, `decisions.jsonl` (appended by `proc`), `results.jsonl` (appended by the executor), the brief, and per profile its items, watermarks and ledger. Only a profile's `[phases.execute]` may grant send tools, and no phase may grant a merge, an approval, a delete or a raw push. Tests run with `python3 -m unittest` from the `process/` folder.
+A profile is markdown with TOML front matter: the project's sources, repo, Linear team, Google account, urgency rules, autonomy overrides, AFK rules, and a model and tool allowlist per phase. Its body is a **How to sweep** section and a **Changelog**. `process/profiles/acme.md` is an example. Keep your real profiles in `~/.config/process/profiles/`, not in this repo. The contract between phases (item, queue entry, decision, result, ticket, next work, profile) is `process/schema.json`. State lives in `$XDG_STATE_HOME/process/`: `queue.jsonl`, `decisions.jsonl` (appended by `proc`), `results.jsonl` (appended by the executor), the brief, and per profile its items, watermarks, ledger and `next.json`. AFK launches need `afk` and `tmux` on PATH. Only a profile's `[phases.execute]` may grant send tools, and no phase may grant a merge, an approval, a delete or a raw push. Tests run with `python3 -m unittest` from the `process/` folder.

@@ -31,9 +31,12 @@ The run is done when every entry in the plan has a recorded result.
 | `gh_review` | `process execute review <profile> <entry id>`. It submits the approved draft with the entry's event (`COMMENT` or `REQUEST_CHANGES`, never `APPROVE`) and records the result itself. |
 | `gh_thread_reply` | The draft is my reply, then an optional `## Fix` section. If there is a fix, make it first (as `gh_fix_pr` below) and push it. Then `process execute reply <profile> <entry id>`: it posts the text above `## Fix` in the comment's own thread and records the result itself. If the fix failed, record the failure instead and post nothing. |
 | `gh_fix_pr` | Fix the PR in a scratch worktree and push, below. Record `success --link <the pushed commit link>`. |
+| `linear_promote` | Move the ticket in `params.ticket` from Backlog to its team's Todo state with `mcp__linear-server__save_issue`, and change nothing else about it. Record `success --link <params.url>`. If it is no longer in Backlog, change nothing and record a failure saying where it is. |
 | anything else | Not executable yet. Record a failure: `no executor step for <type> yet`. |
 
-You send nothing yourself: you hold no GitHub write tool, only these steps. You can read files only in a fix's worktree.
+AFK launches never reach your plan: `process execute` writes each approved one as an `afk` ticket and starts its worker itself.
+
+You send nothing to GitHub yourself: you hold no GitHub write tool, only these steps. Your one Linear write is a promotion. You can read files only in a fix's worktree.
 
 ### Fixing a PR
 
@@ -58,7 +61,7 @@ process execute result <profile> <entry id> failure --error "<what went wrong, o
 
 `review` and `reply` record their own result, success or failure. For anything else, a step that errors is a failure: record it and go on to the next entry. Never retry a send that may have gone out. Recording the result also removes the entry's worktree.
 
-With `--dry-run`, call no GitHub tool and no review, reply, checkout, git or push step. Record every entry as `process execute result <profile> <entry id> skipped`.
+With `--dry-run`, call no GitHub or Linear tool and no review, reply, checkout, git or push step. Record every entry as `process execute result <profile> <entry id> skipped`.
 
 ## 4. Report
 

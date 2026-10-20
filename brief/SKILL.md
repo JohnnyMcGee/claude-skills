@@ -9,7 +9,7 @@ argument-hint: [--delta] [--project <name>] [--fixtures <dir>]
 
 You run `process run`, which does all the work, then show me the brief.
 
-1. **Run**: `process run <arguments as given>`, in the background, and wait for it to finish. It runs each phase (one sweeper per source, triage, then the executor for the fixes triage approved silently) as headless `claude -p` under that phase's model and tool allowlist from the profile, then writes the brief. A full run can take several minutes.
+1. **Run**: `process run <arguments as given>`, in the background, and wait for it to finish. It runs each phase (one sweeper per source, triage, next-work on a full run, then the executor for what triage and next-work approved silently) as headless `claude -p` under that phase's model and tool allowlist from the profile, then writes the brief. A full run can take several minutes.
    - `--delta`: sweep from each source's watermark and show only what this run added.
    - `--project <name>`: one profile only.
    - `--fixtures <dir>`: a dry run. Sweepers read `<dir>/<source>.json` instead of the services, and triage and the executor touch nothing. Run it as `XDG_STATE_HOME=$(mktemp -d) process run …`, a fresh directory every time. `process` refuses a dry run into any directory that already holds real state.

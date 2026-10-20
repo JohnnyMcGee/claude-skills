@@ -1771,6 +1771,8 @@ class ProfileTest(ProcessTestCase):
         self.assertEqual(acme["google"]["account"], "me@acme.example")
         self.assertEqual({p["model"] for p in acme["phases"].values()}, {"sonnet", "opus"})
         self.assertIn("## Changelog", acme["body"])
+        self.assertIn("Bash(process next:*)", acme["phases"]["next-work"]["allowed_tools"])
+        self.assertEqual((acme["afk"]["estimates"], acme["afk"]["max_workers"]), (["XS", "S"], 2))
 
 
 if __name__ == "__main__":
