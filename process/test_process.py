@@ -581,6 +581,39 @@ class ExecuteTest(ExecuteTestCase):
         self.assertEqual(self.executor_calls(), [])
 
 
+class LearningTest(ExecuteTestCase):
+    def comment(self, n, body="Could this be a dict?"):
+        return item(kind="pr_comment", native_id=f"comment/{n}", subject=f"https://github.com/acme/widgets/pull/7#issuecomment-{n}", context=body, summary=f"Ana commented on #7 ({n})")
+
+    def profile_text(self):
+        return (self.tmp / "config" / "process" / "profiles" / "acme.md").read_text()
+
+    def test_promote_to_silent_adds_the_action_type_to_the_profiles_autonomy_overrides(self):
+        self.emit(self.comment(1))
+        [reply] = self.triage()
+        self.decide(reply, promote_to_silent=True)
+
+        self.process("execute")
+
+        profile = process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")
+        self.assertEqual(profile["autonomy"]["silent"], ["gh_thread_reply"])
+        self.assertIn("— Promoted gh_thread_reply to silent", profile["body"].split("## Changelog", 1)[1])
+        self.emit(self.comment(2))
+        [later] = [e for e in self.triage() if e["item_ids"][0].startswith("github:comment/2")]
+        self.assertEqual((later["autonomy"], later["status"]), ("silent", "approved"))
+
+    def test_a_review_is_never_promoted_to_silent(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review, promote_to_silent=True)
+
+        out = self.process("execute")
+
+        self.assertIn("gh_review cannot be silent", out)
+        self.assertEqual(process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")["autonomy"]["silent"], [])
+        self.assertEqual(self.entry(review["id"])["status"], "approved")  # the approval itself still stands
+
+
 class ExecutorStepsTest(ExecuteTestCase):
     def setUp(self):
         super().setUp()

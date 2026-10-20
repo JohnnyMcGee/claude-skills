@@ -537,6 +537,8 @@ class Process:
             e = queue.get(decision["entry_id"])
             if not e or e["status"] != "pending" or e["project"] not in profiles:
                 continue
+            if decision.get("promote_to_silent"):
+                self.promote(e["project"], e["action"]["type"])
             if decision["verdict"] == "approve":
                 e = {**e, "status": "approved", "action": {**e["action"], "draft": decision.get("draft") or e["action"].get("draft", "")}}
             else:
@@ -547,6 +549,35 @@ class Process:
         self.append_jsonl(self.state_root() / "queue.jsonl", changed)
         for name, entries in handled.items():
             self.handle(name, entries, "skipped")
+
+    def promote(self, name, action_type):
+        """Add an action type to the profile's autonomy overrides, so triage approves it without asking next time."""
+        silent = self.profile(name)["autonomy"]["silent"]
+        if action_type not in SCHEMA["$defs"]["profile"]["properties"]["autonomy"]["properties"]["silent"]["items"]["enum"]:
+            self.out(f"process: {name}: {action_type} cannot be silent; not promoted")
+        elif action_type not in silent:
+            self.edit_profile(name, silent=silent + [action_type], changelog=f"Promoted {action_type} to silent.")
+
+    def edit_profile(self, name, changelog, silent=None, lesson=None):
+        """Rewrite a profile in place: the autonomy overrides, a lesson at the end of How to sweep, and always a
+        Changelog line. The result must load cleanly, or the profile is left as it was."""
+        path = self.profiles_dir() / f"{name}.md"
+        text = path.read_text()
+        match = re.match(r"(\+\+\+\n.*?\n\+\+\+\n)(.*)", text, re.S)
+        front, body = match[1], match[2]
+        if silent is not None:
+            front = re.sub(r"^silent\s*=\s*\[[^\]]*\]", lambda _: "silent = " + json.dumps(silent), front, count=1, flags=re.M)
+        if lesson:
+            body = insert_in_section(body, "## How to sweep", f"- {lesson}")
+        body = insert_in_section(body, "## Changelog", f"- {datetime.fromtimestamp(self.clock()).astimezone():%Y-%m-%d} — {changelog}")
+        path.write_text(front + body)
+        try:
+            profile = load_profile(path)
+            if silent is not None and profile["autonomy"]["silent"] != silent:
+                raise SystemExit(f"process: {path}: could not rewrite autonomy.silent")
+        except SystemExit:
+            path.write_text(text)
+            raise
 
     def execute_plan(self, name):
         """Print every approved entry for the executor: its action, params, link and the exact text to send."""
@@ -636,6 +667,14 @@ def canonical(url):
 
 def notification(i):
     return (i.get("facts") or {}).get("notification_id")
+
+
+def insert_in_section(body, heading, line):
+    """Add a line at the end of a markdown section: before the next ## heading, or at the end of the body."""
+    start = body.index(heading) + len(heading)
+    end = body.find("\n## ", start)
+    end = len(body) if end == -1 else end + 1
+    return body[:end].rstrip("\n") + f"\n{line}\n" + ("\n" + body[end:] if end < len(body) else "")
 
 
 def indent(text, prefix, limit=20):
