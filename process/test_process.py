@@ -1138,7 +1138,7 @@ def ticket(identifier, **over):
     return {**base, **over}
 
 
-class NextWorkTestCase(TriageTestCase):
+class NextWorkTestCase(ExecuteTestCase):
     def next_work(self, *tickets, profile="acme"):
         out = self.process("next", profile, stdin="".join(json.dumps(t) + "\n" for t in tickets))
         return out, json.loads((self.profile_dir(profile) / "next.json").read_text())
@@ -1248,6 +1248,55 @@ class AfkListTest(NextWorkTestCase):
         self.write_profile()  # no [afk] rules: nothing is trivial
         _, result = self.next_work(ticket("WID-1", estimate="S"), ticket("WID-5", estimate="M"))
         self.assertEqual((self.picks(result), result["afk"]), (["WID-1", "WID-5"], []))
+
+
+class NextWorkProposalsTest(NextWorkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(afk=TRIVIAL)
+
+    def test_a_rerun_keeps_each_proposal_waiting_once_and_supersedes_those_it_no_longer_makes(self):
+        self.next_work(ticket("WID-1", estimate="S"), ticket("WID-8", state="backlog"))
+        before = self.queue()
+
+        _, result = self.next_work(ticket("WID-1", estimate="S"), ticket("WID-2"), ticket("WID-3"), ticket("WID-4"), ticket("WID-8", state="backlog"))
+
+        [promote] = [e for e in before if e["action"]["type"] == "linear_promote"]
+        [afk] = [e for e in before if e["action"]["type"] == "afk_launch"]
+        self.assertEqual({e["id"]: e["status"] for e in self.queue()}, {afk["id"]: "pending", promote["id"]: "superseded"})
+        self.assertEqual(len(self.jsonl(self.state / "queue.jsonl")), 3)  # the waiting launch was not appended again
+        self.assertEqual(result["afk"][0]["entry_id"], afk["id"])
+
+    def test_a_skipped_afk_launch_never_comes_back_and_the_ticket_is_mine_again(self):
+        self.next_work(ticket("WID-1", estimate="S"))
+        [launch] = self.queue()
+        self.decide(launch, "skip")
+        self.process("execute")
+
+        _, result = self.next_work(ticket("WID-1", estimate="S"))
+
+        self.assertEqual((self.picks(result), result["afk"]), (["WID-1"], []))
+        self.assertEqual([e["status"] for e in self.queue()], ["skipped"])
+
+    def test_a_skipped_promotion_is_not_proposed_again(self):
+        self.next_work(ticket("WID-8", state="backlog"))
+        [promote] = self.queue()
+        self.decide(promote, "skip")
+        self.process("execute")
+
+        _, result = self.next_work(ticket("WID-8", state="backlog"), ticket("WID-9", state="backlog", priority=4))
+
+        self.assertEqual(self.picks(result), ["WID-9"])
+
+    def test_an_approved_afk_launch_takes_its_ticket_off_both_lists(self):
+        self.next_work(ticket("WID-1", estimate="S"))
+        [launch] = self.queue()
+        self.decide(launch)
+        self.process("execute")
+
+        _, result = self.next_work(ticket("WID-1", estimate="S"))
+
+        self.assertEqual((self.picks(result), result["afk"]), ([], []))
 
 
 class ContractTest(ProcessTestCase):

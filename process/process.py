@@ -555,7 +555,9 @@ class Process:
 
     def cmd_next(self, name, *args):
         """Rank the next-work skill's candidate tickets (JSONL on stdin, or --file) into up to 3 recommendations, each
-        with its reason, and write them to next.json. All or nothing."""
+        with its reason, and an AFK list, in next.json. Promotions and AFK launches are queued for my approval, once
+        each: a rerun keeps a proposal still waiting, supersedes one it no longer makes, and never re-proposes one I
+        decided. All or nothing."""
         opts = flags(args, "--file")
         profile = self.profile(name)
         path = opts.get("--file") and self.inbox_file(name, opts["--file"])
@@ -564,10 +566,15 @@ class Process:
         if problems:
             raise SystemExit("process: nothing ranked, invalid tickets:\n" + "\n".join(problems))
         now = self.clock()
-        free = [t for t in tickets if not t["blocked"]]
+        proposals = [e for e in self.queue() if e["project"] == name and e["kind"] == "next_work"]
+        decided = {(e["action"]["type"], e["subject"]): e["status"] for e in proposals if e["status"] not in ("pending", "superseded")}
+        waiting = {(e["action"]["type"], e["subject"]): e for e in proposals if e["status"] == "pending"}
+        status = lambda action_type, t: decided.get((action_type, canonical(t["url"])))
+        # An AFK launch I approved has the ticket; one I skipped (or that failed) hands it back to me.
+        free = [t for t in tickets if not t["blocked"] and status("afk_launch", t) not in ("approved", "done")]
         todo = [t for t in free if t["state"] == "todo" and t["assignee"] != "other"]
-        afk = [(t, trivial(profile, t)) for t in todo if trivial(profile, t)]  # a separate list, not one of my 3
-        todo = [t for t in todo if not trivial(profile, t)]
+        afk = [t for t in todo if trivial(profile, t) and not status("afk_launch", t)]  # a separate list, not one of my 3
+        todo = [t for t in todo if t not in afk]
         unblocked = [t for t in todo if t.get("unblocked_at", "") >= iso(now - UNBLOCKED_AGE)]
         tiers = [
             ("in_progress", [t for t in free if t["state"] == "in_progress" and t["assignee"] == "me"]),
@@ -576,28 +583,37 @@ class Process:
         ]
         ranked = [(tier, t) for tier, group in tiers for t in sorted(group, key=ticket_order)]
         picks = (self.pr_fixes(name) + [recommend(tier, t, now) for tier, t in ranked])[:NEXT_SLOTS]
-        backlog = sorted((t for t in free if t["state"] == "backlog" and t["assignee"] != "other"), key=ticket_order)
-        entries = []
-        for t in backlog[: NEXT_SLOTS - len(picks)]:  # Todo is thin: Backlog fills the slots it leaves
+        backlog = [t for t in free if t["state"] == "backlog" and t["assignee"] != "other" and not status("linear_promote", t)]
+        proposed = []
+
+        def propose(action, summary, t):
+            e = waiting.get((action["type"], canonical(t["url"]))) or self.next_entry(profile, action, summary, t)
+            proposed.append(e)
+            return e["id"]
+
+        for t in sorted(backlog, key=ticket_order)[: NEXT_SLOTS - len(picks)]:  # Todo is thin: Backlog fills the slots it leaves
             pick = recommend("promote", t, now)
             action = {"type": "linear_promote", "params": ticket_ref(t), "draft": f"Move {t['identifier']} from Backlog to Todo. {pick['reason']}."}
-            entries.append(self.next_entry(profile, action, f"Promote {t['identifier']} {t['title']} from Backlog to Todo", t))
-            picks.append({**pick, "entry_id": entries[-1]["id"]})
+            picks.append({**pick, "entry_id": propose(action, f"Promote {t['identifier']} {t['title']} from Backlog to Todo", t)})
         afk_list = []
-        for t, why in sorted(afk, key=lambda pair: ticket_order(pair[0])):
+        for t in sorted(afk, key=ticket_order):
             action = {"type": "afk_launch", "params": ticket_ref(t), "draft": (t.get("description") or "").strip() or f"No description: see {t['url']}."}
-            entries.append(self.next_entry(profile, action, f"Hand {t['identifier']} {t['title']} to an AFK worker", t))
-            afk_list.append({"tier": "afk", "ref": t["identifier"], "title": t["title"], "link": t["url"], "reason": why, "entry_id": entries[-1]["id"]})
+            entry_id = propose(action, f"Hand {t['identifier']} {t['title']} to an AFK worker", t)
+            afk_list.append({"tier": "afk", "ref": t["identifier"], "title": t["title"], "link": t["url"], "reason": trivial(profile, t), "entry_id": entry_id})
         result = {"profile": name, "at": iso(now), "recommendations": picks, "afk": afk_list}
-        problems = validate(result, "next_work") + [f"{e['id']}: {p}" for e in entries for p in validate(e, "queue_entry")]
+        fresh = [e for e in proposed if e not in waiting.values()]
+        problems = validate(result, "next_work") + [f"{e['id']}: {p}" for e in fresh for p in validate(e, "queue_entry")]
         if problems:
             raise SystemExit("process: nothing written:\n" + "\n".join(f"  {p}" for p in problems))
-        self.append_jsonl(self.state_root() / "queue.jsonl", entries)
+        stale = [{**e, "status": "superseded"} for e in waiting.values() if e not in proposed]
+        self.append_jsonl(self.state_root() / "queue.jsonl", stale + fresh)
         self.write_json(self.profile_state(name) / "next.json", result)
         if path:
             path.unlink()
         for n, r in enumerate(picks, 1):
             self.out(f"{n}. {r['ref']}  {r['title']}  — {r['reason']}  {r['link']}")
+        for r in afk_list:
+            self.out(f"AFK {r['ref']}  {r['title']}  — {r['reason']}  {r['link']}")
 
     def next_entry(self, profile, action, summary, t):
         """A queue entry for a promotion or AFK launch: drafted for my approval, unless I promoted its type to silent."""
