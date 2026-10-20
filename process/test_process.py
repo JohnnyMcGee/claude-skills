@@ -174,6 +174,127 @@ class EmitTest(ProcessTestCase):
         self.assertNotEqual(stored[0]["id"], stored[1]["id"])
 
 
+def linear(**over):
+    """A Linear notification item; by default Linear's mirror of Ana's review request on #101."""
+    base = item(
+        source="linear",
+        native_id="notif-1",
+        version="2026-10-20T12:01:00Z",
+        summary="Review requested on #101 (linked to WID-500)",
+        link="https://linear.app/acme/issue/WID-500",
+        timestamp="2026-10-20T12:01:00Z",
+        facts={"notification_id": "notif-1"},
+    )
+    return {**base, **over}
+
+
+def my_pr(number=7, version="v1", **facts):
+    return item(
+        native_id=f"pr/{number}",
+        version=version,
+        kind="pr_status",
+        subject=f"https://github.com/acme/widgets/pull/{number}",
+        link=f"https://github.com/acme/widgets/pull/{number}",
+        actor={"name": "me", "role": "me"},
+        summary=f"Your PR #{number}",
+        facts={"mine": True, **facts},
+    )
+
+
+class TriageTestCase(ProcessTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile()
+
+    @property
+    def plan(self):
+        return json.loads((self.profile_dir() / "plan.json").read_text())
+
+    def queue(self):
+        """The queue's current state: the last line for each entry id."""
+        return list({e["id"]: e for e in self.jsonl(self.state / "queue.jsonl")}.values())
+
+    def triage(self, profile="acme", outcome="done"):
+        """Run triage the way the triage skill does: plan, draft every draft entry, report each silent action, commit."""
+        self.process("triage", "plan", profile)
+        for entry in self.plan["entries"]:
+            if entry["autonomy"] == "draft":
+                self.process("triage", "draft", profile, entry["id"], stdin=f"Draft for {entry['summary']}")
+            if entry["action"]["type"] == "linear_mark_read":
+                self.process("triage", "silent", profile, entry["id"], outcome)
+        self.process("triage", "commit", profile)
+        return self.queue()
+
+
+class TriageTest(TriageTestCase):
+    def test_the_same_review_request_from_github_and_linears_mirror_becomes_one_entry(self):
+        self.emit(item())
+        self.emit(linear(), source="linear")
+
+        queue = self.triage()
+
+        [review] = [e for e in queue if e["kind"] == "review_request"]
+        self.assertEqual(len(review["item_ids"]), 2)
+        self.assertEqual(review["sources"], ["github", "linear"])
+        self.assertEqual(review["action"]["type"], "gh_review")
+        self.assertEqual(review["action"]["params"], {"repo": "acme/widgets", "number": 101, "event": "COMMENT"})
+        self.assertEqual((review["autonomy"], review["status"]), ("draft", "pending"))
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+
+    def test_a_handled_item_stays_handled_until_it_changes_then_it_resurfaces_and_replaces_its_entry(self):
+        self.emit(item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-1", version="c1"))
+        [first] = self.triage()
+
+        self.emit(item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-1", version="c1"))
+        self.assertEqual(self.triage(), [first])  # same version: nothing new
+
+        self.emit(item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-1", version="c2"))
+        queue = self.triage()
+
+        self.assertEqual([e["status"] for e in queue], ["superseded", "pending"])
+        self.assertEqual(queue[1]["action"]["type"], "gh_thread_reply")
+        self.assertNotEqual(queue[1]["item_ids"], first["item_ids"])
+
+
+class NeverActionTest(TriageTestCase):
+    def test_my_approved_green_pr_is_an_fyi_never_a_merge(self):
+        self.emit(my_pr(mergeable="mergeable", checks="passing", review="approved"))
+
+        [ready] = self.triage()
+
+        self.assertEqual((ready["status"], ready["action"]["type"]), ("info", "none"))
+        self.assertIn("merging is yours", ready["summary"])
+
+    def test_my_broken_pr_is_a_fix_for_approval(self):
+        self.emit(my_pr(mergeable="conflicting", checks="failing", review="review_required"))
+
+        [broken] = self.triage()
+
+        self.assertEqual((broken["autonomy"], broken["action"]["type"]), ("draft", "gh_fix_pr"))
+
+    def test_a_plan_edited_into_a_merge_or_an_approving_review_is_refused_and_nothing_is_queued(self):
+        for action in ({"type": "gh_merge", "params": {"repo": "acme/widgets", "number": 101}},
+                       {"type": "gh_review", "params": {"repo": "acme/widgets", "number": 101, "event": "APPROVE"}, "draft": "LGTM"},
+                       {"type": "prod_deploy", "params": {}}):
+            with self.subTest(action=action["type"]):
+                self.emit(item(version=action["type"]))
+                self.process("triage", "plan", "acme")
+                path = self.profile_dir() / "plan.json"
+                plan = json.loads(path.read_text())
+                plan["entries"][0]["action"] = action
+                path.write_text(json.dumps(plan))
+
+                self.assertIn("nothing committed", self.process("triage", "commit", "acme", expect=1))
+                self.assertEqual(self.jsonl(self.state / "queue.jsonl"), [])
+                self.assertEqual(self.jsonl(self.profile_dir() / "ledger.jsonl"), [])
+
+    def test_commit_refuses_a_draft_entry_without_a_draft(self):
+        self.emit(item())
+        self.process("triage", "plan", "acme")
+
+        self.assertIn("no draft", self.process("triage", "commit", "acme", expect=1))
+
+
 class ProfileTest(ProcessTestCase):
     # Tools that send, review, RSVP or merge on my behalf. None may ever be in a sweep or triage allowlist.
     SEND_TOOLS = [

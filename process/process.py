@@ -267,6 +267,189 @@ class Process:
             raise SystemExit("\n".join(problems))
 
 
+    # -- triage side --
+
+    def cmd_triage(self, step, profile, *args):
+        """plan → draft/silent → commit. The triage skill drives it; plan and commit hold every rule."""
+        steps = {"plan": self.triage_plan, "draft": self.triage_draft, "silent": self.triage_silent, "commit": self.triage_commit}
+        if step not in steps:
+            raise SystemExit(f"process: triage step must be one of {', '.join(steps)}")
+        return steps[step](profile, *args)
+
+    def triage_plan(self, name):
+        """Turn every unhandled item into proposed queue entries in plan.json, and print what needs drafting."""
+        profile = self.profile(name)
+        pdir = self.profile_state(name)
+        handled = {line["item_id"] for line in self.read_jsonl(pdir / "ledger.jsonl")}
+        items = [i for i in self.read_jsonl(pdir / "items.jsonl") if i["id"] not in handled]
+        first_run = "bankrupt_at" not in self.read_json(pdir / "state.json", {})
+        cutoff = iso(self.clock() - BANKRUPTCY_AGE)
+        stale = [i for i in items if first_run and i["source"] == "linear" and notification(i) and i["timestamp"] < cutoff]
+        dropped = [i for i in items if i["actor"]["role"] == "me" and i["kind"] != "pr_status"]
+        live = [i for i in items if i not in stale and i not in dropped]
+        groups = {}
+        for i in sorted(live, key=lambda i: (i["source"], i["timestamp"])):  # github first: its item leads the entry
+            groups.setdefault((i["kind"], canonical(i["subject"])), []).append(i)
+        entries = [entry(name, profile, group) for group in groups.values()]
+        if stale:
+            entries.append(mark_read(name, stale, f"Cleared {len(stale)} Linear notification(s) older than 7 days (first run)"))
+        if [i for i in live if notification(i)]:
+            read = [i for i in live if notification(i)]
+            entries.append(mark_read(name, read, f"Marked {len(read)} processed Linear notification(s) read"))
+        plan = {"profile": name, "first_run": first_run, "dropped": [i["id"] for i in dropped], "entries": entries}
+        self.write_json(pdir / "plan.json", plan)
+        by_id = {i["id"]: i for i in items}
+        for e in entries:
+            todo = "draft" if e["autonomy"] == "draft" else "do, then report" if e["action"]["type"] == "linear_mark_read" else e["status"]
+            self.out(f"{e['id']}  [{todo}]  {e['action']['type']} {json.dumps(e['action']['params'])}  {e['summary']}  {e['link']}")
+            if todo == "draft":
+                for item_id in e["item_ids"]:
+                    self.out(f"    {item_id}: {by_id[item_id]['summary']}\n" + indent(by_id[item_id]["context"], "      | "))
+        self.out(f"{len(entries)} entr(ies) planned in {pdir / 'plan.json'}; {len(dropped)} item(s) of my own dropped")
+
+    def plan_entry(self, name, entry_id):
+        plan = self.read_json(self.profile_state(name) / "plan.json", None)
+        if plan is None:
+            raise SystemExit(f"process: no triage plan for {name}; run `process triage plan {name}` first")
+        found = [e for e in plan["entries"] if e["id"] == entry_id]
+        if not found:
+            raise SystemExit(f"process: no entry {entry_id} in the {name} plan")
+        return plan, found[0]
+
+    def triage_draft(self, name, entry_id):
+        """Set an entry's draft from stdin."""
+        plan, e = self.plan_entry(name, entry_id)
+        e["action"]["draft"] = self.stdin.read().strip()
+        self.write_json(self.profile_state(name) / "plan.json", plan)
+
+    def triage_silent(self, name, entry_id, outcome, note=None):
+        """Record how a silent action triage performed itself went: done, failed or skipped (dry run)."""
+        if outcome not in ("done", "failed", "skipped"):
+            raise SystemExit("process: a silent outcome is done, failed or skipped")
+        plan, e = self.plan_entry(name, entry_id)
+        e["status"] = outcome
+        if note:
+            e["note"] = note
+        self.write_json(self.profile_state(name) / "plan.json", plan)
+
+    def triage_commit(self, name):
+        """Validate the finished plan, then append it to the queue and ledger. All or nothing."""
+        pdir = self.profile_state(name)
+        plan = self.read_json(pdir / "plan.json", None)
+        if plan is None:
+            raise SystemExit(f"process: no triage plan for {name}; run `process triage plan {name}` first")
+        run = self.read_json(self.state_root() / "run.json", {}).get("id") or iso(self.clock())
+        entries = [{**e, "run": run, "created": iso(self.clock())} for e in plan["entries"]]
+        problems = []
+        for e in entries:
+            problems += [f"{e['id']}: {p}" for p in validate(e, "queue_entry")]
+            if e["autonomy"] == "draft" and not e["action"].get("draft"):
+                problems.append(f"{e['id']}: no draft (process triage draft {name} {e['id']})")
+            if e["action"]["type"] == "linear_mark_read" and e["status"] == "approved":
+                problems.append(f"{e['id']}: no outcome (process triage silent {name} {e['id']} done|failed|skipped)")
+        if problems:
+            raise SystemExit("process: nothing committed:\n" + "\n".join(f"  {p}" for p in problems))
+        keys = {(e["kind"], e["subject"]) for e in entries}
+        superseded = [
+            {**old, "status": "superseded"}
+            for old in self.queue()
+            if old["project"] == name and old["status"] in ("pending", "info") and (old["kind"], old["subject"]) in keys
+        ]
+        self.append_jsonl(self.state_root() / "queue.jsonl", superseded + entries)
+        handled = [i for e in entries for i in e["item_ids"]] + plan["dropped"]
+        self.append_jsonl(pdir / "ledger.jsonl", [{"item_id": i, "at": iso(self.clock())} for i in handled])
+        if plan["first_run"]:
+            self.write_json(pdir / "state.json", {**self.read_json(pdir / "state.json", {}), "bankrupt_at": iso(self.clock())})
+        (pdir / "plan.json").unlink()
+        self.out(f"committed {len(entries)} entr(ies) for {name}; superseded {len(superseded)}; {len(handled)} item(s) handled")
+
+    def queue(self):
+        """The queue's current state: the last line for each entry id, in first-seen order."""
+        return list({e["id"]: e for e in self.read_jsonl(self.state_root() / "queue.jsonl")}.values())
+
+
+BANKRUPTCY_AGE = 7 * 24 * 3600
+PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
+
+
+def canonical(url):
+    """Same thing, same key: lower-case host, no query, no trailing slash. Fragments stay (they name a comment)."""
+    match = re.match(r"(https?://)([^/]+)([^?#]*)(\?[^#]*)?(#.*)?$", url)
+    return match[1] + match[2].lower() + match[3].rstrip("/") + (match[5] or "") if match else url
+
+
+def notification(i):
+    return (i.get("facts") or {}).get("notification_id")
+
+
+def indent(text, prefix):
+    return "\n".join(prefix + line for line in (text or "").splitlines()[:20])
+
+
+def mark_read(name, items, summary):
+    ids = [i["id"] for i in items]
+    return {
+        "id": "q-" + digest(name + "linear_mark_read" + "".join(ids)),
+        "project": name,
+        "item_ids": ids,
+        "sources": ["linear"],
+        "kind": "housekeeping",
+        "subject": "",
+        "summary": summary,
+        "link": "",
+        "urgency": "low",
+        "autonomy": "silent",
+        "action": {"type": "linear_mark_read", "params": {"notification_ids": [notification(i) for i in items]}},
+        "status": "approved",
+    }
+
+
+def entry(name, profile, group):
+    """Apply the needs-me rules to one deduped ask: what to do about it, who decides, how urgent."""
+    lead = group[0]
+    facts = {k: v for i in group for k, v in (i.get("facts") or {}).items()}
+    pr = PULL.search(lead["subject"]) or PULL.search(lead["link"])
+    ref = {"repo": pr[1], "number": int(pr[2])} if pr else None
+    action, summary, urgency = {"type": "none", "params": {}}, lead["summary"], "low"
+    kind = lead["kind"]
+    if kind == "review_request" and ref:
+        action, urgency = {"type": "gh_review", "params": {**ref, "event": "COMMENT"}}, "normal"
+    elif kind == "pr_status" and facts.get("mine") and ref:
+        broken = facts.get("mergeable") == "conflicting" or facts.get("checks") == "failing" or facts.get("review") == "changes_requested"
+        ready = facts.get("review") == "approved" and facts.get("checks") in ("passing", "none") and facts.get("mergeable") == "mergeable"
+        if broken:
+            action, urgency = {"type": "gh_fix_pr", "params": ref}, "normal"
+        elif ready:
+            summary += " — approved and green; merging is yours"  # merge is a never action: say so, never queue it
+    elif kind == "pr_comment" and ref:
+        action, urgency = {"type": "gh_fix_pr" if lead["actor"]["role"] == "bot" else "gh_thread_reply", "params": ref}, "normal"
+    elif kind in ("mention", "ticket_change"):
+        urgency = "normal"
+    rules = profile.get("urgency", {})
+    if {i["actor"]["name"] for i in group} & set(rules.get("people", [])) or {l for i in group for l in i.get("labels", [])} & set(rules.get("labels", [])):
+        urgency = "urgent"
+    autonomy, status = "draft", "pending"
+    if action["type"] == "none":
+        autonomy, status = "silent", "info"
+    elif action["type"] in profile["autonomy"]["silent"]:
+        autonomy, status = "silent", "approved"
+    ids = [i["id"] for i in group]
+    return {
+        "id": "q-" + digest(name + kind + canonical(lead["subject"]) + "".join(ids)),
+        "project": name,
+        "item_ids": ids,
+        "sources": sorted({i["source"] for i in group}),
+        "kind": kind,
+        "subject": canonical(lead["subject"]),
+        "summary": summary,
+        "link": lead["link"],
+        "urgency": urgency,
+        "autonomy": autonomy,
+        "action": action,
+        "status": status,
+    }
+
+
 def flags(args, *names):
     """--name value pairs; bare --name (no value) is True."""
     opts, args = {}, list(args)
