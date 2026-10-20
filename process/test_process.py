@@ -1120,6 +1120,51 @@ class DryRunExecuteTest(ExecuteTestCase):
         self.assertIn("only a dry run records skipped", self.process("execute", "result", "acme", self.review["id"], "skipped", expect=1))
 
 
+def ticket(identifier, **over):
+    """A candidate ticket as the next-work skill hands it to `process next`."""
+    base = {
+        "identifier": identifier,
+        "title": f"Ticket {identifier}",
+        "url": f"https://linear.app/acme/issue/{identifier}",
+        "state": "todo",
+        "assignee": "none",
+        "priority": 3,
+        "labels": [],
+        "blocked": False,
+        "created": "2026-10-01T12:00:00Z",
+    }
+    return {**base, **over}
+
+
+class NextWorkTestCase(TriageTestCase):
+    def next_work(self, *tickets, profile="acme"):
+        out = self.process("next", profile, stdin="".join(json.dumps(t) + "\n" for t in tickets))
+        return out, json.loads((self.profile_dir(profile) / "next.json").read_text())
+
+    def picks(self, result):
+        return [r["ref"] for r in result["recommendations"]]
+
+
+class NextWorkRankingTest(NextWorkTestCase):
+    def test_in_progress_comes_first_then_todo_by_priority_then_target_date_then_age(self):
+        _, result = self.next_work(
+            ticket("WID-1", priority=4),
+            ticket("WID-2", priority=2, target_date="2026-12-01"),
+            ticket("WID-3", priority=2, target_date="2026-11-01", created="2026-10-10T12:00:00Z"),
+            ticket("WID-4", priority=2, target_date="2026-11-01", created="2026-09-10T12:00:00Z"),
+            ticket("WID-5", state="in_progress", assignee="me", priority=4),
+        )
+
+        self.assertEqual(self.picks(result), ["WID-5", "WID-4", "WID-3"])
+        self.assertTrue(all(r["reason"].strip() for r in result["recommendations"]))
+        self.assertEqual(self.process("validate", "next_work", str(self.profile_dir() / "next.json")), "")
+
+    def test_in_staging_tickets_never_take_a_slot(self):
+        _, result = self.next_work(ticket("WID-1", state="in_staging", assignee="me", priority=1), ticket("WID-2"))
+
+        self.assertEqual(self.picks(result), ["WID-2"])
+
+
 class ContractTest(ProcessTestCase):
     def test_decisions_and_results_validate_against_the_shared_schema(self):
         approve = {"entry_id": "q-0123456789ab", "verdict": "approve", "draft": "Edited.", "reason": "too formal", "promote_to_silent": False, "at": "2026-10-20T13:05:00Z"}

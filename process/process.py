@@ -551,6 +551,35 @@ class Process:
         (pdir / "plan.json").unlink()
         self.out(f"committed {len(entries)} entr(ies) for {name}; superseded {len(superseded)}; {len(handled)} item(s) handled")
 
+    # -- next work --
+
+    def cmd_next(self, name, *args):
+        """Rank the next-work skill's candidate tickets (JSONL on stdin, or --file) into up to 3 recommendations, each
+        with its reason, and write them to next.json. All or nothing."""
+        opts = flags(args, "--file")
+        self.profile(name)
+        path = opts.get("--file") and self.inbox_file(name, opts["--file"])
+        tickets = self.parse_jsonl(path.read_text() if path else self.stdin.read(), "ticket")
+        problems = [f"ticket {n}: {e}" for n, t in enumerate(tickets, 1) for e in validate(t, "ticket")]
+        if problems:
+            raise SystemExit("process: nothing ranked, invalid tickets:\n" + "\n".join(problems))
+        now = self.clock()
+        free = [t for t in tickets if not t["blocked"]]
+        tiers = [
+            ("in_progress", [t for t in free if t["state"] == "in_progress" and t["assignee"] == "me"]),
+            ("todo", [t for t in free if t["state"] == "todo" and t["assignee"] != "other"]),
+        ]
+        picks = [recommend(tier, t, now) for tier, group in tiers for t in sorted(group, key=ticket_order)][:NEXT_SLOTS]
+        result = {"profile": name, "at": iso(now), "recommendations": picks, "afk": []}
+        problems = validate(result, "next_work")
+        if problems:
+            raise SystemExit("process: nothing written:\n" + "\n".join(f"  {p}" for p in problems))
+        self.write_json(self.profile_state(name) / "next.json", result)
+        if path:
+            path.unlink()
+        for n, r in enumerate(picks, 1):
+            self.out(f"{n}. {r['ref']}  {r['title']}  — {r['reason']}  {r['link']}")
+
     # -- executor side --
 
     def cmd_execute(self, *args):
@@ -1036,6 +1065,24 @@ def entry(name, profile, group):
         "action": action,
         "status": status,
     }
+
+
+NEXT_SLOTS = 3
+PRIORITY = {1: "urgent", 2: "high", 3: "medium", 4: "low"}
+TIER_LEADS = {"in_progress": "Already in progress", "todo": "Next in Todo"}
+
+
+def ticket_order(t):
+    """Priority (none last), then the project's target date (none last), then age (oldest first)."""
+    return (t["priority"] or 5, t.get("target_date") or "9999-99-99", t["created"])
+
+
+def recommend(tier, t, now):
+    created = datetime.fromisoformat(t["created"].replace("Z", "+00:00")).timestamp()
+    facts = [f"{PRIORITY[t['priority']]} priority"] if t["priority"] else []
+    facts += [f"project due {t['target_date']}"] if t.get("target_date") else []
+    facts.append(f"opened {max(0, int((now - created) // 86400))} days ago")
+    return {"tier": tier, "ref": t["identifier"], "title": t["title"], "link": t["url"], "reason": f"{TIER_LEADS[tier]}: {', '.join(facts)}"}
 
 
 def failure(phase, error):
