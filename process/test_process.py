@@ -1375,7 +1375,8 @@ class AfkLaunchTest(NextWorkTestCase):
         self.process("execute")
 
         calls = self.run_fake.calls
-        self.assertIn(["tmux", "new-session", "-d", "-s", "process-acme", "-c", str(self.workdir), "-P", "-F", "#{pane_id}"], calls)
+        # The session pins its afk project: a tmux server started from an afk worker would hand the watcher that one.
+        self.assertIn(["tmux", "new-session", "-d", "-s", "process-acme", "-c", str(self.workdir), "-e", "AFK_PROJECT=process-acme", "-P", "-F", "#{pane_id}"], calls)
         init = ["env", "TMUX_PANE=%7", "afk", "init", str(self.spec)]
         watch = ["tmux", "send-keys", "-t", "%7", "afk watch", "Enter"]
         self.assertLess(calls.index(init), calls.index(watch))

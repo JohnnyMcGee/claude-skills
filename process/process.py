@@ -770,7 +770,8 @@ class Process:
         try:
             self.run(["tmux", "has-session", "-t", f"={project}"])
         except subprocess.CalledProcessError:
-            pane = self.run(["tmux", "new-session", "-d", "-s", project, "-c", str(workdir), "-P", "-F", "#{pane_id}"]).strip()
+            # -e: the session's panes find their project even if the tmux server was started inside another afk project.
+            pane = self.run(["tmux", "new-session", "-d", "-s", project, "-c", str(workdir), "-e", f"AFK_PROJECT={project}", "-P", "-F", "#{pane_id}"]).strip()
             self.run(["env", f"TMUX_PANE={pane}", "afk", "init", str(spec)], cwd=workdir)  # binds the pane's session
             self.run(["tmux", "send-keys", "-t", pane, "afk watch", "Enter"])  # drives the workers through their phases
         return project, spec
