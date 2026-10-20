@@ -557,7 +557,7 @@ class Process:
         """Rank the next-work skill's candidate tickets (JSONL on stdin, or --file) into up to 3 recommendations, each
         with its reason, and write them to next.json. All or nothing."""
         opts = flags(args, "--file")
-        self.profile(name)
+        profile = self.profile(name)
         path = opts.get("--file") and self.inbox_file(name, opts["--file"])
         tickets = self.parse_jsonl(path.read_text() if path else self.stdin.read(), "ticket")
         problems = [f"ticket {n}: {e}" for n, t in enumerate(tickets, 1) for e in validate(t, "ticket")]
@@ -572,17 +572,45 @@ class Process:
             ("unblocked", unblocked),
             ("todo", [t for t in todo if t not in unblocked]),
         ]
-        picks = self.pr_fixes(name) + [recommend(tier, t, now) for tier, group in tiers for t in sorted(group, key=ticket_order)]
-        picks = picks[:NEXT_SLOTS]
+        ranked = [(tier, t) for tier, group in tiers for t in sorted(group, key=ticket_order)]
+        picks = (self.pr_fixes(name) + [recommend(tier, t, now) for tier, t in ranked])[:NEXT_SLOTS]
+        backlog = sorted((t for t in free if t["state"] == "backlog" and t["assignee"] != "other"), key=ticket_order)
+        entries = []
+        for t in backlog[: NEXT_SLOTS - len(picks)]:  # Todo is thin: Backlog fills the slots it leaves
+            pick = recommend("promote", t, now)
+            action = {"type": "linear_promote", "params": ticket_ref(t), "draft": f"Move {t['identifier']} from Backlog to Todo. {pick['reason']}."}
+            entries.append(self.next_entry(profile, action, f"Promote {t['identifier']} {t['title']} from Backlog to Todo", t))
+            picks.append({**pick, "entry_id": entries[-1]["id"]})
         result = {"profile": name, "at": iso(now), "recommendations": picks, "afk": []}
-        problems = validate(result, "next_work")
+        problems = validate(result, "next_work") + [f"{e['id']}: {p}" for e in entries for p in validate(e, "queue_entry")]
         if problems:
             raise SystemExit("process: nothing written:\n" + "\n".join(f"  {p}" for p in problems))
+        self.append_jsonl(self.state_root() / "queue.jsonl", entries)
         self.write_json(self.profile_state(name) / "next.json", result)
         if path:
             path.unlink()
         for n, r in enumerate(picks, 1):
             self.out(f"{n}. {r['ref']}  {r['title']}  — {r['reason']}  {r['link']}")
+
+    def next_entry(self, profile, action, summary, t):
+        """A queue entry for a promotion or AFK launch: drafted for my approval, unless I promoted its type to silent."""
+        silent = action["type"] in profile["autonomy"]["silent"]
+        return {
+            "id": "q-" + digest(profile["name"] + "next_work" + action["type"] + canonical(t["url"])),
+            "project": profile["name"],
+            "item_ids": [f"linear:{t['identifier']}"],
+            "sources": ["linear"],
+            "kind": "next_work",
+            "subject": canonical(t["url"]),
+            "summary": summary,
+            "link": t["url"],
+            "urgency": "normal",
+            "autonomy": "silent" if silent else "draft",
+            "action": action,
+            "status": "approved" if silent else "pending",
+            "run": self.read_json(self.state_root() / "run.json", {}).get("id") or iso(self.clock()),
+            "created": iso(self.clock()),
+        }
 
     def pr_fixes(self, name):
         """One recommendation per PR of mine with fixes waiting on my approval, most urgent first. Silent fixes are the
@@ -1093,12 +1121,16 @@ NEXT_SLOTS = 3
 PRIORITY = {1: "urgent", 2: "high", 3: "medium", 4: "low"}
 # A Todo ticket stays newly unblocked this long after its last blocker cleared, then it is just another Todo ticket.
 UNBLOCKED_AGE = 3 * 24 * 3600
-TIER_LEADS = {"in_progress": "Already in progress", "unblocked": "Unblocked {unblocked}", "todo": "Next in Todo"}
+TIER_LEADS = {"in_progress": "Already in progress", "unblocked": "Unblocked {unblocked}", "todo": "Next in Todo", "promote": "Todo is thin, so promote from Backlog"}
 
 
 def ticket_order(t):
     """Priority (none last), then the project's target date (none last), then age (oldest first)."""
     return (t["priority"] or 5, t.get("target_date") or "9999-99-99", t["created"])
+
+
+def ticket_ref(t):
+    return {"ticket": t["identifier"], "title": t["title"], "url": t["url"]}
 
 
 def recommend(tier, t, now):

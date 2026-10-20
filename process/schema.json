@@ -79,7 +79,21 @@
         "draft": {"description": "The outward-facing text (review body, reply, fix plan) for the human to approve or edit.", "type": "string"}
       },
       "anyOf": [
-        {"properties": {"type": {"enum": ["none", "slack_reply", "email_reply", "rsvp", "linear_promote", "linear_create_issue", "afk_launch"]}}},
+        {"properties": {"type": {"enum": ["none", "slack_reply", "email_reply", "rsvp", "linear_create_issue"]}}},
+        {
+          "properties": {
+            "type": {"enum": ["linear_promote", "afk_launch"]},
+            "params": {
+              "type": "object",
+              "required": ["ticket", "title", "url"],
+              "properties": {
+                "ticket": {"description": "The Linear identifier.", "type": "string", "pattern": "^[A-Za-z0-9]+-\\d+$"},
+                "title": {"type": "string", "minLength": 1},
+                "url": {"type": "string", "pattern": "^https?://"}
+              }
+            }
+          }
+        },
         {
           "properties": {
             "type": {"const": "gh_review"},
@@ -113,7 +127,7 @@
         "project": {"$ref": "#/$defs/name"},
         "item_ids": {"description": "Every item merged into this entry.", "type": "array", "minItems": 1, "items": {"type": "string"}},
         "sources": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/source"}},
-        "kind": {"anyOf": [{"$ref": "#/$defs/kind"}, {"const": "housekeeping"}]},
+        "kind": {"description": "The item kind it came from; housekeeping for a silent chore; next_work for a promotion or AFK launch next-work proposes.", "anyOf": [{"$ref": "#/$defs/kind"}, {"enum": ["housekeeping", "next_work"]}]},
         "subject": {"type": "string"},
         "summary": {"type": "string", "minLength": 1},
         "link": {"type": "string"},

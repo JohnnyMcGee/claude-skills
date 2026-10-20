@@ -1185,6 +1185,24 @@ class NextWorkRankingTest(NextWorkTestCase):
         self.assertEqual(self.picks(result), ["WID-2", "WID-1", "WID-3"])
         self.assertIn("Unblocked 2026-10-19", result["recommendations"][0]["reason"])
 
+    def test_backlog_fills_the_slots_todo_leaves_as_promotions_queued_for_my_approval(self):
+        _, result = self.next_work(ticket("WID-1"), ticket("WID-7", state="backlog", priority=4), ticket("WID-8", state="backlog", priority=2), ticket("WID-9", state="backlog", priority=3))
+
+        self.assertEqual(self.picks(result), ["WID-1", "WID-8", "WID-9"])
+        promotions = [e for e in self.queue() if e["action"]["type"] == "linear_promote"]
+        self.assertEqual([e["action"]["params"]["ticket"] for e in promotions], ["WID-8", "WID-9"])
+        self.assertEqual({(e["status"], e["autonomy"]) for e in promotions}, {("pending", "draft")})
+        self.assertEqual([r.get("entry_id") for r in result["recommendations"]], [None] + [e["id"] for e in promotions])
+        self.assertIn("Todo is thin", result["recommendations"][1]["reason"])
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+        self.assertEqual(self.run_fake.calls, [])  # proposed, never done
+
+    def test_backlog_is_left_alone_while_todo_fills_every_slot(self):
+        _, result = self.next_work(ticket("WID-1"), ticket("WID-2"), ticket("WID-3"), ticket("WID-8", state="backlog", priority=1))
+
+        self.assertEqual(self.picks(result), ["WID-1", "WID-2", "WID-3"])
+        self.assertEqual(self.queue(), [])
+
     def test_in_staging_tickets_never_take_a_slot(self):
         _, result = self.next_work(ticket("WID-1", state="in_staging", assignee="me", priority=1), ticket("WID-2"))
 
