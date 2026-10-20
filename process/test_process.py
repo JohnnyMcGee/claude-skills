@@ -755,6 +755,49 @@ class ExecutorStepsTest(ExecuteTestCase):
         self.assertEqual(self.entry(self.waiting["id"])["status"], "pending")
 
 
+class DryRunExecuteTest(ExecuteTestCase):
+    def setUp(self):
+        super().setUp()
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "dry-run").touch()  # what `process run --fixtures` leaves in a scratch state directory
+        self.emit(item())
+        [self.review] = self.triage()
+
+    def test_a_dry_run_executor_records_skipped_and_never_success(self):
+        self.decide(self.review)
+        self.process("execute")
+        self.assertEqual(self.executor_calls()[0][2], "/execute acme --dry-run")
+
+        self.assertIn("a dry run records skipped", self.process("execute", "result", "acme", self.review["id"], "success", expect=1))
+        self.process("execute", "result", "acme", self.review["id"], "skipped")
+
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual(result["outcome"], "skipped")
+        self.assertEqual(self.process("validate", "result", str(self.state / "results.jsonl")), "")
+        self.assertEqual((self.entry(self.review["id"])["status"], self.entry(self.review["id"])["note"]), ("skipped", "dry run"))
+
+    def test_a_dry_run_leaves_profiles_in_the_real_config_directory_alone(self):
+        real = self.tmp / ".config" / "process" / "profiles" / "acme.md"
+        real.parent.mkdir(parents=True)
+        real.write_text((self.tmp / "config" / "process" / "profiles" / "acme.md").read_text())
+        del self.env["XDG_CONFIG_HOME"]
+        before = real.read_text()
+        self.decide(self.review, "skip", reason="Noise", promote_to_silent=True)
+
+        out = self.process("execute")
+
+        self.assertIn("dry run: acme's profile is real, so no lesson or promotion is written", out)
+        self.assertEqual(real.read_text(), before)
+        self.assertEqual(self.entry(self.review["id"])["status"], "skipped")
+
+    def test_a_real_executor_never_records_skipped(self):
+        (self.state / "dry-run").unlink()
+        self.decide(self.review)
+        self.process("execute")
+
+        self.assertIn("only a dry run records skipped", self.process("execute", "result", "acme", self.review["id"], "skipped", expect=1))
+
+
 class ContractTest(ProcessTestCase):
     def test_decisions_and_results_validate_against_the_shared_schema(self):
         approve = {"entry_id": "q-0123456789ab", "verdict": "approve", "draft": "Edited.", "reason": "too formal", "promote_to_silent": False, "at": "2026-10-20T13:05:00Z"}

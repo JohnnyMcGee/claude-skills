@@ -593,10 +593,18 @@ class Process:
             queue[e["id"]] = e
             if e["status"] == "skipped":
                 self.handle(e["project"], [e], "skipped")
+            if (decision.get("promote_to_silent") or decision.get("reason", "").strip()) and self.real_profiles_in_dry_run():
+                self.out(f"process: dry run: {e['project']}'s profile is real, so no lesson or promotion is written")
+                continue
             if decision.get("promote_to_silent"):
                 self.promote(e["project"], e["action"]["type"])
             if decision.get("reason", "").strip():
                 self.learn(e, did, decision["reason"])
+
+    def real_profiles_in_dry_run(self):
+        """A dry run may teach only scratch profiles: an XDG_CONFIG_HOME other than ~/.config."""
+        real = Path(self.env["HOME"]) / ".config" / "process" / "profiles"
+        return (self.state_root() / "dry-run").exists() and self.profiles_dir().resolve() == real.resolve()
 
     def learn(self, e, did, reason):
         """A lesson is my reason, word for word, never a paraphrase: the profile is read by every phase, so nothing
@@ -644,17 +652,21 @@ class Process:
         self.out(f"{len(entries)} approved entr(ies) for {name}")
 
     def execute_result(self, name, entry_id, outcome, *args):
-        """Record what the executor did with one approved entry: success (--link), failure (--error)."""
+        """Record what the executor did with one approved entry: success (--link), failure (--error), or skipped in a
+        dry run."""
         opts = flags(args, "--link", "--error")
         found = [e for e in self.approved(name) if e["id"] == entry_id]
         if not found:
             raise SystemExit(f"process: {entry_id} is not approved for {name}; the executor acts only on approved entries")
+        dry = (self.state_root() / "dry-run").exists()
+        if dry != (outcome == "skipped"):
+            raise SystemExit("process: a dry run records skipped" if dry else "process: only a dry run records skipped")
         result = {"entry_id": entry_id, "outcome": outcome, **{k[2:]: v for k, v in opts.items() if isinstance(v, str)}, "at": iso(self.clock())}
         problems = validate(result, "result")
         if problems:
             raise SystemExit("process: result not recorded:\n" + "\n".join(f"  {p}" for p in problems))
-        status = {"success": "done", "failure": "failed"}[outcome]
-        note = result.get("link") or result.get("error")
+        status = {"success": "done", "failure": "failed", "skipped": "skipped"}[outcome]
+        note = result.get("link") or result.get("error") or ("dry run" if dry else None)
         e = {**found[0], "status": status, **({"note": note} if note else {})}
         self.append_jsonl(self.state_root() / "results.jsonl", [result])
         self.append_jsonl(self.state_root() / "queue.jsonl", [e])
