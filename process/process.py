@@ -4,6 +4,7 @@
 stdlib only. Every external command (claude) goes through run().
 """
 
+import fcntl
 import hashlib
 import inspect
 import json
@@ -308,10 +309,14 @@ class Process:
                     except (subprocess.CalledProcessError, OSError) as error:  # OSError: no workdir, no claude
                         problem = failure(phase, error)
                     self.report(run, name, problem)
+                lock = self.executor_lock()
                 try:  # what triage approved silently (bot fixes, merges of the base) happens now, not when I open proc
-                    problem = self.execute(profile, dry)
+                    problem = self.execute(profile, dry) if lock else "execute skipped: another executor is running"
                 except (subprocess.CalledProcessError, OSError) as error:
                     problem = failure("execute", error)
+                finally:
+                    if lock:
+                        lock.close()
                 self.report(run, name, problem)
             self.cmd_brief(*(["--delta"] if opts.get("--delta") else []), *(["--project", opts["--project"]] if opts.get("--project") else []))
         finally:
@@ -567,17 +572,34 @@ class Process:
         profiles = self.profiles()
         if opts.get("--project") and opts["--project"] not in profiles:
             raise SystemExit(f"process: no profile {opts['--project']!r} in {self.profiles_dir()}")
-        self.apply_decisions(profiles)
-        dry = (self.state_root() / "dry-run").exists()
-        failed = False
-        for name in [opts["--project"]] if opts.get("--project") else list(profiles):
-            try:
-                problem = self.execute(profiles[name], dry)
-            except (subprocess.CalledProcessError, OSError) as error:  # one profile's executor must not stop the rest
-                problem, failed = failure("execute", error), True
-            if problem:
-                self.out(f"process: {name}: {problem}")
+        lock = self.executor_lock()
+        if lock is None:
+            self.out("process: another executor is running; these decisions apply on the next run")
+            return 0
+        with lock:
+            self.apply_decisions(profiles)
+            dry = (self.state_root() / "dry-run").exists()
+            failed = False
+            for name in [opts["--project"]] if opts.get("--project") else list(profiles):
+                try:
+                    problem = self.execute(profiles[name], dry)
+                except (subprocess.CalledProcessError, OSError) as error:  # one profile's executor must not stop the rest
+                    problem, failed = failure("execute", error), True
+                if problem:
+                    self.out(f"process: {name}: {problem}")
         return 1 if failed else 0
+
+    def executor_lock(self):
+        """One executor at a time (proc's on quit, or a run's after triage), or both could send the same approved
+        review. Returns the held lock, released when closed or when this process exits; None if another holds it."""
+        self.state_root().mkdir(parents=True, exist_ok=True)
+        lock = (self.state_root() / "execute.lock").open("w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            return None
+        return lock
 
     def execute(self, profile, dry):
         """Run the executor phase for one profile when it has approved entries; return what went wrong, if anything.

@@ -732,6 +732,24 @@ class ExecuteTest(ExecuteTestCase):
         self.assertIn("process: acme: execute failed: [Errno 2] No such file or directory", out)
         self.assertEqual(self.entry(review["id"])["status"], "approved")  # still waits for the next run
 
+    def test_only_one_executor_runs_at_a_time(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review)
+        nested = []
+
+        def executor(cmd):  # while this executor runs, proc quits and starts another
+            nested.append(self.process("execute"))
+            nested.append(self.process("execute", "plan", "acme"))  # the running executor's own steps still work
+
+        self.run_fake.responses[("claude", "-p", "/execute acme")] = executor
+
+        self.process("execute")
+
+        self.assertIn("another executor is running", nested[0])
+        self.assertIn(review["id"], nested[1])
+        self.assertEqual(len(self.executor_calls()), 1)
+
     def test_a_decision_on_an_entry_no_longer_pending_changes_nothing(self):
         self.emit(item())
         [old] = self.triage()
@@ -1218,6 +1236,16 @@ class RunTest(ProcessTestCase):
 
         self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", "/triage acme", "/execute acme"])
         self.assertIn("> ⚠ execute left 1 approved entr(ies) without a result", (self.state / "brief.md").read_text())
+
+    def test_run_skips_its_executor_while_procs_executor_is_running(self):
+        self.write_profile("acme")
+        self.state.mkdir(parents=True, exist_ok=True)
+        with (self.state / "execute.lock").open("w") as held:
+            process.fcntl.flock(held, process.fcntl.LOCK_EX | process.fcntl.LOCK_NB)
+            prompts = self.silent_fix_run()
+
+        self.assertNotIn("/execute acme", prompts)
+        self.assertIn("> ⚠ execute skipped: another executor is running", (self.state / "brief.md").read_text())
 
     def test_a_dry_run_executes_as_a_dry_run_with_no_service_tools(self):
         self.write_profile("acme", execute_tools=["Bash(process execute plan:*)", "mcp__github__add_issue_comment"])
