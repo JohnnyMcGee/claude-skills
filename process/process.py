@@ -291,6 +291,13 @@ class Process:
         path.mkdir(exist_ok=True)
         return path
 
+    def inbox_file(self, name, path):
+        """A --file argument, refused before any read or delete unless it sits directly in the profile's inbox."""
+        path = Path(path).resolve()
+        if path.parent != self.inbox(name).resolve():
+            raise SystemExit(f"process: {path} is outside the {name} inbox ({self.inbox(name)}); write it there first")
+        return path
+
     def watermarks(self, name):
         return self.read_json(self.state_root() / "profiles" / name / "watermarks.json", {})
 
@@ -346,7 +353,8 @@ class Process:
     def cmd_emit(self, profile, source, *args):
         """Store a sweeper's candidate items (JSONL on stdin, or --file) and advance its watermark."""
         opts = flags(args, "--watermark", "--file")
-        text = Path(opts["--file"]).read_text() if opts.get("--file") else self.stdin.read()
+        path = opts.get("--file") and self.inbox_file(profile, opts["--file"])
+        text = path.read_text() if path else self.stdin.read()
         pdir = self.profile_state(profile)
         known = {i["id"] for i in self.read_jsonl(pdir / "items.jsonl")}
         fresh, problems = [], []
@@ -366,8 +374,8 @@ class Process:
         marks = self.read_json(pdir / "watermarks.json", {})
         marks[source] = opts.get("--watermark") or iso(self.clock())
         self.write_json(pdir / "watermarks.json", marks)
-        if opts.get("--file"):
-            Path(opts["--file"]).unlink()  # consumed, so a later sweep can never re-send it
+        if path:
+            path.unlink()  # consumed, so a later sweep can never re-send it
         self.out(f"stored {len(fresh)} new item(s) for {profile}/{source}; watermark {marks[source]}")
 
     def cmd_watermark(self, profile, source):
@@ -442,10 +450,11 @@ class Process:
     def triage_draft(self, name, entry_id, *args):
         """Set an entry's draft from stdin, or from --file (consumed)."""
         opts = flags(args, "--file")
+        path = opts.get("--file") and self.inbox_file(name, opts["--file"])
         plan, e = self.plan_entry(name, entry_id)
-        e["action"]["draft"] = (Path(opts["--file"]).read_text() if opts.get("--file") else self.stdin.read()).strip()
-        if opts.get("--file"):
-            Path(opts["--file"]).unlink()
+        e["action"]["draft"] = (path.read_text() if path else self.stdin.read()).strip()
+        if path:
+            path.unlink()
         self.write_json(self.profile_state(name) / "plan.json", plan)
 
     def triage_silent(self, name, entry_id, outcome, note=None):

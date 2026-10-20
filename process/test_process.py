@@ -165,6 +165,15 @@ class EmitTest(ProcessTestCase):
         self.assertEqual(len(self.jsonl(self.profile_dir() / "items.jsonl")), 1)
         self.assertFalse((inbox / "github.jsonl").exists())
 
+    def test_a_file_outside_the_inbox_is_refused_and_left_alone(self):
+        secret = self.tmp / "id_rsa"
+        secret.write_text("")
+
+        self.assertIn("outside", self.process("emit", "acme", "github", "--file", str(secret), expect=1))
+
+        self.assertTrue(secret.exists())
+        self.assertEqual(self.process("watermark", "acme", "github"), "")
+
     def test_a_missing_argument_prints_the_commands_usage(self):
         self.assertIn("usage: process emit <profile> <source>", self.process("emit", "acme", expect=2))
         self.assertIn("usage: process triage <step> <profile>", self.process("triage", "plan", expect=2))
@@ -303,6 +312,17 @@ class TriageRulesTest(TriageTestCase):
 
         self.assertEqual(self.plan()["entries"][0]["action"]["draft"], "Two questions on the export.")
         self.assertFalse(draft.exists())
+
+    def test_a_draft_file_outside_the_inbox_is_refused_and_left_alone(self):
+        self.emit(item())
+        self.process("triage", "plan", "acme")
+        [review] = self.plan()["entries"]
+        secret = self.tmp / "id_rsa"
+        secret.write_text("PRIVATE KEY")
+
+        self.assertIn("outside", self.process("triage", "draft", "acme", review["id"], "--file", str(secret), expect=1))
+        self.assertTrue(secret.exists())
+        self.assertNotIn("draft", self.plan()["entries"][0]["action"])
 
     def test_silent_outcomes_are_only_for_actions_triage_performs_itself(self):
         self.emit(item())
