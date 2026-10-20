@@ -569,6 +569,8 @@ class Process:
     def file_unsorted(self):
         """Shared-source items no profile claimed become FYI entries of their own: no project's rules apply to them."""
         items = self.unhandled(UNSORTED)
+        if not items:
+            return
         bare = {"autonomy": {"silent": []}}
         entries = [{**entry(UNSORTED, bare, g), "autonomy": "silent", "action": {"type": "none", "params": {}}, "status": "info"} for g in asks(items)]
         self.record(UNSORTED, self.stamp(entries), [i["id"] for i in items])
