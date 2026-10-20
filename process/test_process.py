@@ -567,6 +567,19 @@ class RunTest(ProcessTestCase):
         self.assertIn("scratch XDG_STATE_HOME", self.process("run", "--fixtures", "/fx", expect=1))
         self.assertEqual(self.claude_calls(), [])
 
+    def test_a_dry_run_refuses_any_used_state_directory_even_before_its_first_queue(self):
+        self.write_profile("acme")
+        self.emit(item())  # a real sweep ran, triage has not yet
+
+        self.assertIn("scratch XDG_STATE_HOME", self.process("run", "--fixtures", "/fx", expect=1))
+        self.assertFalse((self.state / "dry-run").exists())
+
+    def test_a_real_run_refuses_a_dry_run_state_directory(self):
+        self.write_profile("acme")
+        self.process("run", "--fixtures", "/fx")
+
+        self.assertIn("holds dry-run data", self.process("run", expect=1))
+
     def test_a_missing_workdir_is_reported_and_the_run_carries_on(self):
         self.write_profile("acme")
         self.write_profile("side")

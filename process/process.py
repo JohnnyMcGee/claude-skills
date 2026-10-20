@@ -255,6 +255,8 @@ class Process:
         if dry:
             self.guard_dry_run()
             opts["--fixtures"] = os.path.abspath(opts["--fixtures"])  # phases run in the profile's workdir
+        elif (self.state_root() / "dry-run").exists():
+            raise SystemExit(f"process: {self.state_root()} holds dry-run data; unset XDG_STATE_HOME for a real run")
         profiles = self.profiles()  # refuses before any phase starts if one grants a send tool
         if opts.get("--project") and opts["--project"] not in profiles:
             raise SystemExit(f"process: no profile {opts['--project']!r} in {self.profiles_dir()}")
@@ -307,10 +309,10 @@ class Process:
         return [i for i in self.read_jsonl(pdir / "items.jsonl") if i["id"] not in handled]
 
     def guard_dry_run(self):
-        """A dry run writes only to a scratch state directory: never the default one, never one a real run used."""
+        """A dry run writes only to a scratch state directory: absent, empty or already a dry run's, never the default."""
         root = self.state_root()
         real = Path(self.env["HOME"]) / ".local" / "state" / "process"
-        used = (root / "queue.jsonl").exists() and not (root / "dry-run").exists()
+        used = root.exists() and any(root.iterdir()) and not (root / "dry-run").exists()  # absent, empty or marked only
         if root.resolve() == real.resolve() or used:
             raise SystemExit(f"process: a --fixtures dry run needs a scratch XDG_STATE_HOME, not the real queue in {root}")
         root.mkdir(parents=True, exist_ok=True)
