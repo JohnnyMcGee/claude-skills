@@ -563,6 +563,7 @@ class Process:
         if plan is None:
             raise SystemExit(f"process: no triage plan for {name}; run `process triage plan {name}` first")
         entries = self.stamp(plan["entries"])
+        items = {i["id"]: i for i in self.read_jsonl(pdir / "items.jsonl")}
         problems = []
         for e in entries:
             problems += [f"{e['id']}: {p}" for p in validate(e, "queue_entry")]
@@ -570,6 +571,9 @@ class Process:
                 problems.append(f"{e['id']}: no draft (process triage draft {name} {e['id']})")
             if e["action"]["type"] in TRIAGE_ACTIONS and e["status"] == "approved":
                 problems.append(f"{e['id']}: no outcome (process triage silent {name} {e['id']} done|failed|skipped)")
+            declined = e["action"]["type"] == "rsvp" and e["action"]["params"].get("response") == "declined"
+            if declined and protected_meeting(self.profile(name), [items[i] for i in e["item_ids"] if i in items]):
+                problems.append(f"{e['id']}: never decline a meeting with external guests or my manager")
         if problems:
             raise SystemExit("process: nothing committed:\n" + "\n".join(f"  {p}" for p in problems))
         handled = list(dict.fromkeys([i for e in entries for i in e["item_ids"]] + plan["dropped"]))
@@ -704,6 +708,15 @@ def render_project(entries):
     return lines
 
 
+def protected_meeting(profile, items):
+    """A meeting with external guests or my manager: declining it is a never action."""
+    manager = profile.get("google", {}).get("manager", "").lower()
+    return any(
+        (i.get("facts") or {}).get("external_guests") or (i.get("facts") or {}).get("with_manager") or (manager and i["actor"]["name"].lower() == manager)
+        for i in items
+    )
+
+
 def entry(name, profile, group):
     """Apply the needs-me rules to one deduped ask: what to do about it, who decides, how urgent."""
     lead = group[0]
@@ -723,6 +736,11 @@ def entry(name, profile, group):
             summary += " — approved and green; merging is yours"  # merge is a never action: say so, never queue it
     elif kind == "pr_comment" and ref:
         action, urgency = {"type": "gh_fix_pr" if lead["actor"]["role"] == "bot" else "gh_thread_reply", "params": ref}, "normal"
+    elif kind == "invite":
+        conflicts = facts.get("conflicts") or []
+        response = "tentative" if conflicts and protected_meeting(profile, group) else "declined" if conflicts else "accepted"
+        action, urgency = {"type": "rsvp", "params": {"event_id": lead["native_id"], "response": response}}, "normal"
+        summary += f" — conflicts with {', '.join(conflicts)}" if conflicts else ""
     elif kind == "action_item" and "linear" in profile:  # meeting commitments land in Triage so next-work sees them
         params = {"team": profile["linear"]["team"], "state": "Triage", "assignee": "me", "link": lead["link"]}
         action, urgency = {"type": "linear_create_issue", "params": params}, "normal"

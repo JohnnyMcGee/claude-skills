@@ -85,7 +85,20 @@
         "draft": {"description": "The outward-facing text (review body, reply, fix plan) for the human to approve or edit.", "type": "string"}
       },
       "anyOf": [
-        {"properties": {"type": {"enum": ["none", "email_reply", "rsvp", "linear_promote", "afk_launch"]}}},
+        {"properties": {"type": {"enum": ["none", "email_reply", "linear_promote", "afk_launch"]}}},
+        {
+          "properties": {
+            "type": {"const": "rsvp"},
+            "params": {
+              "type": "object",
+              "required": ["event_id", "response"],
+              "properties": {
+                "event_id": {"type": "string", "minLength": 1},
+                "response": {"description": "declined is never proposed for a meeting with external guests or my manager.", "enum": ["accepted", "tentative", "declined"]}
+              }
+            }
+          }
+        },
         {
           "properties": {
             "type": {"const": "slack_reply"},

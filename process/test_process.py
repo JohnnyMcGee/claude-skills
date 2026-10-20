@@ -568,6 +568,54 @@ class MeetingsTriageTest(TriageTestCase):
         self.assertEqual([e["action"]["type"] for e in self.triage()], ["linear_create_issue", "none"])
 
 
+class CalendarTriageTest(TriageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def rsvp(self, **over):
+        self.emit(invite(**over), source="calendar")
+        return self.triage()[-1]
+
+    def test_a_pending_invite_with_no_conflict_gets_a_drafted_accept(self):
+        rsvp = self.rsvp()
+
+        self.assertEqual(rsvp["action"]["type"], "rsvp")
+        self.assertEqual(rsvp["action"]["params"], {"event_id": "event-1", "response": "accepted"})
+        self.assertEqual((rsvp["autonomy"], rsvp["status"]), ("draft", "pending"))
+
+    def test_a_conflicting_invite_is_proposed_declined_unless_external_guests_or_my_manager_are_in_it(self):
+        cases = {
+            "internal": ({"external_guests": False, "with_manager": False}, "dee@acme.example", "declined"),
+            "external guests": ({"external_guests": True, "with_manager": False}, "dee@acme.example", "tentative"),
+            "manager attends": ({"external_guests": False, "with_manager": True}, "dee@acme.example", "tentative"),
+            "manager organizes": ({"external_guests": False, "with_manager": False}, "boss@acme.example", "tentative"),
+        }
+        for n, (case, (facts, organizer, response)) in enumerate(cases.items()):
+            with self.subTest(case=case):
+                rsvp = self.rsvp(native_id=f"event-{n}", subject=f"https://calendar.google.com/calendar/event?eid=event-{n}", actor={"name": organizer, "role": "person"}, facts={**facts, "conflicts": ["1:1 with Ana"]})
+
+                self.assertEqual(rsvp["action"]["params"]["response"], response)
+                self.assertIn("conflicts with 1:1 with Ana", rsvp["summary"])
+
+    def test_a_plan_edited_into_declining_a_meeting_with_external_guests_or_my_manager_is_refused(self):
+        for n, facts in enumerate(({"external_guests": True}, {"with_manager": True})):
+            with self.subTest(facts=facts):
+                self.emit(invite(native_id=f"event-{n}", facts={"conflicts": [], **facts}), source="calendar")
+                self.process("triage", "plan", "acme")
+                path = self.profile_dir() / "plan.json"
+                plan = json.loads(path.read_text())
+                plan["entries"][0]["action"]["params"]["response"] = "declined"
+                plan["entries"][0]["action"]["draft"] = "Can't make it."
+                path.write_text(json.dumps(plan))
+
+                out = self.process("triage", "commit", "acme", expect=1)
+
+                self.assertIn("never decline", out)
+                self.assertEqual(self.jsonl(self.state / "queue.jsonl"), [])
+                path.unlink()
+
+
 class LinearInboxTest(TriageTestCase):
     def notification(self, n, days_old):
         stamp = process.iso(NOW - days_old * 86400)
