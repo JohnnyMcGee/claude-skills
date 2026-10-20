@@ -289,11 +289,13 @@
           }
         },
         "urgency": {
+          "description": "The only rules that mark an entry urgent. Everything else is at most normal. A merged entry is urgent when any of its items matches.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "people": {"description": "Actors whose asks are urgent (e.g. my manager).", "type": "array", "items": {"type": "string"}},
-            "labels": {"description": "Labels that make an item urgent (e.g. deploy-blocking).", "type": "array", "items": {"type": "string"}}
+            "people": {"description": "Actors whose DMs and mentions of me are urgent (e.g. my manager). Their other items are not.", "type": "array", "items": {"type": "string"}},
+            "channels": {"description": "Slack channels, glob patterns allowed (e.g. #incident-*), where a mention of me is urgent. A message there that doesn't mention me is not.", "type": "array", "items": {"type": "string", "pattern": "^#"}},
+            "labels": {"description": "PR labels that make a review request urgent (e.g. deploy-blocking). Other items carrying them are not.", "type": "array", "items": {"type": "string"}}
           }
         },
         "autonomy": {

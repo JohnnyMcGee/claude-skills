@@ -5,6 +5,7 @@ stdlib only. Every external command (claude) goes through run().
 """
 
 import fcntl
+import fnmatch
 import hashlib
 import inspect
 import json
@@ -1151,10 +1152,12 @@ def protected_meeting(profile, items):
 
 
 def urgent(rules, i):
-    """The profile's [urgency] rules, the only things that interrupt me: a DM or mention from one of its people, or a
-    review request whose PR carries one of its labels."""
+    """The profile's [urgency] rules, the only things that interrupt me: a DM or mention from one of its people, a
+    mention in one of its channels (incident-*), or a review request whose PR carries one of its labels."""
+    channel = (i.get("facts") or {}).get("channel", "").lower()
     return (
         i["kind"] in ("dm", "mention") and i["actor"]["name"] in rules.get("people", [])
+        or i["kind"] == "mention" and any(fnmatch.fnmatchcase(channel, c.lower()) for c in rules.get("channels", []))
         or i["kind"] == "review_request" and bool(set(i.get("labels", [])) & set(rules.get("labels", [])))
     )
 

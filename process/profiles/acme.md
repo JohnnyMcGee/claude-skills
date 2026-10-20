@@ -38,7 +38,12 @@ channels = ["#widgets"]
 senders = ["@acme.example"]
 
 [urgency]
-people = ["my-manager"]
+# The only things that interrupt me (proc notify). Everything else waits for the brief.
+# A DM or a mention from these people, by the name each source shows (Slack and Linear name, GitHub login).
+people = ["Mo", "mo-acme"]
+# A mention of me in these Slack channels (glob patterns allowed). Other messages there are not urgent.
+channels = ["#incidents", "#incident-*"]
+# A review request whose PR carries one of these labels.
 labels = ["deploy-blocking"]
 
 [autonomy]

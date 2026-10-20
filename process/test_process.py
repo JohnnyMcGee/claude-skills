@@ -65,6 +65,7 @@ team = "{team}"
 {extra}
 [urgency]
 people = ["boss"]
+channels = ["#incident-*"]
 labels = ["deploy-blocking"]
 
 [autonomy]
@@ -484,6 +485,16 @@ class UrgencyTest(TriageTestCase):
         self.emit(linear(native_id="issue/WID-20", kind="ticket_change", subject="https://linear.app/acme/issue/WID-20", actor={"name": "boss", "role": "person"}, summary="Boss moved WID-20's due date up", facts={}), source="linear")
 
         self.assertEqual(self.urgent(), [])
+
+    def test_a_mention_in_an_incident_channel_is_urgent_but_an_incident_message_that_does_not_mention_me_is_not(self):
+        self.emit(
+            slack(native_id="C9/1", summary="Ops asked you in #incident-db to check the replica lag", facts={"channel": "#incident-db", "ask": "question"}),
+            slack(native_id="C9/2", kind="channel_message", summary="Ops posted an update in #incident-db", facts={"channel": "#incident-db"}),
+            slack(native_id="C1/3", summary="Dee asked you in #deploys about the index", facts={"channel": "#deploys", "ask": "question"}),
+            source="slack",
+        )
+
+        self.assertEqual(self.urgent(), ["Ops asked you in #incident-db to check the replica lag"])
 
     def test_a_review_request_labeled_deploy_blocking_is_urgent_but_the_label_elsewhere_is_not(self):
         self.emit(
