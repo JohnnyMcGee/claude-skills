@@ -682,9 +682,13 @@ def needs_draft(e):
 
 
 def canonical(url):
-    """Same thing, same key: lower-case host, no query, no trailing slash. Fragments stay (they name a comment)."""
+    """Same thing, same key: lower-case host, no trailing slash, no tracking parameters. The rest of the query stays,
+    sorted (a calendar event or Slack thread is named by it), and so do fragments (they name a comment)."""
     match = re.match(r"(https?://)([^/]+)([^?#]*)(\?[^#]*)?(#.*)?$", url)
-    return match[1] + match[2].lower() + match[3].rstrip("/") + (match[5] or "") if match else url
+    if not match:
+        return url
+    params = sorted(p for p in (match[4] or "?")[1:].split("&") if p and not p.startswith("utm_"))
+    return match[1] + match[2].lower() + match[3].rstrip("/") + ("?" + "&".join(params) if params else "") + (match[5] or "")
 
 
 def notification(i):

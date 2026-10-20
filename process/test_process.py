@@ -610,6 +610,11 @@ class CalendarTriageTest(TriageTestCase):
         self.emit(invite(**over), source="calendar")
         return self.triage()[-1]
 
+    def test_invites_whose_links_differ_only_in_the_query_stay_separate(self):
+        self.emit(invite(), invite(native_id="event-2", subject="https://calendar.google.com/calendar/event?eid=event-2"), source="calendar")
+
+        self.assertEqual([e["action"]["params"]["event_id"] for e in self.triage()], ["event-1", "event-2"])
+
     def test_a_pending_invite_with_no_conflict_gets_a_drafted_accept(self):
         rsvp = self.rsvp()
 
