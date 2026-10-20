@@ -545,6 +545,29 @@ class SlackTriageTest(TriageTestCase):
         self.assertEqual((fyi["status"], fyi["action"]["type"], fyi["urgency"]), ("info", "none", "low"))
 
 
+class MeetingsTriageTest(TriageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def test_my_meeting_action_item_becomes_a_ticket_in_triage_assigned_to_me_linking_to_the_notes(self):
+        self.emit(action_item(), source="meetings")
+
+        [ticket] = self.triage(note="https://linear.app/acme/issue/WID-31")
+
+        self.assertEqual(ticket["action"]["type"], "linear_create_issue")
+        self.assertEqual(ticket["action"]["params"], {"team": "WID", "state": "Triage", "assignee": "me", "link": "https://docs.google.com/document/d/doc-1"})
+        self.assertEqual((ticket["autonomy"], ticket["status"]), ("silent", "done"))
+
+    def test_an_action_item_already_ticketed_is_not_ticketed_again_when_the_notes_change(self):
+        self.emit(action_item(), source="meetings")
+        self.triage(note="https://linear.app/acme/issue/WID-31")
+
+        self.emit(action_item(version="2026-10-20T09:00:00Z"), source="meetings")
+
+        self.assertEqual([e["action"]["type"] for e in self.triage()], ["linear_create_issue", "none"])
+
+
 class LinearInboxTest(TriageTestCase):
     def notification(self, n, days_old):
         stamp = process.iso(NOW - days_old * 86400)

@@ -723,6 +723,9 @@ def entry(name, profile, group):
             summary += " — approved and green; merging is yours"  # merge is a never action: say so, never queue it
     elif kind == "pr_comment" and ref:
         action, urgency = {"type": "gh_fix_pr" if lead["actor"]["role"] == "bot" else "gh_thread_reply", "params": ref}, "normal"
+    elif kind == "action_item" and "linear" in profile:  # meeting commitments land in Triage so next-work sees them
+        params = {"team": profile["linear"]["team"], "state": "Triage", "assignee": "me", "link": lead["link"]}
+        action, urgency = {"type": "linear_create_issue", "params": params}, "normal"
     elif lead["source"] == "slack" and facts.get("ask") == "task" and "linear" in profile:  # an immediate ask: a ticket for me, linking back
         action, urgency = {"type": "linear_create_issue", "params": {"team": profile["linear"]["team"], "assignee": "me", "link": lead["link"]}}, "normal"
     elif lead["source"] == "slack" and facts.get("ask"):
