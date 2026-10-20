@@ -62,7 +62,7 @@ Run by `process run` as `/sweep-github <profile> [--delta] [--fixtures <dir>]`.
 
 ### sweep-gmail
 
-The Gmail sweeper of process. It reads the inbox and classifies each thread by its latest message: an ask (triage drafts a reply), FYI, or noise (newsletters and notification mail, which triage labels and archives silently). Read-only. Gmail must be connected with modify scope for triage's archiving.
+The Gmail sweeper of process. It reads the inbox and classifies each thread by its latest message: an ask (triage drafts a reply), FYI, or noise (newsletters and notification mail, which triage labels and archives silently). Read-only. Gmail must be connected with modify scope for triage's archiving, and the profile's `noise_label` must already exist in Gmail.
 
 Run by `process run` as `/sweep-gmail <profile> [--delta] [--fixtures <dir>]`.
 

@@ -275,7 +275,7 @@
           "properties": {
             "account": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$"},
             "manager": {"description": "My manager's email. Declining a meeting they organize or attend is never proposed.", "type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$"},
-            "noise_label": {"description": "The Gmail label noise is filed under when it is archived.", "type": "string", "minLength": 1}
+            "noise_label": {"description": "The Gmail label noise is filed under when it is archived. It must already exist: triage cannot create labels.", "type": "string", "minLength": 1}
           }
         },
         "match": {

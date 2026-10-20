@@ -58,7 +58,7 @@ process triage silent <profile> <entry id> skipped "<why>"
 |---|---|
 | `linear_mark_read` | Mark each notification id in its params read with `mcp__linear-server__mark_notification`. |
 | `linear_create_issue` | **First look for an existing ticket**: `mcp__linear-server__list_issues` in the params' team, searching for the ask's key words and for the params' `link`. If an open ticket already covers the ask, create nothing and report `skipped "already tracked: <its URL>"`. Otherwise create it with `mcp__linear-server__create_issue`: the params' team, assigned to me, in the params' `state` when it names one. The title is a short imperative from the entry's summary. The description is what was asked and by whom, plus `From: <link>`. Attach the params' `link` too. Report `done "<new ticket URL>"`. |
-| `gmail_archive` | For each thread id in its params, add the params' `label` (`mcp__claude_ai_Gmail__list_labels` for its id) with `label_thread`, then remove `INBOX` with `unlabel_thread`. Never trash or mark spam. |
+| `gmail_archive` | For each thread id in its params, add the params' `label` (`mcp__claude_ai_Gmail__list_labels` for its id) with `label_thread`, then remove `INBOX` with `unlabel_thread`. Never trash or mark spam. You can't create labels: if the label doesn't exist, report `failed "no Gmail label <label>: create it"`. If a label call fails with a scope or permission error, report `failed "Gmail needs reconnecting with modify scope"`. |
 
 With `--dry-run`, call no service tool. Report `skipped "dry run"` for each entry, except for a `linear_create_issue` whose ask is already covered by a ticket in `<fixtures>/linear.json` (`issues`): report that one `skipped "already tracked: <its URL>"`.
 

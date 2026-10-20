@@ -16,7 +16,7 @@ You turn the action items I own in Gemini's meeting notes into **items** and han
 - Read the profile with `process profile <profile>`. It prints the profile's path, your `inbox:` directory (the one place you may write files), then the profile: `[google] account` and the **How to sweep** section, which can say which meetings matter. Apply that section throughout.
 - A `shared meetings:` line means other profiles use the same account. Sweep it once for all of them; `emit` decides which project each item belongs to.
 - **Start**: `date -u +%Y-%m-%dT%H:%M:%SZ`, run before any read. It becomes the new watermark.
-- **Window**: meetings that ended in the 48 hours before **start**. With `--delta`, `process watermark <profile> meetings`, and only meetings that ended after it.
+- **Window**: meetings that ended in the 48 hours before **start**, with or without `--delta`. Gemini's notes can land after a sweep has skipped their meeting for having none, and `emit` drops the action items it already holds.
 
 ## 2. Read
 

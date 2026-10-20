@@ -26,7 +26,7 @@ watchlist = ["#incidents", "#deploys"]
 account = "me@acme.example"
 # Declining a meeting my manager organizes or attends is never proposed.
 manager = "boss@acme.example"
-# Noise mail is filed under this label as it is archived.
+# Noise mail is filed under this label as it is archived. Create it in Gmail first: triage cannot create labels.
 noise_label = "Noise"
 
 [match]
