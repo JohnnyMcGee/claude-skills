@@ -581,6 +581,50 @@ class ExecuteTest(ExecuteTestCase):
         self.assertEqual(self.executor_calls(), [])
 
 
+class ExecutorStepsTest(ExecuteTestCase):
+    def setUp(self):
+        super().setUp()
+        self.emit(item(), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", summary="Ben requested your review on #102"))
+        self.review, self.waiting = self.triage()
+        self.decide(self.review, draft="Two questions on the export.")
+        self.process("execute")
+
+    def test_the_plan_lists_only_approved_entries_with_their_final_draft(self):
+        out = self.process("execute", "plan", "acme")
+
+        self.assertIn(self.review["id"], out)
+        self.assertIn('gh_review {"repo": "acme/widgets", "number": 101, "event": "COMMENT"}', out)
+        self.assertIn("| Two questions on the export.", out)
+        self.assertNotIn(self.waiting["id"], out)
+
+    def test_a_result_is_recorded_schema_valid_and_closes_the_entry(self):
+        link = "https://github.com/acme/widgets/pull/101#pullrequestreview-1"
+
+        self.process("execute", "result", "acme", self.review["id"], "success", "--link", link)
+
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual(result, {"entry_id": self.review["id"], "outcome": "success", "link": link, "at": process.iso(self.now)})
+        self.assertEqual(self.process("validate", "result", str(self.state / "results.jsonl")), "")
+        done = self.entry(self.review["id"])
+        self.assertEqual((done["status"], done["note"]), ("done", link))
+        self.assertIn({"item_id": self.review["item_ids"][0], "at": process.iso(self.now), "entry_id": self.review["id"], "outcome": "done"}, self.jsonl(self.profile_dir() / "ledger.jsonl"))
+        self.assertNotIn(self.review["id"], self.process("execute", "plan", "acme"))
+
+    def test_a_failure_records_its_error(self):
+        self.process("execute", "result", "acme", self.review["id"], "failure", "--error", "403 from GitHub")
+
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual((result["outcome"], result["error"]), ("failure", "403 from GitHub"))
+        self.assertEqual((self.entry(self.review["id"])["status"], self.entry(self.review["id"])["note"]), ("failed", "403 from GitHub"))
+
+    def test_a_result_for_an_entry_i_did_not_approve_is_refused(self):
+        out = self.process("execute", "result", "acme", self.waiting["id"], "success", expect=1)
+
+        self.assertIn("not approved", out)
+        self.assertEqual(self.jsonl(self.state / "results.jsonl"), [])
+        self.assertEqual(self.entry(self.waiting["id"])["status"], "pending")
+
+
 class ContractTest(ProcessTestCase):
     def test_decisions_and_results_validate_against_the_shared_schema(self):
         approve = {"entry_id": "q-0123456789ab", "verdict": "approve", "draft": "Edited.", "reason": "too formal", "promote_to_silent": False, "at": "2026-10-20T13:05:00Z"}

@@ -504,7 +504,11 @@ class Process:
 
     def cmd_execute(self, *args):
         """Apply proc's decisions to the queue, then run the executor headless for each profile (or --project) that
-        has approved actions waiting. proc runs this when I quit it; `process run` runs it after triage."""
+        has approved actions waiting. proc runs this when I quit it; `process run` runs it after triage. The executor
+        skill drives the steps: `process execute plan|result <profile> ...`."""
+        steps = {"plan": self.execute_plan, "result": self.execute_result}
+        if args and args[0] in steps:
+            return call(steps[args[0]], args[1:], f"execute {args[0]}")
         opts = flags(args, "--project")
         profiles = self.profiles()
         if opts.get("--project") and opts["--project"] not in profiles:
@@ -543,6 +547,33 @@ class Process:
         self.append_jsonl(self.state_root() / "queue.jsonl", changed)
         for name, entries in handled.items():
             self.handle(name, entries, "skipped")
+
+    def execute_plan(self, name):
+        """Print every approved entry for the executor: its action, params, link and the exact text to send."""
+        self.profile(name)
+        entries = self.approved(name)
+        for e in entries:
+            self.out(f"{e['id']}  {e['action']['type']} {json.dumps(e['action']['params'])}  {e['summary']}  {e['link']}")
+            self.out(indent(e["action"]["draft"], "    | ", limit=None))
+        self.out(f"{len(entries)} approved entr(ies) for {name}")
+
+    def execute_result(self, name, entry_id, outcome, *args):
+        """Record what the executor did with one approved entry: success (--link), failure (--error)."""
+        opts = flags(args, "--link", "--error")
+        found = [e for e in self.approved(name) if e["id"] == entry_id]
+        if not found:
+            raise SystemExit(f"process: {entry_id} is not approved for {name}; the executor acts only on approved entries")
+        result = {"entry_id": entry_id, "outcome": outcome, **{k[2:]: v for k, v in opts.items() if isinstance(v, str)}, "at": iso(self.clock())}
+        problems = validate(result, "result")
+        if problems:
+            raise SystemExit("process: result not recorded:\n" + "\n".join(f"  {p}" for p in problems))
+        status = {"success": "done", "failure": "failed"}[outcome]
+        note = result.get("link") or result.get("error")
+        e = {**found[0], "status": status, **({"note": note} if note else {})}
+        self.append_jsonl(self.state_root() / "results.jsonl", [result])
+        self.append_jsonl(self.state_root() / "queue.jsonl", [e])
+        self.handle(name, [e], status)
+        self.out(f"{entry_id}: {status}")
 
     def handle(self, name, entries, outcome):
         """Record entries' items in the ledger with how they ended, so the same version never comes back."""
@@ -607,8 +638,8 @@ def notification(i):
     return (i.get("facts") or {}).get("notification_id")
 
 
-def indent(text, prefix):
-    return "\n".join(prefix + line for line in (text or "").splitlines()[:20])
+def indent(text, prefix, limit=20):
+    return "\n".join(prefix + line for line in (text or "").splitlines()[:limit])
 
 
 def mark_read(name, items, summary):
