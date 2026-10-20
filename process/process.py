@@ -772,8 +772,12 @@ class Process:
         except subprocess.CalledProcessError:
             # -e: the session's panes find their project even if the tmux server was started inside another afk project.
             pane = self.run(["tmux", "new-session", "-d", "-s", project, "-c", str(workdir), "-e", f"AFK_PROJECT={project}", "-P", "-F", "#{pane_id}"]).strip()
-            self.run(["env", f"TMUX_PANE={pane}", "afk", "init", str(spec)], cwd=workdir)  # binds the pane's session
-            self.run(["tmux", "send-keys", "-t", pane, "afk watch", "Enter"])  # drives the workers through their phases
+            try:
+                self.run(["env", f"TMUX_PANE={pane}", "afk", "init", str(spec)], cwd=workdir)  # binds the pane's session
+                self.run(["tmux", "send-keys", "-t", pane, "afk watch", "Enter"])  # drives the workers through their phases
+            except (subprocess.CalledProcessError, OSError):  # an unbound session would be taken as bound next time
+                self.run(["tmux", "kill-session", "-t", f"={project}"])
+                raise
         return project, spec
 
     def afk_ticket(self, spec, e):
@@ -1271,8 +1275,9 @@ def recommend(tier, t, now):
 
 
 def failure(phase, error):
-    stderr = getattr(error, "stderr", None) or ""
-    return f"{phase} failed: {(stderr.strip().splitlines() or [str(error)])[-1]}"
+    """A failed command's last line of stderr, else of stdout (afk prints its refusals there), else the error itself."""
+    said = getattr(error, "stderr", None) or getattr(error, "stdout", None) or ""
+    return f"{phase} failed: {(said.strip().splitlines() or [str(error)])[-1]}"
 
 
 class Usage(Exception):

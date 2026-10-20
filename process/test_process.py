@@ -1419,6 +1419,28 @@ class AfkLaunchTest(NextWorkTestCase):
 
         self.assertEqual(len(self.starts()), 1)
 
+    def test_a_session_whose_afk_init_failed_is_removed_so_the_next_launch_binds_it_again(self):
+        def broken(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="afk: command not found")
+        self.afk_workers([], session=False)
+        self.run_fake.responses[("env", "TMUX_PANE=%7", "afk", "init")] = broken
+        [launch] = self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(launch["id"])["status"], "failed")
+        self.assertIn(["tmux", "kill-session", "-t", "=process-acme"], self.run_fake.calls)
+
+    def test_a_refusal_afk_prints_on_stdout_is_the_recorded_error(self):
+        def refuse(cmd):
+            raise subprocess.CalledProcessError(1, cmd, output="afk: ticket 01 is already started; see `afk status`\n", stderr="")
+        self.run_fake.responses[("env", "AFK_PROJECT=process-acme", "afk", "start")] = refuse
+        [launch] = self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(launch["id"])["note"], "afk: ticket 01 is already started; see `afk status`")
+
     def test_a_failed_start_is_recorded_as_a_failure(self):
         def refuse(cmd):
             raise subprocess.CalledProcessError(1, cmd, stderr="afk: base branch 'main' does not exist")
