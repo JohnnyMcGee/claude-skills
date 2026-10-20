@@ -363,12 +363,19 @@ class Process:
         config = profile["phases"][phase]
         tools = [t for t in config["allowed_tools"] if not (dry and t.startswith("mcp__"))]
         inbox = self.inbox(profile["name"])
-        tools.append(f"Edit(/{inbox}/**)")  # dontAsk refuses heredocs, so items and drafts travel as inbox files
-        workdir = Path(profile["workdir"].replace("~", self.env["HOME"], 1) if profile["workdir"].startswith("~") else profile["workdir"])
+        dirs = [inbox]  # dontAsk refuses heredocs, so items and drafts travel as inbox files
+        if phase == "execute":
+            dirs.append(self.profile_state(profile["name"]) / "work")  # a fix edits files in its scratch worktree only
+            dirs[-1].mkdir(exist_ok=True)
+        tools += [f"Edit(/{d}/**)" for d in dirs]
+        workdir = self.workdir(profile)
         cmd = ["claude", "-p", prompt, "--model", config["model"], "--permission-mode", "dontAsk"]
         denied = NEVER_DENIED if phase == "execute" else DENIED_TOOLS
-        cmd += ["--add-dir", str(inbox), "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(denied)]
+        cmd += ["--add-dir", *map(str, dirs), "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(denied)]
         return self.run(cmd, cwd=workdir)
+
+    def workdir(self, profile):
+        return Path(profile["workdir"].replace("~", self.env["HOME"], 1) if profile["workdir"].startswith("~") else profile["workdir"])
 
     def cmd_profile(self, name):
         """Print one validated profile, path first, so a phase reads it without guessing XDG_CONFIG_HOME."""
@@ -539,7 +546,7 @@ class Process:
         """Apply proc's decisions to the queue, then run the executor headless for each profile (or --project) that
         has approved actions waiting. proc runs this when I quit it; `process run` runs it after triage. The executor
         skill drives the steps: `process execute plan|result <profile> ...`."""
-        steps = {"plan": self.execute_plan, "result": self.execute_result}
+        steps = {"plan": self.execute_plan, "result": self.execute_result, "checkout": self.execute_checkout, "git": self.execute_git, "push": self.execute_push}
         if args and args[0] in steps:
             return call(steps[args[0]], args[1:], f"execute {args[0]}")
         opts = flags(args, "--project")
@@ -671,7 +678,57 @@ class Process:
         self.append_jsonl(self.state_root() / "results.jsonl", [result])
         self.append_jsonl(self.state_root() / "queue.jsonl", [e])
         self.handle(name, [e], status)
+        worktree = self.profile_state(name) / "work" / entry_id
+        if worktree.exists():
+            self.run(["git", "-C", str(self.workdir(self.profile(name))), "worktree", "remove", "--force", str(worktree)])
         self.out(f"{entry_id}: {status}")
+
+    # The executor fixes my PRs in a scratch worktree per entry, never in my own checkout, and pushes only here.
+
+    def fix_entry(self, name, entry_id):
+        found = [e for e in self.approved(name) if e["id"] == entry_id and e["action"]["type"] in ("gh_fix_pr", "gh_thread_reply")]
+        if not found:
+            raise SystemExit(f"process: {entry_id} is not an approved fix for {name}")
+        return self.profile(name), found[0], self.profile_state(name) / "work" / entry_id
+
+    def my_open_pr(self, profile, e):
+        """The PR's branches, after checking it is mine, open and on the repo itself (a fork's branch is not mine)."""
+        repo, number = e["action"]["params"]["repo"], e["action"]["params"]["number"]
+        fields = "headRefName,baseRefName,author,isCrossRepository,state"
+        pr = json.loads(self.run(["gh", "pr", "view", str(number), "--repo", repo, "--json", fields], cwd=self.workdir(profile)))
+        me = self.run(["gh", "api", "user", "--jq", ".login"], cwd=self.workdir(profile)).strip()
+        if pr["author"]["login"] != me or pr["state"] != "OPEN" or pr["isCrossRepository"]:
+            raise SystemExit(f"process: {repo}#{number} is not my open PR on {repo}; the executor never touches it")
+        return pr
+
+    def execute_checkout(self, name, entry_id):
+        """Check out my PR's head in the entry's scratch worktree and print its path."""
+        profile, e, worktree = self.fix_entry(name, entry_id)
+        pr = self.my_open_pr(profile, e)
+        repo = str(self.workdir(profile))
+        self.run(["git", "-C", repo, "fetch", "origin", pr["headRefName"], pr["baseRefName"]])
+        if not worktree.exists():
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            self.run(["git", "-C", repo, "worktree", "add", "--detach", str(worktree), f"origin/{pr['headRefName']}"])
+        self.out(f"worktree: {worktree}\nhead: {pr['headRefName']}\nbase: origin/{pr['baseRefName']}")
+
+    def execute_git(self, name, entry_id, subcommand, *args):
+        """Run one git step of a fix in the entry's worktree. Pushing goes through `execute push` instead."""
+        _, _, worktree = self.fix_entry(name, entry_id)
+        if subcommand not in FIX_GIT:
+            raise SystemExit(f"process: git {subcommand} is not a fix step; use one of {', '.join(sorted(FIX_GIT))}")
+        try:
+            self.out(self.run(["git", "-C", str(worktree), subcommand, *args]).rstrip())
+        except subprocess.CalledProcessError as error:  # a merge conflict says what conflicts on stdout
+            raise SystemExit(f"process: git {subcommand} failed:\n{(error.stdout or '').strip()}\n{(error.stderr or '').strip()}".rstrip())
+
+    def execute_push(self, name, entry_id):
+        """Push the worktree's commits to my PR's branch: no force, no other branch. Prints the commit's link."""
+        profile, e, worktree = self.fix_entry(name, entry_id)
+        pr = self.my_open_pr(profile, e)
+        self.run(["git", "-C", str(worktree), "push", "origin", f"HEAD:refs/heads/{pr['headRefName']}"])
+        sha = self.run(["git", "-C", str(worktree), "rev-parse", "--short", "HEAD"]).strip()
+        self.out(f"pushed: https://github.com/{e['action']['params']['repo']}/pull/{e['action']['params']['number']}/commits/{sha}")
 
     def handle(self, name, entries, outcome):
         """Record entries' items in the ledger with how they ended, so the same version never comes back."""
@@ -725,6 +782,8 @@ class Process:
 BANKRUPTCY_AGE = 7 * 24 * 3600
 # A reviewer's nit, by the usual convention: the comment opens with "nit" (nit:, Nit —, [nit], nitpick).
 NIT = re.compile(r"\s*\[?nit(pick)?\b", re.I)
+# What a fix may do in its worktree: look, stage, commit, and merge the base branch in (never rebase, as open-pr).
+FIX_GIT = {"status", "diff", "log", "show", "add", "rm", "mv", "restore", "commit", "merge"}
 MERGE_BASE = (
     "Merge the base branch into the PR branch (never rebase) and resolve the conflicts. Push only if every conflict is "
     "mechanical: both sides kept, nothing about behaviour decided. Otherwise abort and report the conflicting files."

@@ -640,6 +640,9 @@ class ExecuteTest(ExecuteTestCase):
         self.assertNotIn("mcp__github__pull_request_review_write", opt("--disallowedTools"))
         self.assertIn("mcp__github__merge_pull_request", opt("--disallowedTools"))
         self.assertIn("Bash(git push:*)", opt("--disallowedTools"))
+        work = self.profile_dir() / "work"
+        self.assertIn(f"Edit(/{work}/**)", opt("--allowedTools"))  # a fix edits files in its scratch worktree only
+        self.assertEqual(cmd[cmd.index("--add-dir") + 1:cmd.index("--add-dir") + 3], [str(self.profile_dir() / "inbox"), str(work)])
         self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
         self.assertEqual(cmd[cmd.index("--model") + 1], "opus")
 
@@ -787,6 +790,76 @@ class ExecutorStepsTest(ExecuteTestCase):
         self.assertIn("not approved", out)
         self.assertEqual(self.jsonl(self.state / "results.jsonl"), [])
         self.assertEqual(self.entry(self.waiting["id"])["status"], "pending")
+
+
+class FixPrTest(ExecuteTestCase):
+    """The executor fixes my PRs in a scratch worktree and pushes only through `process execute push`."""
+
+    def setUp(self):
+        super().setUp()
+        self.pr = {"headRefName": "paginate-orders", "baseRefName": "main", "author": {"login": "me-dev"}, "isCrossRepository": False, "state": "OPEN"}
+        self.run_fake.responses[("gh", "pr", "view")] = lambda cmd: json.dumps(self.pr)
+        self.run_fake.responses[("gh", "api", "user")] = "me-dev\n"
+        self.run_fake.responses[("git", "-C")] = self.git
+        bot = item(kind="pr_comment", native_id="comment/9", subject="https://github.com/acme/widgets/pull/8#discussion_r9", actor={"name": "lint-bot[bot]", "role": "bot"}, context="unused import")
+        self.emit(bot)
+        [self.fix] = self.triage()  # silent, so already approved
+        self.worktree = self.profile_dir() / "work" / self.fix["id"]
+
+    def git(self, cmd):
+        if cmd[3:5] == ["worktree", "add"]:
+            Path(cmd[6]).mkdir(parents=True)
+        return "abc1234\n" if "rev-parse" in cmd else ""
+
+    def git_calls(self):
+        return [c for c in self.run_fake.calls if c[0] == "git"]
+
+    def test_checkout_puts_my_prs_head_in_a_scratch_worktree_away_from_my_own_checkout(self):
+        out = self.process("execute", "checkout", "acme", self.fix["id"])
+
+        self.assertIn(str(self.worktree), out)
+        workdir = str(self.tmp / "work" / "acme")
+        self.assertIn(["git", "-C", workdir, "fetch", "origin", "paginate-orders", "main"], self.git_calls())
+        self.assertIn(["git", "-C", workdir, "worktree", "add", "--detach", str(self.worktree), "origin/paginate-orders"], self.git_calls())
+
+    def test_a_pr_that_is_not_mine_or_not_open_or_from_a_fork_is_never_touched(self):
+        for change in ({"author": {"login": "ana"}}, {"state": "MERGED"}, {"isCrossRepository": True}):
+            with self.subTest(change=change):
+                self.pr = {**self.pr, **change}
+                self.assertIn("not my open PR", self.process("execute", "checkout", "acme", self.fix["id"], expect=1))
+                self.assertEqual(self.git_calls(), [])
+
+    def test_git_runs_in_the_worktree_and_only_the_subcommands_a_fix_needs(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+
+        self.process("execute", "git", "acme", self.fix["id"], "merge", "origin/main")
+
+        self.assertEqual(self.git_calls()[-1], ["git", "-C", str(self.worktree), "merge", "origin/main"])
+        for sub in ("push", "config", "remote", "reset", "rebase", "-c"):
+            with self.subTest(sub=sub):
+                self.assertIn("not a fix step", self.process("execute", "git", "acme", self.fix["id"], sub, "x", expect=1))
+
+    def test_push_sends_the_worktree_to_my_prs_branch_and_never_forces(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+
+        out = self.process("execute", "push", "acme", self.fix["id"])
+
+        self.assertEqual([c for c in self.git_calls() if "push" in c], [["git", "-C", str(self.worktree), "push", "origin", "HEAD:refs/heads/paginate-orders"]])
+        self.assertIn("https://github.com/acme/widgets/pull/8/commits/abc1234", out)
+
+    def test_push_checks_the_pr_is_still_mine(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+        self.pr = {**self.pr, "state": "CLOSED"}
+
+        self.assertIn("not my open PR", self.process("execute", "push", "acme", self.fix["id"], expect=1))
+        self.assertNotIn("push", [c[3] for c in self.git_calls()])
+
+    def test_fix_steps_are_only_for_approved_fixes(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+        self.process("execute", "result", "acme", self.fix["id"], "success")
+
+        self.assertIn("not an approved fix", self.process("execute", "push", "acme", self.fix["id"], expect=1))
+        self.assertIn(["git", "-C", str(self.tmp / "work" / "acme"), "worktree", "remove", "--force", str(self.worktree)], self.git_calls())
 
 
 class DryRunExecuteTest(ExecuteTestCase):
