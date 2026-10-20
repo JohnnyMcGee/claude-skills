@@ -769,6 +769,9 @@ class Process:
         me = self.run(["gh", "api", "user", "--jq", ".login"], cwd=self.workdir(profile)).strip()
         if pr["author"]["login"] != me or pr["state"] != "OPEN" or pr["isCrossRepository"]:
             raise SystemExit(f"process: {repo}#{number} is not my open PR on {repo}; the executor never touches it")
+        origin = self.run(["git", "-C", str(self.workdir(profile)), "remote", "get-url", "origin"]).strip()
+        if not re.fullmatch(rf"(https://|ssh://git@|git@)github\.com[:/]{re.escape(repo)}(\.git)?/?", origin, re.I):
+            raise SystemExit(f"process: the workdir's origin is not {repo} ({origin}); fetching or pushing there would miss the PR")
         return pr
 
     def execute_checkout(self, name, entry_id):
@@ -777,9 +780,10 @@ class Process:
         pr = self.my_open_pr(profile, e)
         repo = str(self.workdir(profile))
         self.run(["git", "-C", repo, "fetch", "origin", pr["headRefName"], pr["baseRefName"]])
-        if not worktree.exists():
-            worktree.parent.mkdir(parents=True, exist_ok=True)
-            self.run(["git", "-C", repo, "worktree", "add", "--detach", str(worktree), f"origin/{pr['headRefName']}"])
+        if worktree.exists():  # left by a run that crashed before its result: start again from the PR's head
+            self.run(["git", "-C", repo, "worktree", "remove", "--force", str(worktree)])
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        self.run(["git", "-C", repo, "worktree", "add", "--detach", str(worktree), f"origin/{pr['headRefName']}"])
         self.out(f"worktree: {worktree}\nhead: {pr['headRefName']}\nbase: origin/{pr['baseRefName']}")
 
     def execute_git(self, name, entry_id, subcommand, *args):
@@ -787,6 +791,9 @@ class Process:
         _, _, worktree = self.fix_entry(name, entry_id)
         if subcommand not in FIX_GIT:
             raise SystemExit(f"process: git {subcommand} is not a fix step; use one of {', '.join(sorted(FIX_GIT))}")
+        refused = [a for a in args if FIX_GIT_REFUSED.match(a)]
+        if refused:
+            raise SystemExit(f"process: git {refused[0]} is not allowed in a fix: it reads or writes files outside the worktree")
         try:
             self.out(self.run(["git", "-C", str(worktree), subcommand, *args]).rstrip())
         except subprocess.CalledProcessError as error:  # a merge conflict says what conflicts on stdout
@@ -854,6 +861,9 @@ BANKRUPTCY_AGE = 7 * 24 * 3600
 NIT = re.compile(r"\s*\[?nit(pick)?\b", re.I)
 # What a fix may do in its worktree: look, stage, commit, and merge the base branch in (never rebase, as open-pr).
 FIX_GIT = {"status", "diff", "log", "show", "add", "rm", "mv", "restore", "commit", "merge"}
+# Options that reach files outside the worktree (--output writes anywhere, -F/--file reads anywhere into a commit I then
+# push) or run external programs. Short -F and -t also match stuck forms like -Fpath.
+FIX_GIT_REFUSED = re.compile(r"(--output|--file|--template|--pathspec-from-file|--no-index|--ext-diff|--exec)(=|$)|-[a-zA-Z]*[Ft]")
 MERGE_BASE = (
     "Merge the base branch into the PR branch (never rebase) and resolve the conflicts. Push only if every conflict is "
     "mechanical: both sides kept, nothing about behaviour decided. Otherwise abort and report the conflicting files."

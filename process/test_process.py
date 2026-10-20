@@ -903,9 +903,15 @@ class FixPrTest(ExecuteTestCase):
         [self.fix] = self.triage()  # silent, so already approved
         self.worktree = self.profile_dir() / "work" / self.fix["id"]
 
+    origin = "https://github.com/acme/widgets.git"
+
     def git(self, cmd):
         if cmd[3:5] == ["worktree", "add"]:
             Path(cmd[6]).mkdir(parents=True)
+        if cmd[3:5] == ["worktree", "remove"]:
+            Path(cmd[-1]).rmdir()
+        if cmd[3:5] == ["remote", "get-url"]:
+            return self.origin + "\n"
         return "abc1234\n" if "rev-parse" in cmd else ""
 
     def git_calls(self):
@@ -935,6 +941,33 @@ class FixPrTest(ExecuteTestCase):
         for sub in ("push", "config", "remote", "reset", "rebase", "-c"):
             with self.subTest(sub=sub):
                 self.assertIn("not a fix step", self.process("execute", "git", "acme", self.fix["id"], sub, "x", expect=1))
+
+    def test_git_refuses_arguments_that_write_or_read_files_outside_the_worktree(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+        before = len(self.git_calls())
+
+        for args in (["log", "-1", "--output=../x"], ["diff", "--output", "../x"], ["commit", "-F", "/home/me/.ssh/id_rsa"], ["commit", "--file=/etc/passwd"],
+                     ["commit", "-Fsecret"], ["add", "--pathspec-from-file=../list"], ["diff", "--no-index", "/a", "/b"], ["diff", "--ext-diff"], ["commit", "-t", "../t"]):
+            with self.subTest(args=args):
+                self.assertIn("not allowed in a fix", self.process("execute", "git", "acme", self.fix["id"], *args, expect=1))
+        self.assertEqual(len(self.git_calls()), before)
+        self.process("execute", "git", "acme", self.fix["id"], "commit", "-m", "fix: drop the unused import")
+
+    def test_a_workdir_whose_origin_is_not_the_prs_repo_is_never_fetched_or_pushed(self):
+        for url in ("git@github.com:me-dev/widgets.git", "https://github.com/acme/widgets-fork.git"):
+            with self.subTest(url=url):
+                self.origin = url
+                self.assertIn("origin is not acme/widgets", self.process("execute", "checkout", "acme", self.fix["id"], expect=1))
+        self.assertEqual([c for c in self.git_calls() if "fetch" in c or "push" in c], [])
+
+    def test_checkout_replaces_a_worktree_a_crashed_run_left_behind(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])  # the run crashed before recording a result
+
+        self.process("execute", "checkout", "acme", self.fix["id"])
+
+        workdir = str(self.tmp / "work" / "acme")
+        self.assertIn(["git", "-C", workdir, "worktree", "remove", "--force", str(self.worktree)], self.git_calls())
+        self.assertEqual(self.git_calls()[-1], ["git", "-C", workdir, "worktree", "add", "--detach", str(self.worktree), "origin/paginate-orders"])
 
     def test_push_sends_the_worktree_to_my_prs_branch_and_never_forces(self):
         self.process("execute", "checkout", "acme", self.fix["id"])
