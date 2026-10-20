@@ -485,6 +485,19 @@ class UrgencyTest(TriageTestCase):
 
         self.assertEqual(self.urgent(), [])
 
+    def test_a_review_request_labeled_deploy_blocking_is_urgent_but_the_label_elsewhere_is_not(self):
+        self.emit(
+            item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", labels=["deploy-blocking"], summary="Ben requested your review on #102"),
+            item(native_id="comment/2", kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-2", labels=["deploy-blocking"], summary="Ana commented on #7"),
+        )
+
+        self.assertEqual(self.urgent(), ["Ben requested your review on #102"])
+
+    def test_a_dm_from_a_peer_is_not_urgent(self):
+        self.emit(slack(native_id="D1/1", kind="dm", summary="Dee DMed you about the index", facts={"channel": "DM", "ask": "question"}), source="slack")
+
+        self.assertEqual(self.urgent(), [])
+
 
 class TriageRulesTest(TriageTestCase):
     def test_an_action_type_promoted_to_silent_skips_approval(self):

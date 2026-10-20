@@ -1151,10 +1151,11 @@ def protected_meeting(profile, items):
 
 
 def urgent(rules, i):
-    """The profile's [urgency] rules, the only things that interrupt me: a DM or mention from one of its people."""
+    """The profile's [urgency] rules, the only things that interrupt me: a DM or mention from one of its people, or a
+    review request whose PR carries one of its labels."""
     return (
         i["kind"] in ("dm", "mention") and i["actor"]["name"] in rules.get("people", [])
-        or bool(set(i.get("labels", [])) & set(rules.get("labels", [])))
+        or i["kind"] == "review_request" and bool(set(i.get("labels", [])) & set(rules.get("labels", [])))
     )
 
 
