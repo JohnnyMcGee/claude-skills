@@ -87,7 +87,8 @@ def schema_errors(value, schema, path="$"):
     if "anyOf" in schema:
         branches = [schema_errors(value, sub, path) for sub in schema["anyOf"]]
         if all(branches):
-            errors.append(f"{path}: matches no allowed shape ({min(branches, key=len)[0]})")
+            closest = min(branches, key=lambda b: (len(b), -max(e.split(":")[0].count(".") for e in b)))  # got furthest
+            errors.append(f"{path}: matches no allowed shape ({closest[0]})")
     return errors
 
 

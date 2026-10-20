@@ -357,7 +357,10 @@ class NeverActionTest(TriageTestCase):
                 plan["entries"][0]["action"] = action
                 path.write_text(json.dumps(plan))
 
-                self.assertIn("nothing committed", self.process("triage", "commit", "acme", expect=1))
+                out = self.process("triage", "commit", "acme", expect=1)
+                self.assertIn("nothing committed", out)
+                if action["type"] == "gh_review":
+                    self.assertIn("'APPROVE' is not one of", out)
                 self.assertEqual(self.jsonl(self.state / "queue.jsonl"), [])
                 self.assertEqual(self.jsonl(self.profile_dir() / "ledger.jsonl"), [])
 
