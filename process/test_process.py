@@ -616,6 +616,41 @@ class CalendarTriageTest(TriageTestCase):
                 path.unlink()
 
 
+class GmailTriageTest(TriageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def noise(self, n):
+        return email(native_id=f"thread-{n}", subject=f"https://mail.google.com/mail/u/0/#all/thread-{n}", actor={"name": "news@vendor.example", "role": "bot"}, summary=f"Vendor newsletter {n}", facts={"noise": True})
+
+    def test_an_email_that_asks_something_of_me_gets_a_drafted_reply(self):
+        self.emit(email(), source="gmail")
+
+        [reply] = self.triage()
+
+        self.assertEqual((reply["action"]["type"], reply["action"]["params"]), ("email_reply", {"thread_id": "thread-1"}))
+        self.assertEqual((reply["autonomy"], reply["status"], reply["urgency"]), ("draft", "pending", "normal"))
+
+    def test_noise_is_labeled_and_archived_silently_and_listed_under_done_silently(self):
+        self.emit(self.noise(2), self.noise(3), source="gmail")
+
+        [archive] = self.triage()
+
+        self.assertEqual(archive["action"], {"type": "gmail_archive", "params": {"thread_ids": ["thread-2", "thread-3"], "label": "Noise"}})
+        self.assertEqual((archive["autonomy"], archive["status"]), ("silent", "done"))
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+        self.process("brief")
+        self.assertIn("- Labeled Noise and archived 2 email(s): Vendor newsletter 2; Vendor newsletter 3 — done", (self.state / "brief.md").read_text())
+
+    def test_an_email_that_asks_nothing_is_an_fyi(self):
+        self.emit(email(summary="Cal shared the Q4 roadmap", facts={}), source="gmail")
+
+        [fyi] = self.triage()
+
+        self.assertEqual((fyi["status"], fyi["action"]["type"], fyi["urgency"]), ("info", "none", "low"))
+
+
 class LinearInboxTest(TriageTestCase):
     def notification(self, n, days_old):
         stamp = process.iso(NOW - days_old * 86400)

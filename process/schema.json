@@ -65,7 +65,7 @@
     },
     "action_type": {
       "description": "Every action triage may propose. Merging, approving others' PRs and prod changes are absent on purpose: they are never actions.",
-      "enum": ["none", "linear_mark_read", "gh_review", "gh_thread_reply", "gh_fix_pr", "slack_reply", "email_reply", "rsvp", "linear_promote", "linear_create_issue", "afk_launch"]
+      "enum": ["none", "linear_mark_read", "gh_review", "gh_thread_reply", "gh_fix_pr", "slack_reply", "email_reply", "rsvp", "linear_promote", "linear_create_issue", "gmail_archive", "afk_launch"]
     },
     "pr_ref": {
       "type": "object",
@@ -85,7 +85,27 @@
         "draft": {"description": "The outward-facing text (review body, reply, fix plan) for the human to approve or edit.", "type": "string"}
       },
       "anyOf": [
-        {"properties": {"type": {"enum": ["none", "email_reply", "linear_promote", "afk_launch"]}}},
+        {"properties": {"type": {"enum": ["none", "linear_promote", "afk_launch"]}}},
+        {
+          "properties": {
+            "type": {"const": "email_reply"},
+            "params": {"type": "object", "required": ["thread_id"], "properties": {"thread_id": {"type": "string", "minLength": 1}}}
+          }
+        },
+        {
+          "properties": {
+            "type": {"const": "gmail_archive"},
+            "params": {
+              "description": "Noise triage labels and archives silently. Never trash, never spam.",
+              "type": "object",
+              "required": ["thread_ids", "label"],
+              "properties": {
+                "thread_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                "label": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        },
         {
           "properties": {
             "type": {"const": "rsvp"},

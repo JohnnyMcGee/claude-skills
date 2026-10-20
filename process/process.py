@@ -479,7 +479,8 @@ class Process:
         cutoff = iso(self.clock() - BANKRUPTCY_AGE)
         stale = [i for i in items if first_run and i["source"] == "linear" and notification(i) and i["timestamp"] < cutoff]
         dropped = [i for i in items if i["actor"]["role"] == "me" and i["kind"] != "pr_status"]
-        live = [i for i in items if i not in stale and i not in dropped]
+        noise = [i for i in items if i["source"] == "gmail" and (i.get("facts") or {}).get("noise") and i not in dropped]
+        live = [i for i in items if i not in stale and i not in dropped and i not in noise]
         entries = [entry(name, profile, group) for group in asks(live)]
         ticketed = {e["subject"]: e.get("note", "") for e in self.queue() if e["project"] == name and e["action"]["type"] == "linear_create_issue" and e["status"] == "done"}
         for e in entries:
@@ -487,6 +488,8 @@ class Process:
                 e.update(action={"type": "none", "params": {}}, autonomy="silent", status="info", summary=f"{e['summary']} — already ticketed: {ticketed[e['subject']]}")
         if stale:
             entries.append(mark_read(name, stale, f"Cleared {len(stale)} Linear notification(s) older than 7 days (first run)"))
+        if noise:
+            entries.append(archive(name, profile, noise))
         read = [i for i in live + dropped if notification(i)]  # my own get marked read too
         if read:
             entries.append(mark_read(name, read, f"Marked {len(read)} processed Linear notification(s) read"))
@@ -662,19 +665,31 @@ def indent(text, prefix):
 
 
 def mark_read(name, items, summary):
+    return housekeeping(name, items, summary, {"type": "linear_mark_read", "params": {"notification_ids": [notification(i) for i in items]}})
+
+
+def archive(name, profile, items):
+    """One silent entry that labels and archives every noise email of the run."""
+    label = profile["google"].get("noise_label", "Noise")
+    summary = f"Labeled {label} and archived {len(items)} email(s): " + "; ".join(i["summary"] for i in items)
+    return housekeeping(name, items, summary, {"type": "gmail_archive", "params": {"thread_ids": [i["native_id"] for i in items], "label": label}})
+
+
+def housekeeping(name, items, summary, action):
+    """A batch silent action triage performs itself over many items: it waits on triage's report."""
     ids = [i["id"] for i in items]
     return {
-        "id": "q-" + digest(name + "linear_mark_read" + "".join(ids)),
+        "id": "q-" + digest(name + action["type"] + "".join(ids)),
         "project": name,
         "item_ids": ids,
-        "sources": ["linear"],
+        "sources": sorted({i["source"] for i in items}),
         "kind": "housekeeping",
         "subject": "",
         "summary": summary,
         "link": "",
         "urgency": "low",
         "autonomy": "silent",
-        "action": {"type": "linear_mark_read", "params": {"notification_ids": [notification(i) for i in items]}},
+        "action": action,
         "status": "approved",
     }
 
@@ -746,6 +761,8 @@ def entry(name, profile, group):
         action, urgency = {"type": "linear_create_issue", "params": params}, "normal"
     elif lead["source"] == "slack" and facts.get("ask") == "task" and "linear" in profile:  # an immediate ask: a ticket for me, linking back
         action, urgency = {"type": "linear_create_issue", "params": {"team": profile["linear"]["team"], "assignee": "me", "link": lead["link"]}}, "normal"
+    elif lead["source"] == "gmail" and facts.get("ask"):
+        action, urgency = {"type": "email_reply", "params": {"thread_id": lead["native_id"]}}, "normal"
     elif lead["source"] == "slack" and facts.get("ask"):
         channel, _, thread = lead["native_id"].partition("/")
         action, urgency = {"type": "slack_reply", "params": {"channel": channel, "thread_ts": thread}}, "normal"
