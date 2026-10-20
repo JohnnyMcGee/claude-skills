@@ -17,7 +17,7 @@ You turn what GitHub says about one project into **items** and hand them to `pro
 
 ## 2. Read
 
-With `--fixtures <dir>`, read `<dir>/github.json` instead of GitHub. It holds the same four reads under the keys `me`, `my_prs`, `review_requested` and `comments`, and a timestamp of `now` there means **start**.
+With `--fixtures <dir>`, read `<dir>/github.json` instead of GitHub. It holds the same four reads under the keys `me`, `my_prs`, `review_requested` and `comments`, and every `now` value there (timestamps, `updatedAt`, versions) means **start**.
 
 Live, for repo `R`:
 

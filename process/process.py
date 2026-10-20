@@ -413,7 +413,7 @@ class Process:
             if old["project"] == name and old["status"] in ("pending", "info") and (old["kind"], old["subject"]) in keys
         ]
         self.append_jsonl(self.state_root() / "queue.jsonl", superseded + entries)
-        handled = [i for e in entries for i in e["item_ids"]] + plan["dropped"]
+        handled = list(dict.fromkeys([i for e in entries for i in e["item_ids"]] + plan["dropped"]))
         self.append_jsonl(pdir / "ledger.jsonl", [{"item_id": i, "at": iso(self.clock())} for i in handled])
         if plan["first_run"]:
             self.write_json(pdir / "state.json", {**self.read_json(pdir / "state.json", {}), "bankrupt_at": iso(self.clock())})

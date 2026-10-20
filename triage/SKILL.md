@@ -37,6 +37,8 @@ EOF
 | `gh_thread_reply` | My reply to the comment: answer it, or say what I will change. |
 | `gh_fix_pr` | A fix plan: what is broken (conflicts, failing checks, requested changes, bot findings) and the steps to fix it. |
 
+With `--dry-run`, draft from the context the plan printed and call no GitHub or Linear tool: the fixtures name repos that don't exist.
+
 Write as me: first person, short, plain. This step is done when every `[draft]` entry has a draft.
 
 ## 3. Silent actions

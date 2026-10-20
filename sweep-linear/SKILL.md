@@ -17,7 +17,7 @@ You turn what Linear says about one project into **items** and hand them to `pro
 
 ## 2. Read
 
-With `--fixtures <dir>`, read `<dir>/linear.json` instead of Linear. It holds the same reads under the keys `me`, `notifications` and `issues`, and a timestamp of `now` there means **start**.
+With `--fixtures <dir>`, read `<dir>/linear.json` instead of Linear. It holds the same reads under the keys `me`, `notifications` and `issues`, and every `now` value there (timestamps, `updatedAt`, versions) means **start**.
 
 Live, through the Linear MCP server (`mcp__linear-server__*`):
 
