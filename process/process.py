@@ -363,6 +363,39 @@ class Process:
         (pdir / "plan.json").unlink()
         self.out(f"committed {len(entries)} entr(ies) for {name}; superseded {len(superseded)}; {len(handled)} item(s) handled")
 
+    # -- the brief --
+
+    def cmd_brief(self, *args):
+        """Render brief.md from the queue, grouped by project, and append it to today's archive."""
+        opts = flags(args, "--delta", "--project")
+        profiles = self.profiles()
+        names = [opts["--project"]] if opts.get("--project") else [n for n, p in profiles.items() if p["active"]]
+        unknown = [n for n in names if n not in profiles]
+        if unknown:
+            raise SystemExit(f"process: no profile {unknown[0]!r} in {self.profiles_dir()}")
+        queue = self.queue()
+        run = self.read_json(self.state_root() / "run.json", {})
+        latest = run.get("id") or max((e["run"] for e in queue), default=None)
+        now = datetime.fromtimestamp(self.clock()).astimezone()
+        midnight = iso(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        if opts.get("--delta"):
+            shown = lambda e: e["run"] == latest
+        else:
+            shown = lambda e: e["status"] == "pending" or e["created"] >= midnight
+        mode = "delta" if opts.get("--delta") else "full"
+        lines = [f"# Brief — {now:%a %Y-%m-%d %H:%M} · {mode}", ""]
+        for name in names:
+            entries = [e for e in queue if e["project"] == name and e["status"] != "superseded" and shown(e)]
+            lines += [f"## {name}", ""] + [f"> ⚠ {p}" for p in run.get("problems", {}).get(name, [])]
+            lines += render_project(entries) or ["Nothing new.", ""]
+        brief = "\n".join(lines).rstrip() + "\n"
+        (self.state_root() / "brief.md").write_text(brief)
+        archive = self.state_root() / "briefs" / f"{now:%Y-%m-%d}.md"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open("a") as f:
+            f.write(("\n---\n\n" if archive.stat().st_size else "") + brief)
+        self.out(str(self.state_root() / "brief.md"))
+
     def queue(self):
         """The queue's current state: the last line for each entry id, in first-seen order."""
         return list({e["id"]: e for e in self.read_jsonl(self.state_root() / "queue.jsonl")}.values())
@@ -402,6 +435,35 @@ def mark_read(name, items, summary):
         "action": {"type": "linear_mark_read", "params": {"notification_ids": [notification(i) for i in items]}},
         "status": "approved",
     }
+
+
+URGENCY = ["urgent", "normal", "low"]
+
+
+def render_project(entries):
+    """One project's brief sections: Needs approval, Done silently, FYI (collapsed). Empty sections are left out."""
+    entries = sorted(entries, key=lambda e: (URGENCY.index(e["urgency"]), e["created"]))
+    needs = [e for e in entries if e["status"] == "pending"]
+    silent = [e for e in entries if e["autonomy"] == "silent" and e["status"] in ("approved", "done", "failed", "skipped")]
+    fyi = [e for e in entries if e["status"] == "info"]
+    lines = []
+    if needs:
+        lines += [f"### Needs approval ({len(needs)})", ""]
+        for e in needs:
+            params = e["action"]["params"]
+            ref = f" #{params['number']}" if "number" in params else ""
+            lines.append(f"- {'**urgent** · ' if e['urgency'] == 'urgent' else ''}{e['summary']} · {' + '.join(e['sources'])} · {e['link']}")
+            lines.append(f"  `{e['action']['type']}`{ref}{' ' + params['event'] if 'event' in params else ''} · `{e['id']}`")
+            lines += [f"  > {line}" for line in (e["action"].get("draft") or "").splitlines()] + [""]
+    if silent:
+        lines += [f"### Done silently ({len(silent)})", ""]
+        words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped (dry run)"}
+        lines += [f"- {e['summary']} — {words[e['status']]}{': ' + e['note'] if e.get('note') else ''}" for e in silent] + [""]
+    if fyi:
+        lines += [f"### FYI ({len(fyi)})", "", "<details>", f"<summary>{len(fyi)} item(s)</summary>", ""]
+        lines += [f"- {'**urgent** · ' if e['urgency'] == 'urgent' else ''}{e['summary']} · {e['link']}" for e in fyi]
+        lines += ["", "</details>", ""]
+    return lines
 
 
 def entry(name, profile, group):

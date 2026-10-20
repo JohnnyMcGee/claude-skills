@@ -40,8 +40,8 @@ def item(**over):
         "actor": {"name": "ana", "role": "person"},
         "timestamp": "2026-10-20T12:00:00Z",
         "link": "https://github.com/acme/widgets/pull/101",
-        "summary": "Ana requested your review on #101 Add vote export",
-        "context": "Adds a CSV export of votes.",
+        "summary": "Ana requested your review on #101 Add CSV export",
+        "context": "Adds a CSV export of orders.",
     }
     return {**base, **over}
 
@@ -206,9 +206,8 @@ class TriageTestCase(ProcessTestCase):
         super().setUp()
         self.write_profile()
 
-    @property
-    def plan(self):
-        return json.loads((self.profile_dir() / "plan.json").read_text())
+    def plan(self, profile="acme"):
+        return json.loads((self.profile_dir(profile) / "plan.json").read_text())
 
     def queue(self):
         """The queue's current state: the last line for each entry id."""
@@ -217,7 +216,7 @@ class TriageTestCase(ProcessTestCase):
     def triage(self, profile="acme", outcome="done"):
         """Run triage the way the triage skill does: plan, draft every draft entry, report each silent action, commit."""
         self.process("triage", "plan", profile)
-        for entry in self.plan["entries"]:
+        for entry in self.plan(profile)["entries"]:
             if entry["autonomy"] == "draft":
                 self.process("triage", "draft", profile, entry["id"], stdin=f"Draft for {entry['summary']}")
             if entry["action"]["type"] == "linear_mark_read":
@@ -277,7 +276,7 @@ class TriageRulesTest(TriageTestCase):
         self.assertEqual(self.triage(), [])
         self.emit(mine)
         self.process("triage", "plan", "acme")
-        self.assertEqual(self.plan["entries"], [])
+        self.assertEqual(self.plan()["entries"], [])
 
 
 class LinearInboxTest(TriageTestCase):
@@ -363,6 +362,70 @@ class NeverActionTest(TriageTestCase):
         self.process("triage", "plan", "acme")
 
         self.assertIn("no draft", self.process("triage", "commit", "acme", expect=1))
+
+
+class BriefTest(TriageTestCase):
+    def section(self, brief, project, heading):
+        """The lines under one project's ### heading, up to the next heading."""
+        lines = brief.split(f"## {project}\n", 1)[1].split(f"### {heading}", 1)[1].split("\n#", 1)[0]
+        return lines
+
+    def test_the_brief_groups_each_project_into_needs_approval_done_silently_and_fyi(self):
+        self.emit(item(), my_pr(mergeable="mergeable", checks="passing", review="approved"))
+        self.emit(linear(native_id="notif-9", kind="mention", subject="https://linear.app/acme/issue/WID-9", summary="Mentioned on WID-9", facts={"notification_id": "notif-9"}), source="linear")
+        self.triage()
+
+        self.process("brief")
+
+        brief = (self.state / "brief.md").read_text()
+        self.assertIn("Ana requested your review on #101", self.section(brief, "acme", "Needs approval (1)"))
+        self.assertIn("> Draft for Ana requested your review on #101", self.section(brief, "acme", "Needs approval (1)"))
+        self.assertIn("Marked 1 processed Linear notification(s) read", self.section(brief, "acme", "Done silently (1)"))
+        fyi = self.section(brief, "acme", "FYI (2)")
+        self.assertIn("<details>", fyi)
+        self.assertIn("Mentioned on WID-9", fyi)
+        self.assertIn("merging is yours", fyi)
+        self.assertEqual((self.state / "briefs" / "2026-10-20.md").read_text(), brief)
+
+    def test_delta_shows_only_what_the_latest_run_added_and_the_archive_keeps_every_brief_of_the_day(self):
+        self.emit(item())
+        self.triage()
+        self.process("brief")
+        self.now += 4 * 3600
+        self.emit(item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", summary="Ben requested your review on #102"))
+        self.triage()
+
+        self.process("brief", "--delta")
+
+        delta = (self.state / "brief.md").read_text()
+        self.assertIn("#102", delta)
+        self.assertNotIn("#101", delta)
+        archive = (self.state / "briefs" / "2026-10-20.md").read_text()
+        self.assertIn("#101", archive)
+        self.assertIn("#102", archive)
+
+    def test_a_full_brief_keeps_showing_drafts_still_waiting_on_me(self):
+        self.emit(item())
+        self.triage()
+        self.now += 4 * 3600
+        self.triage()
+
+        self.process("brief")
+
+        self.assertIn("#101", (self.state / "brief.md").read_text())
+
+    def test_project_narrows_the_brief_to_one_profile(self):
+        self.write_profile("side")
+        self.emit(item())
+        self.emit(item(summary="Side review"), profile="side")
+        self.triage()
+        self.triage("side")
+
+        self.process("brief", "--project", "side")
+
+        brief = (self.state / "brief.md").read_text()
+        self.assertIn("## side", brief)
+        self.assertNotIn("## acme", brief)
 
 
 class ProfileTest(ProcessTestCase):
