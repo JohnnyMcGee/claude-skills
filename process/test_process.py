@@ -709,6 +709,43 @@ class RunTest(ProcessTestCase):
         self.assertIn("· delta", brief)
         self.assertNotIn("## acme", brief)
 
+    def test_a_source_shared_by_two_profiles_is_swept_once_for_both(self):
+        self.write_profile("acme", sources=ALL_SOURCES)
+        self.write_profile("side", sources=ALL_SOURCES)
+
+        def sweep(source):  # a sweeper that does its job and finds nothing
+            return lambda cmd: process.main(["emit", "acme", source], run=self.run_fake, env=self.env, stdin=io.StringIO(""), stdout=io.StringIO(), clock=lambda: self.now)
+
+        for source in ALL_SOURCES[2:]:
+            self.run_fake.responses[("claude", "-p", f"/sweep-{source} acme")] = sweep(source)
+
+        self.process("run")
+
+        prompts = [c[2] for c, _ in self.claude_calls()]
+        shared = [f"/sweep-{s} acme" for s in ALL_SOURCES[2:]]
+        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", *shared, "/triage acme", "/sweep-github side", "/sweep-linear side", "/triage side"])
+        self.assertNotIn("slack", (self.state / "brief.md").read_text())  # side's watermark moved with acme's sweep
+
+    def test_unsorted_items_get_their_own_section_of_the_brief_once(self):
+        self.write_profile("acme", sources=["github", "linear", "slack"])
+        self.write_profile("side", sources=["github", "linear", "slack"], repo="acme/gadgets", team="GAD", watchlist=[])
+        lunch = slack(summary="Gus asked who is up for lunch", context="lunch?", facts={"channel": "#random", "ask": "question"})
+
+        def sweep_slack(cmd):
+            process.main(["emit", "acme", "slack"], run=self.run_fake, env=self.env, stdin=io.StringIO(json.dumps(lunch) + "\n"), stdout=io.StringIO(), clock=lambda: self.now)
+
+        self.run_fake.responses[("claude", "-p", "/sweep-slack acme")] = sweep_slack
+
+        self.process("run")
+        self.process("run")
+
+        brief = (self.state / "brief.md").read_text()
+        self.assertIn("## Unsorted", brief)
+        self.assertIn("Gus asked who is up for lunch", brief.split("## Unsorted", 1)[1])
+        unsorted = [e for e in self.jsonl(self.state / "queue.jsonl") if e["project"] == "unsorted"]
+        self.assertEqual([(e["status"], e["action"]["type"]) for e in unsorted], [("info", "none")])
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+
     def test_a_dry_run_reads_fixtures_from_an_absolute_path_with_no_service_tools(self):
         self.write_profile("acme")
 

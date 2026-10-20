@@ -299,10 +299,13 @@ class Process:
         run = {"id": iso(self.clock()), "delta": bool(opts.get("--delta")), "problems": {}}
         self.write_json(self.state_root() / "run.json", run)
         sweep_args = (" --delta" if opts.get("--delta") else "") + (f" --fixtures {opts['--fixtures']}" if dry else "")
+        swept = set()  # shared feeds already swept this run, for every profile that shares them
         try:
             for name in names:
                 profile = profiles[name]
-                phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in profile["sources"]]
+                sources = [s for s in profile["sources"] if share_key(profile, s) not in swept]
+                swept |= {share_key(profile, s) for s in sources} - {None}
+                phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in sources]
                 phases.append(("triage", f"/triage {name}" + (" --dry-run" if dry else "")))
                 for phase, prompt in phases:
                     self.out(f"{name}: {phase}")
@@ -316,6 +319,7 @@ class Process:
                     if problem:
                         run["problems"].setdefault(name, []).append(problem)
                         self.write_json(self.state_root() / "run.json", run)
+            self.file_unsorted()
             self.cmd_brief(*(["--delta"] if opts.get("--delta") else []), *(["--project", opts["--project"]] if opts.get("--project") else []))
         finally:
             (self.state_root() / "run.json").unlink()
@@ -476,10 +480,7 @@ class Process:
         stale = [i for i in items if first_run and i["source"] == "linear" and notification(i) and i["timestamp"] < cutoff]
         dropped = [i for i in items if i["actor"]["role"] == "me" and i["kind"] != "pr_status"]
         live = [i for i in items if i not in stale and i not in dropped]
-        groups = {}
-        for i in sorted(live, key=lambda i: (i["source"], i["timestamp"])):  # github first: its item leads the entry
-            groups.setdefault((i["kind"], canonical(i["subject"])), []).append(i)
-        entries = [entry(name, profile, group) for group in groups.values()]
+        entries = [entry(name, profile, group) for group in asks(live)]
         if stale:
             entries.append(mark_read(name, stale, f"Cleared {len(stale)} Linear notification(s) older than 7 days (first run)"))
         read = [i for i in live + dropped if notification(i)]  # my own get marked read too
@@ -527,14 +528,37 @@ class Process:
             e["note"] = note
         self.write_json(self.profile_state(name) / "plan.json", plan)
 
+    def file_unsorted(self):
+        """Shared-source items no profile claimed become FYI entries of their own: no project's rules apply to them."""
+        items = self.unhandled(UNSORTED)
+        bare = {"autonomy": {"silent": []}}
+        entries = [{**entry(UNSORTED, bare, g), "autonomy": "silent", "action": {"type": "none", "params": {}}, "status": "info"} for g in asks(items)]
+        self.record(UNSORTED, self.stamp(entries), [i["id"] for i in items])
+
+    def stamp(self, entries):
+        """Give planned entries the run that made them and their creation time."""
+        run = self.read_json(self.state_root() / "run.json", {}).get("id") or iso(self.clock())
+        return [{**e, "run": run, "created": iso(self.clock())} for e in entries]
+
+    def record(self, name, entries, handled):
+        """Append stamped entries to the queue (superseding older versions of the same ask) and their items to the ledger."""
+        keys = {(e["kind"], e["subject"]) for e in entries}
+        superseded = [
+            {**old, "status": "superseded"}
+            for old in self.queue()
+            if old["project"] == name and old["status"] in ("pending", "info") and (old["kind"], old["subject"]) in keys
+        ]
+        self.append_jsonl(self.state_root() / "queue.jsonl", superseded + entries)
+        self.append_jsonl(self.profile_state(name) / "ledger.jsonl", [{"item_id": i, "at": iso(self.clock())} for i in handled])
+        return superseded
+
     def triage_commit(self, name):
         """Validate the finished plan, then append it to the queue and ledger. All or nothing."""
         pdir = self.profile_state(name)
         plan = self.read_json(pdir / "plan.json", None)
         if plan is None:
             raise SystemExit(f"process: no triage plan for {name}; run `process triage plan {name}` first")
-        run = self.read_json(self.state_root() / "run.json", {}).get("id") or iso(self.clock())
-        entries = [{**e, "run": run, "created": iso(self.clock())} for e in plan["entries"]]
+        entries = self.stamp(plan["entries"])
         problems = []
         for e in entries:
             problems += [f"{e['id']}: {p}" for p in validate(e, "queue_entry")]
@@ -544,15 +568,8 @@ class Process:
                 problems.append(f"{e['id']}: no outcome (process triage silent {name} {e['id']} done|failed|skipped)")
         if problems:
             raise SystemExit("process: nothing committed:\n" + "\n".join(f"  {p}" for p in problems))
-        keys = {(e["kind"], e["subject"]) for e in entries}
-        superseded = [
-            {**old, "status": "superseded"}
-            for old in self.queue()
-            if old["project"] == name and old["status"] in ("pending", "info") and (old["kind"], old["subject"]) in keys
-        ]
-        self.append_jsonl(self.state_root() / "queue.jsonl", superseded + entries)
         handled = list(dict.fromkeys([i for e in entries for i in e["item_ids"]] + plan["dropped"]))
-        self.append_jsonl(pdir / "ledger.jsonl", [{"item_id": i, "at": iso(self.clock())} for i in handled])
+        superseded = self.record(name, entries, handled)
         if plan["first_run"]:
             self.write_json(pdir / "state.json", {**self.read_json(pdir / "state.json", {}), "bankrupt_at": iso(self.clock())})
         (pdir / "plan.json").unlink()
@@ -583,6 +600,9 @@ class Process:
             entries = [e for e in queue if e["project"] == name and e["status"] != "superseded" and shown(e)]
             lines += [f"## {name}", ""] + [f"> ⚠ {p}" for p in run.get("problems", {}).get(name, [])]
             lines += render_project(entries) or ["Nothing new.", ""]
+        unsorted = [e for e in queue if e["project"] == UNSORTED and e["status"] != "superseded" and shown(e)]
+        if unsorted and not opts.get("--project"):
+            lines += ["## Unsorted", "", "Items from a shared source that no profile's match rules claimed.", ""] + render_project(unsorted)
         brief = "\n".join(lines).rstrip() + "\n"
         self.state_root().mkdir(parents=True, exist_ok=True)
         (self.state_root() / "brief.md").write_text(brief)
@@ -599,6 +619,15 @@ class Process:
 
 BANKRUPTCY_AGE = 7 * 24 * 3600
 PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
+
+
+def asks(items):
+    """Group items into asks: the same kind about the same subject, whichever source saw it. github sorts first, so its
+    item leads the entry."""
+    groups = {}
+    for i in sorted(items, key=lambda i: (i["source"], i["timestamp"])):
+        groups.setdefault((i["kind"], canonical(i["subject"])), []).append(i)
+    return list(groups.values())
 
 
 def needs_draft(e):
