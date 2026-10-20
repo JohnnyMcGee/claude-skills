@@ -145,6 +145,10 @@ DENIED_TOOLS = [
 ]
 
 
+# The profile table each source reads its settings from, when it is not named after the source.
+SOURCE_TABLE = {"gmail": "google", "calendar": "google", "meetings": "google"}
+
+
 def load_profile(path):
     """Parse a profile: TOML front matter between +++ lines, then the how-to-sweep prose. Raises on any problem."""
     match = re.match(r"\+\+\+\n(.*?)\n\+\+\+\n(.*)", path.read_text(), re.S)
@@ -162,8 +166,8 @@ def load_profile(path):
             problems.append(f"the body has no {heading!r} section")
     phases = profile.get("phases", {})
     for source in profile.get("sources", []):
-        if source not in profile:
-            problems.append(f"source {source!r} has no [{source}] table")
+        if SOURCE_TABLE.get(source, source) not in profile:
+            problems.append(f"source {source!r} has no [{SOURCE_TABLE.get(source, source)}] table")
         if f"sweep-{source}" not in phases:
             problems.append(f"source {source!r} has no [phases.sweep-{source}]")
     for name, phase in phases.items():

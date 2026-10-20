@@ -53,14 +53,14 @@ name = "{name}"
 active = {active}
 workdir = "{workdir}"
 timezone = "America/Chicago"
-sources = ["github", "linear"]
+sources = {sources}
 
 [github]
 repo = "acme/widgets"
 
 [linear]
 team = "WID"
-
+{extra}
 [urgency]
 people = ["boss"]
 labels = ["deploy-blocking"]
@@ -75,7 +75,7 @@ allowed_tools = ["Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__git
 [phases.sweep-linear]
 model = "sonnet"
 allowed_tools = ["Read", "Bash(process emit:*)", "mcp__linear-server__get_notifications"]
-
+{phases}
 [phases.triage]
 model = "opus"
 allowed_tools = {triage_tools}
@@ -92,6 +92,84 @@ Nothing special.
 - 2026-10-20 — Created.
 """
 
+ALL_SOURCES = ["github", "linear", "slack", "gmail", "calendar", "meetings"]
+
+# The tables the Slack and Google sources read, keyed by what turns them on.
+SOURCE_TABLES = {
+    "slack": '[slack]\nworkspace = "{workspace}"\nwatchlist = {watchlist}\n',
+    "google": '[google]\naccount = "{account}"\nmanager = "boss@acme.example"\nnoise_label = "Noise"\n',
+}
+
+
+
+def slack(**over):
+    """A Slack item; by default Dee asking me something in #deploys."""
+    base = item(
+        source="slack",
+        native_id="C100/1792500000.000100",
+        version="1792500000.000100",
+        kind="mention",
+        subject="https://acme.slack.com/archives/C100/p1792500000000100",
+        link="https://acme.slack.com/archives/C100/p1792500000000100",
+        actor={"name": "Dee", "role": "person"},
+        summary="Dee asked in #deploys whether the export query uses the new index",
+        context="@me-dev does the export query use the new index?",
+        facts={"channel": "#deploys", "ask": "question"},
+    )
+    return {**base, **over}
+
+
+def email(**over):
+    """A Gmail item; by default Cal asking me for a review date."""
+    base = item(
+        source="gmail",
+        native_id="thread-1",
+        version="msg-1",
+        kind="email",
+        subject="https://mail.google.com/mail/u/0/#all/thread-1",
+        link="https://mail.google.com/mail/u/0/#all/thread-1",
+        actor={"name": "cal@acme.example", "role": "person"},
+        summary="Cal asked when the security review can happen",
+        context="When can we do the security review?",
+        facts={"ask": "question"},
+    )
+    return {**base, **over}
+
+
+def invite(**over):
+    """A pending Calendar invite; by default an internal one with no conflict."""
+    base = item(
+        source="calendar",
+        native_id="event-1",
+        version="2026-10-20T11:00:00Z",
+        kind="invite",
+        subject="https://calendar.google.com/calendar/event?eid=event-1",
+        link="https://calendar.google.com/calendar/event?eid=event-1",
+        actor={"name": "dee@acme.example", "role": "person"},
+        summary="Dee invited you to Export design review, Wed 14:00",
+        context="Walk through the CSV export design.",
+        facts={"external_guests": False, "with_manager": False, "conflicts": []},
+    )
+    return {**base, **over}
+
+
+def action_item(**over):
+    """An action item of mine from a Gemini notes doc."""
+    base = item(
+        source="meetings",
+        native_id="doc-1#benchmark-the-export-query",
+        version="2026-10-19T16:00:00Z",
+        kind="action_item",
+        subject="https://docs.google.com/document/d/doc-1#benchmark-the-export-query",
+        link="https://docs.google.com/document/d/doc-1",
+        actor={"name": "Gemini", "role": "bot"},
+        summary="Benchmark the export query against the new index",
+        context="Me Dev will benchmark the export query against the new index before Friday.",
+    )
+    return {**base, **over}
+
+
+NEW_SOURCE_ITEMS = {"slack": slack(), "gmail": email(), "calendar": invite(), "meetings": action_item()}
 
 class ProcessTestCase(unittest.TestCase):
     def setUp(self):
@@ -119,15 +197,26 @@ class ProcessTestCase(unittest.TestCase):
     def state(self):
         return self.tmp / "state" / "process"
 
-    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), text=None):
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None):
         path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
+        extra = ""
+        if "slack" in sources:
+            extra += SOURCE_TABLES["slack"].format(workspace=workspace, watchlist=json.dumps(list(watchlist)))
+        if {"gmail", "calendar", "meetings"} & set(sources):
+            extra += SOURCE_TABLES["google"].format(account=account)
+        if match:
+            extra += "[match]\n" + "".join(f"{k} = {json.dumps(v)}\n" for k, v in match.items())
+        phases = "".join(f'[phases.sweep-{s}]\nmodel = "sonnet"\nallowed_tools = ["Read", "Bash(process emit:*)"]\n' for s in sources if s not in ("github", "linear"))
         path.write_text(
             text
             or PROFILE.format(
                 name=name,
                 active=str(active).lower(),
                 workdir=self.tmp / "work" / name,
+                sources=json.dumps(list(sources)),
+                extra=extra,
+                phases=phases,
                 silent=json.dumps(list(silent)),
                 triage_tools=json.dumps(list(triage_tools)),
             )
@@ -186,6 +275,17 @@ class EmitTest(ProcessTestCase):
         self.assertIn("item 2", out)
         self.assertEqual(self.jsonl(self.profile_dir() / "items.jsonl"), [])
         self.assertEqual(self.process("watermark", "acme", "github"), "")
+
+    def test_each_new_sweeper_emits_valid_items_and_advances_its_own_watermark(self):
+        self.write_profile(sources=ALL_SOURCES)
+        for source, candidate in NEW_SOURCE_ITEMS.items():
+            with self.subTest(source=source):
+                self.emit(candidate, source=source, watermark="2026-10-20T13:00:00Z")
+
+                self.assertEqual(self.process("watermark", "acme", source).strip(), "2026-10-20T13:00:00Z")
+        stored = self.jsonl(self.profile_dir() / "items.jsonl")
+        self.assertEqual([i["source"] for i in stored], list(NEW_SOURCE_ITEMS))
+        self.assertEqual(self.process("validate", "item", str(self.profile_dir() / "items.jsonl")), "")
 
     def test_re_emitting_an_unchanged_item_is_a_no_op_but_a_new_version_is_a_new_item(self):
         self.emit(item())
@@ -727,6 +827,17 @@ class ProfileTest(ProcessTestCase):
                 self.write_profile(triage_tools=["Read", tool])
                 out = self.process("profiles", expect=1)
                 self.assertIn(f"phases.triage grants {tool!r}", out)
+
+    def test_a_profile_can_declare_all_six_sources(self):
+        self.write_profile(sources=ALL_SOURCES, match={"keywords": ["widgets"], "channels": ["#widgets"], "senders": ["@acme.example"]})
+
+        self.assertIn("acme  active  github, linear, slack, gmail, calendar, meetings", self.process("profiles"))
+
+    def test_google_sources_need_the_google_table(self):
+        text = self.write_profile(sources=["github", "linear", "gmail"]).read_text()
+        self.write_profile(text=text.replace("[google]", "[elsewhere]").replace('account = "me@acme.example"\n', ""))
+
+        self.assertIn("source 'gmail' has no [google] table", self.process("profiles", expect=1))
 
     def test_a_profile_missing_its_how_to_sweep_section_is_refused(self):
         self.write_profile(text=self.write_profile().read_text().replace("## How to sweep", "## Notes"))

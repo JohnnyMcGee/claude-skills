@@ -9,10 +9,10 @@
       "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
     },
     "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
-    "source": {"enum": ["github", "linear"]},
+    "source": {"enum": ["github", "linear", "slack", "gmail", "calendar", "meetings"]},
     "kind": {
-      "description": "What the item asks of me. review_request: a PR waits on my review. pr_status: one of my PRs needs attention or is ready. pr_comment: someone commented on my PR. mention: I was @-mentioned. comment: a comment on a ticket I own or follow. ticket_change: scope, blockers or due date changed on a ticket I own or one that blocks or is blocked by mine. notification: anything else from an inbox.",
-      "enum": ["review_request", "pr_status", "pr_comment", "mention", "comment", "ticket_change", "notification"]
+      "description": "What the item asks of me. review_request: a PR waits on my review. pr_status: one of my PRs needs attention or is ready. pr_comment: someone commented on my PR. mention: I was @-mentioned. comment: a comment on a ticket I own or follow. ticket_change: scope, blockers or due date changed on a ticket I own or one that blocks or is blocked by mine. notification: anything else from an inbox. dm: a Slack direct message to me. thread_question: an unanswered question in a Slack thread I posted in. channel_message: a message in a watchlist channel. invite: a calendar invite waiting on my RSVP. action_item: a meeting action item owned by me. email: an email in my inbox.",
+      "enum": ["review_request", "pr_status", "pr_comment", "mention", "comment", "ticket_change", "notification", "dm", "thread_question", "channel_message", "invite", "action_item", "email"]
     },
     "item": {
       "description": "Sweeper output, triage input. One fact from one source.",
@@ -51,7 +51,14 @@
             "checks": {"enum": ["passing", "failing", "pending", "none"]},
             "review": {"enum": ["approved", "changes_requested", "review_required", "none"]},
             "draft": {"type": "boolean"},
-            "notification_id": {"description": "Linear: the notification this item came from, to mark read.", "type": "string", "minLength": 1}
+            "notification_id": {"description": "Linear: the notification this item came from, to mark read.", "type": "string", "minLength": 1},
+            "ask": {"description": "Slack, Gmail: what the message asks of me. task: work to do (Slack: becomes a ticket). question: needs an answer from me. Absent: nothing is asked.", "enum": ["task", "question"]},
+            "answered": {"description": "Slack: I already replied or reacted after the ask. emit drops the item.", "type": "boolean"},
+            "channel": {"description": "Slack: the channel name (#deploys) or DM.", "type": "string", "minLength": 1},
+            "noise": {"description": "Gmail: a newsletter or notification mail, to label and archive.", "type": "boolean"},
+            "external_guests": {"description": "Calendar: a guest outside my Google account's domain is invited.", "type": "boolean"},
+            "with_manager": {"description": "Calendar: my manager organizes or attends.", "type": "boolean"},
+            "conflicts": {"description": "Calendar: titles of my accepted events that overlap it.", "type": "array", "items": {"type": "string"}}
           }
         }
       }
@@ -190,11 +197,36 @@
           "additionalProperties": false,
           "properties": {"team": {"type": "string", "minLength": 1}}
         },
+        "slack": {
+          "description": "The Slack source. Profiles naming the same workspace share one sweep.",
+          "type": "object",
+          "required": ["workspace"],
+          "additionalProperties": false,
+          "properties": {
+            "workspace": {"type": "string", "minLength": 1},
+            "watchlist": {"description": "Channels swept even without a mention (e.g. #incidents, #deploys).", "type": "array", "items": {"type": "string", "pattern": "^#"}}
+          }
+        },
         "google": {
+          "description": "The Gmail, Calendar and Meetings sources. Profiles naming the same account share one sweep of each.",
           "type": "object",
           "required": ["account"],
           "additionalProperties": false,
-          "properties": {"account": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$"}}
+          "properties": {
+            "account": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$"},
+            "manager": {"description": "My manager's email. Declining a meeting they organize or attend is never proposed.", "type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$"},
+            "noise_label": {"description": "The Gmail label noise is filed under when it is archived.", "type": "string", "minLength": 1}
+          }
+        },
+        "match": {
+          "description": "How items from a shared source are attributed to this project. Case-insensitive; the repo, the Linear team's ticket prefix and the Slack watchlist count too.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "keywords": {"description": "Words in an item's summary, subject, link or context.", "type": "array", "items": {"type": "string", "minLength": 1}},
+            "channels": {"description": "Slack channels.", "type": "array", "items": {"type": "string", "pattern": "^#"}},
+            "senders": {"description": "Actors, by full name or address or by a suffix such as @acme.example.", "type": "array", "items": {"type": "string", "minLength": 1}}
+          }
         },
         "urgency": {
           "type": "object",
@@ -223,6 +255,10 @@
           "properties": {
             "sweep-github": {"$ref": "#/$defs/phase"},
             "sweep-linear": {"$ref": "#/$defs/phase"},
+            "sweep-slack": {"$ref": "#/$defs/phase"},
+            "sweep-gmail": {"$ref": "#/$defs/phase"},
+            "sweep-calendar": {"$ref": "#/$defs/phase"},
+            "sweep-meetings": {"$ref": "#/$defs/phase"},
             "triage": {"$ref": "#/$defs/phase"}
           }
         }
