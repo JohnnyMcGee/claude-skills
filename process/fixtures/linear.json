@@ -7,6 +7,7 @@
     {"id": "notif-4", "type": "issueMention", "createdAt": "now", "updatedAt": "now", "readAt": null, "actor": {"name": "Dee"}, "issue": {"identifier": "WID-12", "title": "Reports page is slow", "url": "https://linear.app/acme/issue/WID-12"}, "comment": {"id": "c-12", "body": "@me-dev can you confirm whether the export query uses the new index?"}}
   ],
   "issues": [
-    {"identifier": "WID-20", "title": "Paginate the order list", "url": "https://linear.app/acme/issue/WID-20", "assignee": "me", "state": "In Progress", "updatedAt": "now", "history": [{"field": "dueDate", "from": "2026-10-24", "to": "2026-10-22", "actor": "Dee"}]}
+    {"identifier": "WID-20", "title": "Paginate the order list", "url": "https://linear.app/acme/issue/WID-20", "assignee": "me", "state": "In Progress", "updatedAt": "now", "history": [{"field": "dueDate", "from": "2026-10-24", "to": "2026-10-22", "actor": "Dee"}]},
+    {"identifier": "WID-21", "title": "Profile the reports page query", "url": "https://linear.app/acme/issue/WID-21", "assignee": "me", "state": "Todo", "updatedAt": "2026-10-19T17:00:00Z", "description": "From the Widgets standup notes: https://docs.google.com/document/d/doc-1", "history": []}
   ]
 }

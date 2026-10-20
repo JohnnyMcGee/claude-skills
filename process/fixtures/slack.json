@@ -1,0 +1,17 @@
+{
+  "me": {"id": "U0ME", "name": "me-dev", "real_name": "Me Dev"},
+  "messages": [
+    {"channel": {"id": "C100", "name": "#deploys"}, "ts": "1792500000.000100", "thread_ts": null, "permalink": "https://acme.slack.com/archives/C100/p1792500000000100", "user": {"id": "U0DEE", "name": "Dee"}, "time": "now", "text": "<@U0ME> does the export query use the new index? Deciding whether to ship 412 today.", "replies": [], "reactions": [], "why": "mention"},
+    {"channel": {"id": "D200", "name": "DM"}, "ts": "1792500100.000200", "thread_ts": null, "permalink": "https://acme.slack.com/archives/D200/p1792500100000200", "user": {"id": "U0DEE", "name": "Dee"}, "time": "now", "text": "Can you add an index on orders.created_at today? Reports time out without it.", "replies": [], "reactions": [], "why": "dm"},
+    {"channel": {"id": "C300", "name": "#widgets"}, "ts": "1792490000.000300", "thread_ts": "1792490000.000300", "permalink": "https://acme.slack.com/archives/C300/p1792490000000300", "user": {"id": "U0ME", "name": "me-dev"}, "time": "now", "text": "Heads up: CSV export lands behind a flag this week.", "replies": [
+      {"ts": "1792500200.000301", "user": {"id": "U0ANA", "name": "Ana"}, "time": "now", "text": "Will the export include archived orders?", "permalink": "https://acme.slack.com/archives/C300/p1792500200000301?thread_ts=1792490000.000300"}
+    ], "reactions": [], "why": "thread I posted in"},
+    {"channel": {"id": "C300", "name": "#widgets"}, "ts": "1792480000.000400", "thread_ts": "1792480000.000400", "permalink": "https://acme.slack.com/archives/C300/p1792480000000400", "user": {"id": "U0ME", "name": "me-dev"}, "time": "now", "text": "Thumbnail cache is live.", "replies": [
+      {"ts": "1792500300.000401", "user": {"id": "U0BEN", "name": "Ben"}, "time": "now", "text": "What's the TTL?", "permalink": "https://acme.slack.com/archives/C300/p1792500300000401?thread_ts=1792480000.000400"},
+      {"ts": "1792500400.000402", "user": {"id": "U0ME", "name": "me-dev"}, "time": "now", "text": "24 hours.", "permalink": "https://acme.slack.com/archives/C300/p1792500400000402?thread_ts=1792480000.000400"}
+    ], "reactions": [], "why": "thread I posted in, already answered"},
+    {"channel": {"id": "C100", "name": "#deploys"}, "ts": "1792500500.000500", "thread_ts": null, "permalink": "https://acme.slack.com/archives/C100/p1792500500000500", "user": {"id": "U0CAL", "name": "Cal"}, "time": "now", "text": "<@U0ME> can you confirm the migration ran on staging?", "replies": [], "reactions": [{"name": "white_check_mark", "users": ["U0ME"]}], "why": "mention, already reacted"},
+    {"channel": {"id": "C400", "name": "#incidents"}, "ts": "1792500600.000600", "thread_ts": null, "permalink": "https://acme.slack.com/archives/C400/p1792500600000600", "user": {"id": "U0OPS", "name": "Ops"}, "time": "now", "text": "Incident 88 resolved: checkout latency back to normal.", "replies": [], "reactions": [], "why": "watchlist"},
+    {"channel": {"id": "D500", "name": "DM"}, "ts": "1792490000.000700", "thread_ts": null, "permalink": "https://acme.slack.com/archives/D500/p1792490000000700", "user": {"id": "U0GH", "name": "GitHub", "is_bot": true}, "time": "now", "text": "Your daily review digest: acme/widgets#101 Add CSV export (https://github.com/acme/widgets/pull/101), acme/widgets#102 Fix checkout rounding (https://github.com/acme/widgets/pull/102)", "replies": [], "reactions": [], "why": "dm"}
+  ]
+}

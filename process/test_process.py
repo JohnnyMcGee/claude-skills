@@ -60,14 +60,14 @@ name = "{name}"
 active = {active}
 workdir = "{workdir}"
 timezone = "America/Chicago"
-sources = ["github", "linear"]
+sources = {sources}
 
 [github]
-repo = "acme/widgets"
+repo = "{repo}"
 
 [linear]
-team = "WID"
-
+team = "{team}"
+{extra}
 [urgency]
 people = ["boss"]
 labels = ["deploy-blocking"]
@@ -78,12 +78,12 @@ silent = {silent}
 
 [phases.sweep-github]
 model = "sonnet"
-allowed_tools = ["Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__github__pull_request_read"]
+allowed_tools = {sweep_tools}
 
 [phases.sweep-linear]
 model = "sonnet"
 allowed_tools = ["Read", "Bash(process emit:*)", "mcp__linear-server__get_notifications"]
-
+{phases}
 [phases.triage]
 model = "opus"
 allowed_tools = {triage_tools}
@@ -108,6 +108,84 @@ Nothing special.
 - 2026-10-20 — Created.
 """
 
+ALL_SOURCES = ["github", "linear", "slack", "gmail", "calendar", "meetings"]
+
+# The tables the Slack and Google sources read, keyed by what turns them on.
+SOURCE_TABLES = {
+    "slack": '[slack]\nworkspace = "{workspace}"\nwatchlist = {watchlist}\n',
+    "google": '[google]\naccount = "{account}"\nmanager = "boss@acme.example"\nnoise_label = "Noise"\n',
+}
+
+
+
+def slack(**over):
+    """A Slack item; by default Dee asking me something in #deploys."""
+    base = item(
+        source="slack",
+        native_id="C100/1792500000.000100",
+        version="1792500000.000100",
+        kind="mention",
+        subject="https://acme.slack.com/archives/C100/p1792500000000100",
+        link="https://acme.slack.com/archives/C100/p1792500000000100",
+        actor={"name": "Dee", "role": "person"},
+        summary="Dee asked in #deploys whether the export query uses the new index",
+        context="@me-dev does the export query use the new index?",
+        facts={"channel": "#deploys", "ask": "question"},
+    )
+    return {**base, **over}
+
+
+def email(**over):
+    """A Gmail item; by default Cal asking me for a review date."""
+    base = item(
+        source="gmail",
+        native_id="thread-1",
+        version="msg-1",
+        kind="email",
+        subject="https://mail.google.com/mail/u/0/#all/thread-1",
+        link="https://mail.google.com/mail/u/0/#all/thread-1",
+        actor={"name": "cal@acme.example", "role": "person"},
+        summary="Cal asked when the security review can happen",
+        context="When can we do the security review?",
+        facts={"ask": "question"},
+    )
+    return {**base, **over}
+
+
+def invite(**over):
+    """A pending Calendar invite; by default an internal one with no conflict."""
+    base = item(
+        source="calendar",
+        native_id="event-1",
+        version="2026-10-20T11:00:00Z",
+        kind="invite",
+        subject="https://calendar.google.com/calendar/event?eid=event-1",
+        link="https://calendar.google.com/calendar/event?eid=event-1",
+        actor={"name": "dee@acme.example", "role": "person"},
+        summary="Dee invited you to Export design review, Wed 14:00",
+        context="Walk through the CSV export design.",
+        facts={"external_guests": False, "with_manager": False, "conflicts": []},
+    )
+    return {**base, **over}
+
+
+def action_item(**over):
+    """An action item of mine from a Gemini notes doc."""
+    base = item(
+        source="meetings",
+        native_id="doc-1#benchmark-the-export-query",
+        version="2026-10-19T16:00:00Z",
+        kind="action_item",
+        subject="https://docs.google.com/document/d/doc-1#benchmark-the-export-query",
+        link="https://docs.google.com/document/d/doc-1",
+        actor={"name": "Gemini", "role": "bot"},
+        summary="Benchmark the export query against the new index",
+        context="Me Dev will benchmark the export query against the new index before Friday.",
+    )
+    return {**base, **over}
+
+
+NEW_SOURCE_ITEMS = {"slack": slack(), "gmail": email(), "calendar": invite(), "meetings": action_item()}
 
 class ProcessTestCase(unittest.TestCase):
     def setUp(self):
@@ -135,17 +213,31 @@ class ProcessTestCase(unittest.TestCase):
     def state(self):
         return self.tmp / "state" / "process"
 
-    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Bash(process execute plan:*)", "Bash(process execute result:*)"), afk=None, text=None):
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Bash(process execute plan:*)", "Bash(process execute result:*)"), afk=None, text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None, repo="acme/widgets", team="WID", sweep_tools=("Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__github__pull_request_read")):
         path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
+        extra = ""
+        if "slack" in sources:
+            extra += SOURCE_TABLES["slack"].format(workspace=workspace, watchlist=json.dumps(list(watchlist)))
+        if {"gmail", "calendar", "meetings"} & set(sources):
+            extra += SOURCE_TABLES["google"].format(account=account)
+        if match:
+            extra += "[match]\n" + "".join(f"{k} = {json.dumps(v)}\n" for k, v in match.items())
+        phases = "".join(f'[phases.sweep-{s}]\nmodel = "sonnet"\nallowed_tools = ["Read", "Bash(process emit:*)"]\n' for s in sources if s not in ("github", "linear"))
         path.write_text(
             text
             or PROFILE.format(
                 name=name,
                 active=str(active).lower(),
                 workdir=self.tmp / "work" / name,
+                sources=json.dumps(list(sources)),
+                repo=repo,
+                team=team,
+                extra=extra,
+                phases=phases,
                 silent=json.dumps(list(silent)),
                 triage_tools=json.dumps(list(triage_tools)),
+                sweep_tools=json.dumps(list(sweep_tools)),
                 execute_tools=json.dumps(list(execute_tools)),
                 afk="[afk]\n" + "".join(f"{k} = {json.dumps(v)}\n" for k, v in afk.items()) if afk else "",
             )
@@ -172,6 +264,16 @@ class EmitTest(ProcessTestCase):
         self.assertEqual(stored["profile"], "acme")
         self.assertEqual(self.process("validate", "item", str(self.profile_dir() / "items.jsonl")), "")
         self.assertEqual(self.process("watermark", "acme", "github").strip(), "2026-10-20T13:00:00Z")
+
+    def test_an_item_cannot_name_the_profile_it_is_stored_under(self):
+        self.write_profile("acme")
+        self.write_profile("beta")
+
+        self.emit({**item(), "profile": "beta"})
+
+        [stored] = self.jsonl(self.profile_dir() / "items.jsonl")
+        self.assertEqual(stored["profile"], "acme")
+        self.assertEqual(self.jsonl(self.profile_dir("beta") / "items.jsonl"), [])
 
     def test_emit_consumes_an_inbox_file(self):
         inbox = self.profile_dir() / "inbox"
@@ -204,6 +306,76 @@ class EmitTest(ProcessTestCase):
         self.assertIn("item 2", out)
         self.assertEqual(self.jsonl(self.profile_dir() / "items.jsonl"), [])
         self.assertEqual(self.process("watermark", "acme", "github"), "")
+
+    def test_each_new_sweeper_emits_valid_items_and_advances_its_own_watermark(self):
+        self.write_profile(sources=ALL_SOURCES)
+        for source, candidate in NEW_SOURCE_ITEMS.items():
+            with self.subTest(source=source):
+                self.emit(candidate, source=source, watermark="2026-10-20T13:00:00Z")
+
+                self.assertEqual(self.process("watermark", "acme", source).strip(), "2026-10-20T13:00:00Z")
+        stored = self.jsonl(self.profile_dir() / "items.jsonl")
+        self.assertEqual([i["source"] for i in stored], list(NEW_SOURCE_ITEMS))
+        self.assertEqual(self.process("validate", "item", str(self.profile_dir() / "items.jsonl")), "")
+
+    def test_a_slack_thread_i_already_replied_or_reacted_to_does_not_become_an_item(self):
+        self.write_profile(sources=ALL_SOURCES)
+
+        out = self.emit(slack(facts={"channel": "#deploys", "ask": "question", "answered": True}), source="slack", watermark="2026-10-20T13:00:00Z")
+
+        self.assertIn("stored 0 new item(s)", out)
+        self.assertIn("1 already answered", out)
+        self.assertEqual(self.jsonl(self.profile_dir() / "items.jsonl"), [])
+        self.assertEqual(self.process("watermark", "acme", "slack").strip(), "2026-10-20T13:00:00Z")
+
+    def test_a_shared_source_is_attributed_to_projects_by_match_rules_and_the_rest_is_unsorted(self):
+        self.write_profile("acme", sources=ALL_SOURCES, watchlist=["#deploys"])
+        self.write_profile("side", sources=ALL_SOURCES, watchlist=["#gadgets"], repo="acme/gadgets", team="GAD", match={"keywords": ["gizmo"], "senders": ["@gadgets.example"]})
+        self.write_profile("old", active=False, sources=ALL_SOURCES, match={"keywords": ["lunch"]})
+
+        out = self.emit(
+            slack(native_id="C1/1", facts={"channel": "#deploys"}),  # acme's watchlist
+            slack(native_id="C2/2", summary="Eve asked about the gizmo rollout", facts={"channel": "#general"}),  # side's keyword
+            slack(native_id="C3/3", summary="Fay asked whether GAD-12 ships today", facts={"channel": "#general"}),  # side's team
+            slack(native_id="C4/4", summary="Gus asked who is up for lunch", context="lunch?", facts={"channel": "#random"}),
+            source="slack",
+            watermark="2026-10-20T13:00:00Z",
+        )
+
+        attributed = {name: [i["native_id"] for i in self.jsonl(self.profile_dir(name) / "items.jsonl")] for name in ("acme", "side", "unsorted")}
+        self.assertEqual(attributed, {"acme": ["C1/1"], "side": ["C2/2", "C3/3"], "unsorted": ["C4/4"]})
+        self.assertEqual(self.jsonl(self.profile_dir("side") / "items.jsonl")[0]["profile"], "side")
+        self.assertIn("stored 4 new item(s)", out)
+        for name in ("acme", "side"):
+            self.assertEqual(self.process("watermark", name, "slack").strip(), "2026-10-20T13:00:00Z")
+
+    def test_an_item_already_stored_for_any_profile_sharing_the_feed_is_not_stored_again(self):
+        self.write_profile("acme", sources=ALL_SOURCES, match={"keywords": ["widgets"]})
+        self.write_profile("side", sources=ALL_SOURCES, repo="acme/gadgets", team="GAD")
+        self.emit(email(summary="Cal asked about the widgets security review"), source="gmail")
+
+        out = self.emit(email(summary="Cal asked about the security review"), source="gmail")  # reworded: acme no longer claims it
+
+        self.assertIn("stored 0 new item(s)", out)
+        self.assertFalse((self.profile_dir("unsorted") / "items.jsonl").exists())
+
+    def test_noise_no_profile_claims_goes_to_the_sweeping_profile_to_be_archived(self):
+        self.write_profile("acme", sources=ALL_SOURCES)
+        self.write_profile("side", sources=ALL_SOURCES, repo="acme/gadgets", team="GAD")
+
+        self.emit(email(actor={"name": "news@vendor.example", "role": "bot"}, summary="Vendor newsletter", context="tips", facts={"noise": True}), profile="side", source="gmail")
+
+        self.assertEqual([i["profile"] for i in self.jsonl(self.profile_dir("side") / "items.jsonl")], ["side"])
+
+    def test_a_source_no_other_active_profile_shares_takes_every_item(self):
+        self.write_profile("acme", sources=ALL_SOURCES)
+        self.write_profile("side", sources=ALL_SOURCES, workspace="gadgets", account="me@gadgets.example", match={"keywords": ["lunch"]})
+
+        self.emit(slack(summary="Gus asked who is up for lunch", facts={"channel": "#random"}), source="slack")
+        self.emit(email(summary="Lunch on Friday?", actor={"name": "gus@gadgets.example", "role": "person"}), source="gmail")
+
+        self.assertEqual([i["source"] for i in self.jsonl(self.profile_dir("acme") / "items.jsonl")], ["slack", "gmail"])
+        self.assertFalse((self.profile_dir("side") / "items.jsonl").exists())
 
     def test_re_emitting_an_unchanged_item_is_a_no_op_but_a_new_version_is_a_new_item(self):
         self.emit(item())
@@ -254,16 +426,20 @@ class TriageTestCase(ProcessTestCase):
         """The queue's current state: the last line for each entry id."""
         return list({e["id"]: e for e in self.jsonl(self.state / "queue.jsonl")}.values())
 
-    def triage(self, profile="acme", outcome="done"):
+    def triage(self, profile="acme", outcome="done", note=None):
         """Run triage the way the triage skill does: plan, draft every draft entry, report each silent action, commit."""
         self.process("triage", "plan", profile)
         for entry in self.plan(profile)["entries"]:
-            if entry["action"]["type"] not in ("none", "linear_mark_read"):
+            if entry["action"]["type"] not in ("none",) + TRIAGE_ACTIONS:
                 self.process("triage", "draft", profile, entry["id"], stdin=f"Draft for {entry['summary']}")
-            if entry["action"]["type"] == "linear_mark_read":
-                self.process("triage", "silent", profile, entry["id"], outcome)
+            if entry["action"]["type"] in TRIAGE_ACTIONS:
+                self.process("triage", "silent", profile, entry["id"], outcome, *([note] if note else []))
         self.process("triage", "commit", profile)
         return self.queue()
+
+
+# The silent actions triage performs itself, then reports.
+TRIAGE_ACTIONS = ("linear_mark_read", "linear_create_issue", "gmail_archive")
 
 
 class TriageTest(TriageTestCase):
@@ -357,6 +533,206 @@ class TriageRulesTest(TriageTestCase):
         self.emit(mine)
         self.process("triage", "plan", "acme")
         self.assertEqual(self.plan()["entries"], [])
+
+
+class SlackTriageTest(TriageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def test_a_slack_question_gets_a_drafted_reply_in_its_thread(self):
+        self.emit(slack(), source="slack")
+
+        [reply] = self.triage()
+
+        self.assertEqual(reply["action"]["type"], "slack_reply")
+        self.assertEqual(reply["action"]["params"], {"channel": "C100", "thread_ts": "1792500000.000100"})
+        self.assertEqual((reply["autonomy"], reply["status"], reply["urgency"]), ("draft", "pending", "normal"))
+        self.assertTrue(reply["action"]["draft"])
+
+    def test_an_immediate_slack_ask_becomes_a_ticket_assigned_to_me_silently_linking_back(self):
+        ask = slack(summary="Dee asked you to add an index on orders.created_at", facts={"channel": "#deploys", "ask": "task"})
+        self.emit(ask, source="slack")
+
+        plan = self.process("triage", "plan", "acme")
+        self.assertIn("[do, then report]", plan)
+        self.assertIn("| @me-dev does the export query use the new index?", plan)  # the ticket's description comes from it
+        [ticket] = self.triage(note="https://linear.app/acme/issue/WID-30")
+
+        self.assertEqual(ticket["action"]["type"], "linear_create_issue")
+        self.assertEqual(ticket["action"]["params"], {"team": "WID", "assignee": "me", "link": ask["link"]})
+        self.assertEqual((ticket["autonomy"], ticket["status"], ticket["note"]), ("silent", "done", "https://linear.app/acme/issue/WID-30"))
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+
+    def test_an_ask_already_ticketed_is_not_ticketed_again_when_its_message_changes(self):
+        ask = slack(summary="Dee asked you to add an index on orders.created_at", facts={"channel": "#deploys", "ask": "task"})
+        self.emit(ask, source="slack")
+        self.triage(note="https://linear.app/acme/issue/WID-30")
+
+        self.emit({**ask, "version": "1792500100.000100"}, source="slack")  # Dee edited the message
+        queue = self.triage()
+
+        self.assertEqual([e["action"]["type"] for e in queue], ["linear_create_issue", "none"])
+        self.assertIn("already ticketed: https://linear.app/acme/issue/WID-30", queue[1]["summary"])
+
+    def test_an_ask_triage_found_already_tracked_is_listed_under_done_silently_as_skipped(self):
+        self.emit(slack(summary="Dee asked you to add an index on orders.created_at", facts={"channel": "#deploys", "ask": "task"}), source="slack")
+        self.triage(outcome="skipped", note="already tracked: https://linear.app/acme/issue/WID-21")
+
+        self.process("brief")
+
+        self.assertIn(
+            "- Dee asked you to add an index on orders.created_at — skipped: already tracked: https://linear.app/acme/issue/WID-21",
+            (self.state / "brief.md").read_text(),
+        )
+
+    def digest_dm(self, number=101):
+        """GitHub's daily review digest DM in Slack, as the sweeper maps it: one review request per PR it names."""
+        return slack(
+            native_id=f"D9/1792490000.000100#pr-{number}",
+            kind="review_request",
+            subject=f"https://github.com/acme/widgets/pull/{number}",
+            actor={"name": "GitHub", "role": "bot"},
+            summary=f"GitHub digest: review requested on #{number}",
+            facts={"channel": "DM"},
+        )
+
+    def test_the_github_review_digest_dm_merges_into_the_github_review_request(self):
+        self.emit(item())
+        self.emit(self.digest_dm(), source="slack")
+
+        [review] = self.triage()
+
+        self.assertEqual((review["sources"], review["action"]["type"]), (["github", "slack"], "gh_review"))
+
+    def test_a_review_digest_or_linear_mirror_naming_a_review_already_queued_adds_nothing(self):
+        self.emit(item())
+        [review] = self.triage()
+
+        self.emit(self.digest_dm(), source="slack")
+        self.emit(linear(), source="linear")
+        queue = self.triage()
+
+        self.assertEqual([e["kind"] for e in queue], ["review_request", "housekeeping"])  # the mirror's notification is still marked read
+        self.assertEqual(self.process("triage", "plan", "acme").splitlines()[-1].split(";")[0], "0 entr(ies) planned in " + str(self.profile_dir() / "plan.json"))
+
+    def test_a_slack_message_that_asks_nothing_is_an_fyi(self):
+        self.emit(slack(kind="channel_message", summary="Deploy 412 finished", facts={"channel": "#deploys"}), source="slack")
+
+        [fyi] = self.triage()
+
+        self.assertEqual((fyi["status"], fyi["action"]["type"], fyi["urgency"]), ("info", "none", "low"))
+
+
+class MeetingsTriageTest(TriageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def test_my_meeting_action_item_becomes_a_ticket_in_triage_assigned_to_me_linking_to_the_notes(self):
+        self.emit(action_item(), source="meetings")
+
+        [ticket] = self.triage(note="https://linear.app/acme/issue/WID-31")
+
+        self.assertEqual(ticket["action"]["type"], "linear_create_issue")
+        self.assertEqual(ticket["action"]["params"], {"team": "WID", "state": "Triage", "assignee": "me", "link": "https://docs.google.com/document/d/doc-1"})
+        self.assertEqual((ticket["autonomy"], ticket["status"]), ("silent", "done"))
+
+    def test_an_action_item_already_ticketed_is_not_ticketed_again_when_the_notes_change(self):
+        self.emit(action_item(), source="meetings")
+        self.triage(note="https://linear.app/acme/issue/WID-31")
+
+        self.emit(action_item(version="2026-10-20T09:00:00Z"), source="meetings")
+
+        self.assertEqual([e["action"]["type"] for e in self.triage()], ["linear_create_issue", "none"])
+
+
+class CalendarTriageTest(TriageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def rsvp(self, **over):
+        self.emit(invite(**over), source="calendar")
+        return self.triage()[-1]
+
+    def test_invites_whose_links_differ_only_in_the_query_stay_separate(self):
+        self.emit(invite(), invite(native_id="event-2", subject="https://calendar.google.com/calendar/event?eid=event-2"), source="calendar")
+
+        self.assertEqual([e["action"]["params"]["event_id"] for e in self.triage()], ["event-1", "event-2"])
+
+    def test_a_pending_invite_with_no_conflict_gets_a_drafted_accept(self):
+        rsvp = self.rsvp()
+
+        self.assertEqual(rsvp["action"]["type"], "rsvp")
+        self.assertEqual(rsvp["action"]["params"], {"event_id": "event-1", "response": "accepted"})
+        self.assertEqual((rsvp["autonomy"], rsvp["status"]), ("draft", "pending"))
+
+    def test_a_conflicting_invite_is_proposed_declined_unless_external_guests_or_my_manager_are_in_it(self):
+        cases = {
+            "internal": ({"external_guests": False, "with_manager": False}, "dee@acme.example", "declined"),
+            "external guests": ({"external_guests": True, "with_manager": False}, "dee@acme.example", "tentative"),
+            "manager attends": ({"external_guests": False, "with_manager": True}, "dee@acme.example", "tentative"),
+            "manager organizes": ({"external_guests": False, "with_manager": False}, "boss@acme.example", "tentative"),
+        }
+        for n, (case, (facts, organizer, response)) in enumerate(cases.items()):
+            with self.subTest(case=case):
+                rsvp = self.rsvp(native_id=f"event-{n}", subject=f"https://calendar.google.com/calendar/event?eid=event-{n}", actor={"name": organizer, "role": "person"}, facts={**facts, "conflicts": ["1:1 with Ana"]})
+
+                self.assertEqual(rsvp["action"]["params"]["response"], response)
+                self.assertIn("conflicts with 1:1 with Ana", rsvp["summary"])
+
+    def test_a_plan_edited_into_declining_a_meeting_with_external_guests_or_my_manager_is_refused(self):
+        for n, facts in enumerate(({"external_guests": True}, {"with_manager": True})):
+            with self.subTest(facts=facts):
+                self.emit(invite(native_id=f"event-{n}", facts={"conflicts": [], **facts}), source="calendar")
+                self.process("triage", "plan", "acme")
+                path = self.profile_dir() / "plan.json"
+                plan = json.loads(path.read_text())
+                plan["entries"][0]["action"]["params"]["response"] = "declined"
+                plan["entries"][0]["action"]["draft"] = "Can't make it."
+                path.write_text(json.dumps(plan))
+
+                out = self.process("triage", "commit", "acme", expect=1)
+
+                self.assertIn("never decline", out)
+                self.assertEqual(self.jsonl(self.state / "queue.jsonl"), [])
+                path.unlink()
+
+
+class GmailTriageTest(TriageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def noise(self, n):
+        return email(native_id=f"thread-{n}", subject=f"https://mail.google.com/mail/u/0/#all/thread-{n}", actor={"name": "news@vendor.example", "role": "bot"}, summary=f"Vendor newsletter {n}", facts={"noise": True})
+
+    def test_an_email_that_asks_something_of_me_gets_a_drafted_reply(self):
+        self.emit(email(), source="gmail")
+
+        [reply] = self.triage()
+
+        self.assertEqual((reply["action"]["type"], reply["action"]["params"]), ("email_reply", {"thread_id": "thread-1"}))
+        self.assertEqual((reply["autonomy"], reply["status"], reply["urgency"]), ("draft", "pending", "normal"))
+
+    def test_noise_is_labeled_and_archived_silently_and_listed_under_done_silently(self):
+        self.emit(self.noise(2), self.noise(3), source="gmail")
+
+        [archive] = self.triage()
+
+        self.assertEqual(archive["action"], {"type": "gmail_archive", "params": {"thread_ids": ["thread-2", "thread-3"], "label": "Noise"}})
+        self.assertEqual((archive["autonomy"], archive["status"]), ("silent", "done"))
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+        self.process("brief")
+        self.assertIn("- Labeled Noise and archived 2 email(s): Vendor newsletter 2; Vendor newsletter 3 — done", (self.state / "brief.md").read_text())
+
+    def test_an_email_that_asks_nothing_is_an_fyi(self):
+        self.emit(email(summary="Cal shared the Q4 roadmap", facts={}), source="gmail")
+
+        [fyi] = self.triage()
+
+        self.assertEqual((fyi["status"], fyi["action"]["type"], fyi["urgency"]), ("info", "none", "low"))
 
 
 class LinearInboxTest(TriageTestCase):
@@ -1499,7 +1875,7 @@ class RunTest(ProcessTestCase):
         self.process("run", "--delta", "--project", "side", "--fixtures", "/fx")
 
         prompts = [c[2] for c, _ in self.claude_calls()]
-        self.assertEqual(prompts, ["/sweep-github side --delta --fixtures /fx", "/sweep-linear side --delta --fixtures /fx", "/triage side --dry-run"])
+        self.assertEqual(prompts, ["/sweep-github side --delta --fixtures /fx", "/sweep-linear side --delta --fixtures /fx", "/triage side --dry-run --fixtures /fx"])
         brief = (self.state / "brief.md").read_text()
         self.assertIn("· delta", brief)
         self.assertNotIn("## acme", brief)
@@ -1513,6 +1889,43 @@ class RunTest(ProcessTestCase):
         self.env["XDG_STATE_HOME"] = str(self.tmp / "scratch")
         self.process("run", "--fixtures", "/fx")
         self.assertIn("/next-work acme --fixtures /fx", [c[2] for c, _ in self.claude_calls()])
+
+    def test_a_source_shared_by_two_profiles_is_swept_once_for_both(self):
+        self.write_profile("acme", sources=ALL_SOURCES)
+        self.write_profile("side", sources=ALL_SOURCES)
+
+        def sweep(source):  # a sweeper that does its job and finds nothing
+            return lambda cmd: process.main(["emit", "acme", source], run=self.run_fake, env=self.env, stdin=io.StringIO(""), stdout=io.StringIO(), clock=lambda: self.now)
+
+        for source in ALL_SOURCES[2:]:
+            self.run_fake.responses[("claude", "-p", f"/sweep-{source} acme")] = sweep(source)
+
+        self.process("run")
+
+        prompts = [c[2] for c, _ in self.claude_calls()]
+        shared = [f"/sweep-{s} acme" for s in ALL_SOURCES[2:]]
+        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", *shared, "/triage acme", "/next-work acme", "/sweep-github side", "/sweep-linear side", "/triage side", "/next-work side"])
+        self.assertNotIn("slack", (self.state / "brief.md").read_text())  # side's watermark moved with acme's sweep
+
+    def test_unsorted_items_get_their_own_section_of_the_brief_once(self):
+        self.write_profile("acme", sources=["github", "linear", "slack"])
+        self.write_profile("side", sources=["github", "linear", "slack"], repo="acme/gadgets", team="GAD", watchlist=[])
+        lunch = slack(summary="Gus asked who is up for lunch", context="lunch?", facts={"channel": "#random", "ask": "question"})
+
+        def sweep_slack(cmd):
+            process.main(["emit", "acme", "slack"], run=self.run_fake, env=self.env, stdin=io.StringIO(json.dumps(lunch) + "\n"), stdout=io.StringIO(), clock=lambda: self.now)
+
+        self.run_fake.responses[("claude", "-p", "/sweep-slack acme")] = sweep_slack
+
+        self.process("run")
+        self.process("run")
+
+        brief = (self.state / "brief.md").read_text()
+        self.assertIn("## Unsorted", brief)
+        self.assertIn("Gus asked who is up for lunch", brief.split("## Unsorted", 1)[1])
+        unsorted = [e for e in self.jsonl(self.state / "queue.jsonl") if e["project"] == "unsorted"]
+        self.assertEqual([(e["status"], e["action"]["type"]) for e in unsorted], [("info", "none")])
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
 
     def test_a_dry_run_reads_fixtures_from_an_absolute_path_with_no_service_tools(self):
         self.write_profile("acme")
@@ -1580,7 +1993,7 @@ class RunTest(ProcessTestCase):
         self.run_fake.responses[("claude", "-p", "/sweep-github acme")] = sweep
         self.run_fake.responses[("claude", "-p", "/sweep-github acme --fixtures /fx")] = sweep
         self.run_fake.responses[("claude", "-p", "/triage acme")] = triage
-        self.run_fake.responses[("claude", "-p", "/triage acme --dry-run")] = triage
+        self.run_fake.responses[("claude", "-p", "/triage acme --dry-run --fixtures /fx")] = triage
         self.process("run", *flags)
         return [c[2] for c, _ in self.claude_calls()]
 
@@ -1690,6 +2103,10 @@ class ProfileTest(ProcessTestCase):
         "mcp__github__update_pull_request",
         "mcp__github__delete_repository",
         "mcp__slack__slack_add_reaction",
+        "mcp__slack__slack_complete_file_upload",  # shares an uploaded file into a channel
+        "mcp__claude_ai_Gmail__apply_sensitive_thread_label",
+        "mcp__claude_ai_Gmail__apply_sensitive_message_label",
+        "mcp__claude_ai_Google_Drive__copy_file",
         "mcp__linear-server__create_comment",
         "mcp__claude_ai_Google_Calendar__create_event",
         "Edit",
@@ -1697,7 +2114,36 @@ class ProfileTest(ProcessTestCase):
         "NotebookEdit",
         "WebFetch",
         "WebSearch",
+        "mcp__claude_ai_Gmail__trash_thread",
+        "mcp__claude_ai_Gmail__mark_thread_spam",
+        "mcp__claude_ai_Gmail__create_draft",
+        "mcp__slack__slack_send_message_draft",
     ]
+    # The silent writes: triage may perform them, a sweeper never.
+    SILENT_WRITES = [
+        "mcp__linear-server__mark_notification",
+        "mcp__linear-server__save_issue",
+        "mcp__linear-server__create_issue",
+        "mcp__claude_ai_Gmail__label_thread",
+        "mcp__claude_ai_Gmail__unlabel_thread",
+        "mcp__claude_ai_Gmail__label_message",
+        "mcp__claude_ai_Gmail__unlabel_message",
+    ]
+
+    def test_triage_may_grant_the_silent_writes_but_a_sweeper_may_not(self):
+        self.write_profile(triage_tools=["Read", *self.SILENT_WRITES])
+        self.assertIn("acme  active", self.process("profiles"))
+
+        for tool in self.SILENT_WRITES:
+            with self.subTest(tool=tool):
+                self.write_profile(sweep_tools=["Read", tool])
+                self.assertIn(f"phases.sweep-github grants {tool!r}", self.process("profiles", expect=1))
+
+    def test_sweepers_may_read_slack_reactions_calendars_and_meeting_notes(self):
+        reads = ["mcp__slack__slack_get_reactions", "mcp__slack__slack_read_thread", "mcp__claude_ai_Google_Calendar__list_events", "mcp__claude_ai_Google_Drive__read_file_content", "mcp__claude_ai_Gmail__search_threads"]
+        self.write_profile(sweep_tools=["Read", *reads])
+
+        self.assertIn("acme  active", self.process("profiles"))
 
     def test_profile_prints_one_profile_so_phases_never_guess_its_path(self):
         path = self.write_profile("acme")
@@ -1706,6 +2152,17 @@ class ProfileTest(ProcessTestCase):
 
         self.assertTrue(out.startswith(f"{path}\ninbox: {self.profile_dir('acme') / 'inbox'}\n"))
         self.assertIn("## How to sweep", out)
+
+    def test_profile_names_who_shares_each_feed_and_every_watchlist_its_sweep_covers(self):
+        self.write_profile("acme", sources=ALL_SOURCES, watchlist=["#deploys"])
+        self.write_profile("side", sources=["github", "linear", "slack"], watchlist=["#gadgets", "#deploys"])
+        self.write_profile("solo", sources=["github", "linear", "gmail"], account="me@solo.example")
+
+        out = self.process("profile", "acme")
+
+        self.assertIn("shared slack: acme, side (one sweep serves all; emit attributes each item)\n", out)
+        self.assertIn("watchlist: #deploys, #gadgets\n", out)
+        self.assertNotIn("shared gmail", out)
 
     def test_profiles_lists_each_profile_with_its_sources(self):
         self.write_profile("acme")
@@ -1722,6 +2179,22 @@ class ProfileTest(ProcessTestCase):
                 self.write_profile(triage_tools=["Read", tool])
                 out = self.process("profiles", expect=1)
                 self.assertIn(f"phases.triage grants {tool!r}", out)
+
+    def test_a_profile_can_declare_all_six_sources(self):
+        self.write_profile(sources=ALL_SOURCES, match={"keywords": ["widgets"], "channels": ["#widgets"], "senders": ["@acme.example"]})
+
+        self.assertIn("acme  active  github, linear, slack, gmail, calendar, meetings", self.process("profiles"))
+
+    def test_google_sources_need_the_google_table(self):
+        text = self.write_profile(sources=["github", "linear", "gmail"]).read_text()
+        self.write_profile(text=text.replace("[google]", "[elsewhere]").replace('account = "me@acme.example"\n', ""))
+
+        self.assertIn("source 'gmail' has no [google] table", self.process("profiles", expect=1))
+
+    def test_unsorted_is_reserved_for_items_no_profile_claims(self):
+        self.write_profile("unsorted")
+
+        self.assertIn("'unsorted' is reserved", self.process("profiles", expect=1))
 
     # Tools that send what I approved: the executor's, and only the executor's.
     EXECUTOR_TOOLS = [
@@ -1745,6 +2218,9 @@ class ProfileTest(ProcessTestCase):
         "mcp__github__push_files",
         "mcp__github__create_or_update_file",
         "mcp__github__delete_repository",
+        "mcp__claude_ai_Gmail__trash_thread",
+        "mcp__claude_ai_Gmail__mark_thread_spam",
+        "mcp__claude_ai_Google_Drive__trash_file",
         "Bash",
         "Bash(gh:*)",
         "Bash(git:*)",
@@ -1792,6 +2268,8 @@ class ProfileTest(ProcessTestCase):
         self.assertEqual(acme["github"]["repo"], "acme/widgets")
         self.assertEqual(acme["linear"]["team"], "WID")
         self.assertEqual(acme["google"]["account"], "me@acme.example")
+        self.assertEqual(acme["sources"], ALL_SOURCES)
+        self.assertEqual(acme["slack"]["watchlist"], ["#incidents", "#deploys"])
         self.assertEqual({p["model"] for p in acme["phases"].values()}, {"sonnet", "opus"})
         self.assertIn("## Changelog", acme["body"])
         self.assertIn("Bash(process next:*)", acme["phases"]["next-work"]["allowed_tools"])

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -103,9 +104,19 @@ def validate(value, kind):
 # in a sweep or triage allowlist, unless it only reads (get_/list_/search_/read_ prefixes, a _read suffix).
 SEND_WORDS = re.compile(
     r"send|reply|post|comment|review|rsvp|respond|event|merge|approve|submit|forward|publish|schedule|share|invite"
-    r"|write|delete|push|create|update|add_|reaction|assign"
+    r"|write|delete|push|create|update|add_|reaction|assign|trash|spam|upload|copy|label"
 )
-READ_ONLY = re.compile(r"__(get|list|search|read|fetch)_|_read$")
+READ_ONLY = re.compile(r"__(slack_)?(get|list|search|read|fetch)_|_read$")
+# The silent writes the PRD allows: triage performs them on my own things. A sweeper only reads, so never holds one.
+SILENT_WRITES = {
+    "mcp__linear-server__mark_notification",
+    "mcp__linear-server__save_issue",
+    "mcp__linear-server__create_issue",
+    "mcp__claude_ai_Gmail__label_thread",
+    "mcp__claude_ai_Gmail__unlabel_thread",
+    "mcp__claude_ai_Gmail__label_message",
+    "mcp__claude_ai_Gmail__unlabel_message",
+}
 # Built-in tools that reach any file or any host unless the rule names a path or a domain.
 UNSCOPED = {"Bash", "Edit", "MultiEdit", "NotebookEdit", "Write", "WebFetch", "WebSearch"}
 # Bash prefixes that run arbitrary commands, so no prefix after them is safe.
@@ -121,14 +132,16 @@ def forbidden_tool(tool):
         return too_broad or bool(SEND_WORDS.search(" ".join(words)))
     if tool in UNSCOPED or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
         return True
+    if tool in SILENT_WRITES:
+        return False
     return not READ_ONLY.search(tool) and bool(SEND_WORDS.search(tool.lower()))
 
 
-# Never actions, or what reaches one: merging, approving, deleting, deploying, and pushing (the executor pushes only
+# Never actions, or what reaches one: merging, approving, deleting or trashing, deploying, and pushing (the executor pushes only
 # through `process execute push`, which checks the branch is my PR's). No phase may hold these, the executor included.
 EXECUTE_STEPS = {"plan", "review", "reply", "checkout", "git", "push", "result"}
 # A review tool is one too: its event can be APPROVE, so reviews go through `process execute review`, which pins it.
-NEVER_WORDS = re.compile(r"merge|approve|review_write|delete|deploy|release|push|create_or_update_file|transfer|fork|secret")
+NEVER_WORDS = re.compile(r"merge|approve|review_write|delete|trash|spam|deploy|release|push|create_or_update_file|transfer|fork|secret")
 # The executor pushes code, so it reads only its worktree (granted per run): nothing else can end up in a commit.
 EXECUTOR_UNSCOPED = {"Read", "Glob", "Grep"}
 
@@ -161,16 +174,54 @@ DENIED_TOOLS = [
     "mcp__github__add_reply_to_pull_request_comment",
     "mcp__slack__slack_send_message",
     "mcp__slack__slack_schedule_message",
+    "mcp__slack__slack_complete_file_upload",
     "mcp__claude_ai_Gmail__send_message",
     "mcp__claude_ai_Gmail__reply",
     "mcp__claude_ai_Gmail__forward",
+    "mcp__claude_ai_Gmail__trash_thread",
+    "mcp__claude_ai_Gmail__trash_message",
     "mcp__claude_ai_Google_Calendar__respond_to_event",
+    "mcp__claude_ai_Google_Calendar__update_event",
+    "mcp__claude_ai_Google_Calendar__delete_event",
     "mcp__linear-server__save_comment",
 ]
 
 
 # Denied to the executor: the never actions among DENIED_TOOLS. It keeps the send tools its allowlist grants.
 NEVER_DENIED = [t for t in DENIED_TOOLS if never_tool(t)] + ["mcp__github__push_files", "mcp__github__create_or_update_file"]
+
+
+# The profile table each source reads its settings from, when it is not named after the source.
+SOURCE_TABLE = {"gmail": "google", "calendar": "google", "meetings": "google"}
+
+
+# Where a shared source's items go when no profile's match rules claim them.
+UNSORTED = "unsorted"
+
+
+def share_key(profile, source):
+    """What makes two profiles' source the same feed, swept once for both; None for a source never shared."""
+    if source == "slack":
+        return ("slack", profile["slack"]["workspace"].lower())
+    if SOURCE_TABLE.get(source) == "google":
+        return (source, profile["google"]["account"].lower())
+    return None
+
+
+def claims(profile, item):
+    """True when a profile's match rules (plus its repo, Linear team and Slack watchlist) claim a shared-source item."""
+    rules = profile.get("match", {})
+    text = " ".join([item["summary"], item["subject"], item["link"], item["context"]]).lower()
+    channels = {c.lower() for c in rules.get("channels", []) + profile.get("slack", {}).get("watchlist", [])}
+    keywords = rules.get("keywords", []) + ([profile["github"]["repo"]] if "github" in profile else [])
+    actor = item["actor"]["name"].lower()
+    team = profile.get("linear", {}).get("team")
+    return (
+        (item.get("facts") or {}).get("channel", "").lower() in channels
+        or any(actor == s.lower() or (s.startswith("@") and actor.endswith(s.lower())) for s in rules.get("senders", []))
+        or any(k.lower() in text for k in keywords)
+        or bool(team and re.search(rf"\b{re.escape(team)}-\d+\b", text, re.I))
+    )
 
 
 def load_profile(path):
@@ -183,6 +234,8 @@ def load_profile(path):
     except tomllib.TOMLDecodeError as error:
         raise SystemExit(f"process: {path}: {error}")
     problems = validate(profile, "profile")
+    if profile.get("name") == UNSORTED:
+        problems.append(f"the name {UNSORTED!r} is reserved for items no profile claims")
     if profile.get("name") != path.stem:
         problems.append(f"name {profile.get('name')!r} does not match the file name {path.stem!r}")
     for heading in ("## How to sweep", "## Changelog"):
@@ -190,8 +243,8 @@ def load_profile(path):
             problems.append(f"the body has no {heading!r} section")
     phases = profile.get("phases", {})
     for source in profile.get("sources", []):
-        if source not in profile:
-            problems.append(f"source {source!r} has no [{source}] table")
+        if SOURCE_TABLE.get(source, source) not in profile:
+            problems.append(f"source {source!r} has no [{SOURCE_TABLE.get(source, source)}] table")
         if f"sweep-{source}" not in phases:
             problems.append(f"source {source!r} has no [phases.sweep-{source}]")
     for name, phase in phases.items():
@@ -199,6 +252,8 @@ def load_profile(path):
             problems += [f"phases.execute grants {t!r}, which can merge, approve, delete or push" for t in phase.get("allowed_tools", []) if never_tool(t)]
         else:
             problems += [f"phases.{name} grants {t!r}, which can send, review, RSVP or merge" for t in phase.get("allowed_tools", []) if forbidden_tool(t)]
+        if name.startswith("sweep-"):
+            problems += [f"phases.{name} grants {t!r}, a silent write only triage may hold" for t in phase.get("allowed_tools", []) if t in SILENT_WRITES]
     if problems:
         raise SystemExit(f"process: profile {path}:\n" + "\n".join(f"  {p}" for p in problems))
     return {**profile, "body": match[2]}
@@ -295,11 +350,14 @@ class Process:
         run = {"id": iso(self.clock()), "delta": bool(opts.get("--delta")), "problems": {}}
         self.write_json(self.state_root() / "run.json", run)
         sweep_args = (" --delta" if opts.get("--delta") else "") + (f" --fixtures {opts['--fixtures']}" if dry else "")
+        swept = set()  # shared feeds already swept this run, for every profile that shares them
         try:
             for name in names:
                 profile = profiles[name]
-                phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in profile["sources"]]
-                phases.append(("triage", f"/triage {name}" + (" --dry-run" if dry else "")))
+                sources = [s for s in profile["sources"] if share_key(profile, s) not in swept]
+                swept |= {share_key(profile, s) for s in sources} - {None}
+                phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in sources]
+                phases.append(("triage", f"/triage {name}" + (f" --dry-run --fixtures {opts['--fixtures']}" if dry else "")))
                 if "next-work" in profile["phases"] and not opts.get("--delta"):  # it runs with the full brief, after triage
                     phases.append(("next-work", f"/next-work {name}" + (f" --fixtures {opts['--fixtures']}" if dry else "")))
                 for phase, prompt in phases:
@@ -320,6 +378,7 @@ class Process:
                     if lock:
                         lock.close()
                 self.report(run, name, problem)
+            self.file_unsorted()
             self.cmd_brief(*(["--delta"] if opts.get("--delta") else []), *(["--project", opts["--project"]] if opts.get("--project") else []))
         finally:
             (self.state_root() / "run.json").unlink()
@@ -395,9 +454,16 @@ class Process:
 
     def cmd_profile(self, name):
         """Print one validated profile, path first, so a phase reads it without guessing XDG_CONFIG_HOME."""
-        self.profile(name)
+        profile = self.profile(name)
         path = self.profiles_dir() / f"{name}.md"
-        self.out(f"{path}\ninbox: {self.inbox(name)}\n{path.read_text()}")
+        lines = [str(path), f"inbox: {self.inbox(name)}"]
+        for source in profile["sources"]:
+            group = self.share_group(name, source)
+            if len(group) > 1:
+                lines.append(f"shared {source}: {', '.join(group)} (one sweep serves all; emit attributes each item)")
+            if source == "slack":
+                lines.append("watchlist: " + ", ".join(dict.fromkeys(c for p in group.values() for c in p["slack"].get("watchlist", []))))
+        self.out("\n".join(lines) + "\n" + path.read_text())
 
     def cmd_profiles(self):
         """List every profile, refusing if any is invalid or grants a send tool to a sweep or triage phase."""
@@ -406,33 +472,57 @@ class Process:
 
     # -- sweeper side --
 
+    def share_group(self, name, source):
+        """The profiles one sweep of this source serves: the sweeping profile plus every active one that shares its feed."""
+        if source in ("github", "linear"):
+            return {name: None}
+        profiles = self.profiles()
+        if source not in self.profile(name)["sources"]:
+            raise SystemExit(f"process: profile {name!r} does not sweep {source}")
+        key = share_key(profiles[name], source)
+        return {n: p for n, p in sorted(profiles.items()) if n == name or (p["active"] and source in p["sources"] and share_key(p, source) == key)}
+
     def cmd_emit(self, profile, source, *args):
-        """Store a sweeper's candidate items (JSONL on stdin, or --file) and advance its watermark."""
+        """Store a sweeper's candidate items (JSONL on stdin, or --file) and advance its watermark. A source shared with
+        other profiles is attributed item by item to the first profile whose match rules claim it, or to unsorted."""
         opts = flags(args, "--watermark", "--file")
         path = opts.get("--file") and self.inbox_file(profile, opts["--file"])
         text = path.read_text() if path else self.stdin.read()
-        pdir = self.profile_state(profile)
-        known = {i["id"] for i in self.read_jsonl(pdir / "items.jsonl")}
-        fresh, problems = [], []
+        group = self.share_group(profile, source)
+        # Known to any profile the feed serves: a reworded summary can attribute the same item elsewhere next time.
+        known = {i["id"] for n in [*group, UNSORTED] for i in self.read_jsonl(self.state_root() / "profiles" / n / "items.jsonl")}
+        fresh, problems, answered = [], [], 0
         for n, candidate in enumerate(self.parse_jsonl(text, "item"), 1):
             candidate.pop("id", None)
+            candidate.pop("profile", None)  # emit decides where an item goes, never the item
             record = {"id": f"{candidate.get('source')}:{candidate.get('native_id')}@{digest(str(candidate.get('version')))}", "profile": profile, **candidate}
             errors = validate(record, "item")
             if not errors and record["source"] != source:
                 errors = [f"$.source: {record['source']!r} emitted by the {source} sweeper"]
             problems += [f"item {n}: {e}" for e in errors]
-            if record["id"] not in known:
+            if errors:
+                continue
+            if len(group) > 1:  # unclaimed noise stays with the sweeping profile, whose triage archives it
+                noise = (record.get("facts") or {}).get("noise")
+                record["profile"] = next((n for n, p in group.items() if claims(p, record)), profile if noise else UNSORTED)
+            if (record.get("facts") or {}).get("answered"):  # I already replied or reacted: not an ask any more
+                answered += 1
+            elif record["id"] not in known:
                 known.add(record["id"])
                 fresh.append(record)
         if problems:
             raise SystemExit("process: nothing stored, invalid items:\n" + "\n".join(problems))
-        self.append_jsonl(pdir / "items.jsonl", fresh)
-        marks = self.read_json(pdir / "watermarks.json", {})
-        marks[source] = opts.get("--watermark") or iso(self.clock())
-        self.write_json(pdir / "watermarks.json", marks)
+        counts = Counter(r["profile"] for r in fresh)
+        for name in counts:
+            self.append_jsonl(self.profile_state(name) / "items.jsonl", [r for r in fresh if r["profile"] == name])
+        mark = opts.get("--watermark") or iso(self.clock())
+        for name in group:
+            pdir = self.profile_state(name)
+            self.write_json(pdir / "watermarks.json", {**self.read_json(pdir / "watermarks.json", {}), source: mark})
         if path:
             path.unlink()  # consumed, so a later sweep can never re-send it
-        self.out(f"stored {len(fresh)} new item(s) for {profile}/{source}; watermark {marks[source]}")
+        split = f" ({', '.join(f'{n} {c}' for n, c in counts.items())})" if len(group) > 1 and counts else ""
+        self.out(f"stored {len(fresh)} new item(s) for {profile}/{source}{split}; watermark {mark}" + (f"; skipped {answered} already answered" if answered else ""))
 
     def cmd_watermark(self, profile, source):
         """Print the source's watermark for the profile; nothing when it has never been swept."""
@@ -473,13 +563,22 @@ class Process:
         cutoff = iso(self.clock() - BANKRUPTCY_AGE)
         stale = [i for i in items if first_run and i["source"] == "linear" and notification(i) and i["timestamp"] < cutoff]
         dropped = [i for i in items if i["actor"]["role"] == "me" and i["kind"] != "pr_status"]
-        live = [i for i in items if i not in stale and i not in dropped]
-        groups = {}
-        for i in sorted(live, key=lambda i: (i["source"], i["timestamp"])):  # github first: its item leads the entry
-            groups.setdefault((i["kind"], canonical(i["subject"])), []).append(i)
-        entries = [entry(name, profile, group) for group in groups.values()]
+        noise = [i for i in items if i["source"] == "gmail" and (i.get("facts") or {}).get("noise") and i not in dropped]
+        live = [i for i in items if i not in stale and i not in dropped and i not in noise]
+        queued = {(e["kind"], e["subject"]) for e in self.queue() if e["project"] == name}
+        groups = asks(live)
+        # Linear's mirror or GitHub's Slack digest of a review request already queued: the GitHub item was the ask.
+        echoes = [g for g in groups if g[0]["kind"] == "review_request" and g[0]["source"] != "github" and (g[0]["kind"], canonical(g[0]["subject"])) in queued]
+        dropped += [i for g in echoes for i in g]
+        entries = [entry(name, profile, group) for group in groups if group not in echoes]
+        ticketed = {e["subject"]: e.get("note", "") for e in self.queue() if e["project"] == name and e["action"]["type"] == "linear_create_issue" and e["status"] == "done"}
+        for e in entries:
+            if e["action"]["type"] == "linear_create_issue" and e["subject"] in ticketed:  # a changed ask I already made a ticket for
+                e.update(action={"type": "none", "params": {}}, autonomy="silent", status="info", summary=f"{e['summary']} — already ticketed: {ticketed[e['subject']]}")
         if stale:
             entries.append(mark_read(name, stale, f"Cleared {len(stale)} Linear notification(s) older than 7 days (first run)"))
+        if noise:
+            entries.append(archive(name, profile, noise))
         read = [i for i in live + dropped if notification(i)]  # my own get marked read too
         if read:
             entries.append(mark_read(name, read, f"Marked {len(read)} processed Linear notification(s) read"))
@@ -487,12 +586,12 @@ class Process:
         self.write_json(pdir / "plan.json", plan)
         by_id = {i["id"]: i for i in items}
         for e in entries:
-            todo = "draft" if needs_draft(e) and not e["action"].get("draft") else "do, then report" if e["action"]["type"] == "linear_mark_read" else e["status"]
+            todo = "draft" if needs_draft(e) and not e["action"].get("draft") else "do, then report" if e["action"]["type"] in TRIAGE_ACTIONS else e["status"]
             self.out(f"{e['id']}  [{todo}]  {e['action']['type']} {json.dumps(e['action']['params'])}  {e['summary']}  {e['link']}")
-            if todo == "draft":
+            if todo == "draft" or e["action"]["type"] == "linear_create_issue":  # a ticket is written from its ask
                 for item_id in e["item_ids"]:
                     self.out(f"    {item_id}: {by_id[item_id]['summary']}\n" + indent(by_id[item_id]["context"], "      | "))
-        self.out(f"{len(entries)} entr(ies) planned in {pdir / 'plan.json'}; {len(dropped)} item(s) of my own dropped")
+        self.out(f"{len(entries)} entr(ies) planned in {pdir / 'plan.json'}; {len(dropped)} item(s) dropped (my own, or echoes of a review already queued)")
 
     def plan_entry(self, name, entry_id):
         plan = self.read_json(self.profile_state(name) / "plan.json", None)
@@ -518,30 +617,29 @@ class Process:
         if outcome not in ("done", "failed", "skipped"):
             raise SystemExit("process: a silent outcome is done, failed or skipped")
         plan, e = self.plan_entry(name, entry_id)
-        if e["action"]["type"] != "linear_mark_read":
+        if e["action"]["type"] not in TRIAGE_ACTIONS:
             raise SystemExit(f"process: {entry_id} is {e['action']['type']}, not a silent action triage performs")
         e["status"] = outcome
         if note:
             e["note"] = note
         self.write_json(self.profile_state(name) / "plan.json", plan)
 
-    def triage_commit(self, name):
-        """Validate the finished plan, then append it to the queue and ledger. All or nothing."""
-        pdir = self.profile_state(name)
-        plan = self.read_json(pdir / "plan.json", None)
-        if plan is None:
-            raise SystemExit(f"process: no triage plan for {name}; run `process triage plan {name}` first")
+    def file_unsorted(self):
+        """Shared-source items no profile claimed become FYI entries of their own: no project's rules apply to them."""
+        items = self.unhandled(UNSORTED)
+        if not items:
+            return
+        bare = {"autonomy": {"silent": []}}
+        entries = [{**entry(UNSORTED, bare, g), "autonomy": "silent", "action": {"type": "none", "params": {}}, "status": "info"} for g in asks(items)]
+        self.enqueue(UNSORTED, self.stamp(entries), [i["id"] for i in items])
+
+    def stamp(self, entries):
+        """Give planned entries the run that made them and their creation time."""
         run = self.read_json(self.state_root() / "run.json", {}).get("id") or iso(self.clock())
-        entries = [{**e, "run": run, "created": iso(self.clock())} for e in plan["entries"]]
-        problems = []
-        for e in entries:
-            problems += [f"{e['id']}: {p}" for p in validate(e, "queue_entry")]
-            if needs_draft(e) and not e["action"].get("draft"):
-                problems.append(f"{e['id']}: no draft (process triage draft {name} {e['id']})")
-            if e["action"]["type"] == "linear_mark_read" and e["status"] == "approved":
-                problems.append(f"{e['id']}: no outcome (process triage silent {name} {e['id']} done|failed|skipped)")
-        if problems:
-            raise SystemExit("process: nothing committed:\n" + "\n".join(f"  {p}" for p in problems))
+        return [{**e, "run": run, "created": iso(self.clock())} for e in entries]
+
+    def enqueue(self, name, entries, handled):
+        """Append stamped entries to the queue (superseding older versions of the same ask) and their items to the ledger."""
         keys = {(e["kind"], e["subject"]) for e in entries}
         superseded = [
             {**old, "status": "superseded"}
@@ -549,8 +647,31 @@ class Process:
             if old["project"] == name and old["status"] in ("pending", "info") and (old["kind"], old["subject"]) in keys
         ]
         self.append_jsonl(self.state_root() / "queue.jsonl", superseded + entries)
+        self.append_jsonl(self.profile_state(name) / "ledger.jsonl", [{"item_id": i, "at": iso(self.clock())} for i in handled])
+        return superseded
+
+    def triage_commit(self, name):
+        """Validate the finished plan, then append it to the queue and ledger. All or nothing."""
+        pdir = self.profile_state(name)
+        plan = self.read_json(pdir / "plan.json", None)
+        if plan is None:
+            raise SystemExit(f"process: no triage plan for {name}; run `process triage plan {name}` first")
+        entries = self.stamp(plan["entries"])
+        items = {i["id"]: i for i in self.read_jsonl(pdir / "items.jsonl")}
+        problems = []
+        for e in entries:
+            problems += [f"{e['id']}: {p}" for p in validate(e, "queue_entry")]
+            if needs_draft(e) and not e["action"].get("draft"):
+                problems.append(f"{e['id']}: no draft (process triage draft {name} {e['id']})")
+            if e["action"]["type"] in TRIAGE_ACTIONS and e["status"] == "approved":
+                problems.append(f"{e['id']}: no outcome (process triage silent {name} {e['id']} done|failed|skipped)")
+            declined = e["action"]["type"] == "rsvp" and e["action"]["params"].get("response") == "declined"
+            if declined and protected_meeting(self.profile(name), [items[i] for i in e["item_ids"] if i in items]):
+                problems.append(f"{e['id']}: never decline a meeting with external guests or my manager")
+        if problems:
+            raise SystemExit("process: nothing committed:\n" + "\n".join(f"  {p}" for p in problems))
         handled = list(dict.fromkeys([i for e in entries for i in e["item_ids"]] + plan["dropped"]))
-        self.append_jsonl(pdir / "ledger.jsonl", [{"item_id": i, "at": iso(self.clock())} for i in handled])
+        superseded = self.enqueue(name, entries, handled)
         if plan["first_run"]:
             self.write_json(pdir / "state.json", {**self.read_json(pdir / "state.json", {}), "bankrupt_at": iso(self.clock())})
         (pdir / "plan.json").unlink()
@@ -1036,17 +1157,22 @@ class Process:
         results = self.read_jsonl(self.state_root() / "results.jsonl")
         mode = "delta" if opts.get("--delta") else "full"
         lines = [f"# Brief — {now:%a %Y-%m-%d %H:%M} · {mode}", ""]
+
+        def shown(e, acted=()):
+            if mode == "delta":
+                return e["run"] == latest or e["id"] in acted
+            return e["status"] in ("pending", "approved") or e["created"] >= midnight or e["id"] in acted
+
         for name in names:
             acted = {r["entry_id"] for r in results if r["at"] > last.get(name, "") or (mode == "full" and r["at"] >= midnight)}
-            if mode == "delta":
-                shown = [e for e in queue if e["run"] == latest or e["id"] in acted]
-            else:
-                shown = [e for e in queue if e["status"] in ("pending", "approved") or e["created"] >= midnight or e["id"] in acted]
-            entries = [e for e in shown if e["project"] == name and e["status"] != "superseded"]
+            entries = [e for e in queue if e["project"] == name and e["status"] != "superseded" and shown(e, acted)]
             lines += [f"## {name}", ""] + [f"> ⚠ {p}" for p in run.get("problems", {}).get(name, [])]
             lines += render_project(entries, acted) or ["Nothing new.", ""]
             if mode == "full":  # next-work runs with the full brief
                 lines += render_next(self.read_json(self.state_root() / "profiles" / name / "next.json", None), queue)
+        unsorted = [e for e in queue if e["project"] == UNSORTED and e["status"] != "superseded" and shown(e)]
+        if unsorted and not opts.get("--project"):
+            lines += ["## Unsorted", "", "Items from a shared source that no profile's match rules claimed.", ""] + render_project(unsorted)
         brief = "\n".join(lines).rstrip() + "\n"
         self.state_root().mkdir(parents=True, exist_ok=True)
         (self.state_root() / "brief.md").write_text(brief)
@@ -1093,15 +1219,32 @@ Leave it a draft. Marking it ready for review is mine."""
 PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 
 
+def asks(items):
+    """Group items into asks: the same kind about the same subject, whichever source saw it. A github item leads its
+    entry."""
+    groups = {}
+    for i in sorted(items, key=lambda i: (i["source"] != "github", i["source"], i["timestamp"])):
+        groups.setdefault((i["kind"], canonical(i["subject"])), []).append(i)
+    return list(groups.values())
+
+
+# Silent actions triage performs itself under its allowlist, then reports. They carry no text for me to approve.
+TRIAGE_ACTIONS = ("linear_mark_read", "linear_create_issue", "gmail_archive")
+
+
 def needs_draft(e):
     """Every action that carries text needs a draft, even one promoted to silent: the executor sends that text."""
-    return e["action"]["type"] not in ("none", "linear_mark_read")
+    return e["action"]["type"] not in ("none",) + TRIAGE_ACTIONS
 
 
 def canonical(url):
-    """Same thing, same key: lower-case host, no query, no trailing slash. Fragments stay (they name a comment)."""
+    """Same thing, same key: lower-case host, no trailing slash, no tracking parameters. The rest of the query stays,
+    sorted (a calendar event or Slack thread is named by it), and so do fragments (they name a comment)."""
     match = re.match(r"(https?://)([^/]+)([^?#]*)(\?[^#]*)?(#.*)?$", url)
-    return match[1] + match[2].lower() + match[3].rstrip("/") + (match[5] or "") if match else url
+    if not match:
+        return url
+    params = sorted(p for p in (match[4] or "?")[1:].split("&") if p and not p.startswith("utm_"))
+    return match[1] + match[2].lower() + match[3].rstrip("/") + ("?" + "&".join(params) if params else "") + (match[5] or "")
 
 
 def notification(i):
@@ -1121,19 +1264,31 @@ def indent(text, prefix, limit=20):
 
 
 def mark_read(name, items, summary):
+    return housekeeping(name, items, summary, {"type": "linear_mark_read", "params": {"notification_ids": [notification(i) for i in items]}})
+
+
+def archive(name, profile, items):
+    """One silent entry that labels and archives every noise email of the run."""
+    label = profile["google"].get("noise_label", "Noise")
+    summary = f"Labeled {label} and archived {len(items)} email(s): " + "; ".join(i["summary"] for i in items)
+    return housekeeping(name, items, summary, {"type": "gmail_archive", "params": {"thread_ids": [i["native_id"] for i in items], "label": label}})
+
+
+def housekeeping(name, items, summary, action):
+    """A batch silent action triage performs itself over many items: it waits on triage's report."""
     ids = [i["id"] for i in items]
     return {
-        "id": "q-" + digest(name + "linear_mark_read" + "".join(ids)),
+        "id": "q-" + digest(name + action["type"] + "".join(ids)),
         "project": name,
         "item_ids": ids,
-        "sources": ["linear"],
+        "sources": sorted({i["source"] for i in items}),
         "kind": "housekeeping",
         "subject": "",
         "summary": summary,
         "link": "",
         "urgency": "low",
         "autonomy": "silent",
-        "action": {"type": "linear_mark_read", "params": {"notification_ids": [notification(i) for i in items]}},
+        "action": action,
         "status": "approved",
     }
 
@@ -1158,9 +1313,10 @@ def render_project(entries, acted=()):
             lines.append(f"- {'**urgent** · ' if e['urgency'] == 'urgent' else ''}{e['summary']} · {' + '.join(e['sources'])} · {e['link']}")
             lines.append(f"  `{e['action']['type']}`{ref}{' ' + params['event'] if 'event' in params else ''} · `{e['id']}`")
             lines += [f"  > {line}" for line in (e["action"].get("draft") or "").splitlines()] + [""]
-    words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped (dry run)"}
+    # A skip with no note is the executor's dry run; triage notes why it skipped (dry run, or already tracked).
+    words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped"}
     words_for = lambda e: "approved, waits for a free AFK slot" if e["status"] == "approved" and e["action"]["type"] == "afk_launch" else words[e["status"]]
-    outcome = lambda e: f"{words_for(e)}{': ' + e['note'] if e.get('note') else ''}"
+    outcome = lambda e: f"{words_for(e)}{': ' + e['note'] if e.get('note') else ' (dry run)' if e['status'] == 'skipped' else ''}"
     if approved:
         lines += [f"### Approved ({len(approved)})", ""]
         lines += [f"- {e['summary']} · {e['link']}\n  `{e['action']['type']}` — {outcome(e)}" for e in approved] + [""]
@@ -1184,6 +1340,15 @@ def render_next(result, queue):
     lines += [""] if result["recommendations"] else []
     lines += [f"- AFK: {r['ref']} {r['title']} — {r['reason']} · {status.get(r['entry_id'], 'pending')}" for r in result["afk"]]
     return lines + ([""] if result["afk"] else [])
+
+
+def protected_meeting(profile, items):
+    """A meeting with external guests or my manager: declining it is a never action."""
+    manager = profile.get("google", {}).get("manager", "").lower()
+    return any(
+        (i.get("facts") or {}).get("external_guests") or (i.get("facts") or {}).get("with_manager") or (manager and i["actor"]["name"].lower() == manager)
+        for i in items
+    )
 
 
 def entry(name, profile, group):
@@ -1212,7 +1377,22 @@ def entry(name, profile, group):
         trivial = lead["actor"]["role"] == "bot" or (NIT.match(lead["context"]) and facts.get("collaborator"))
         action = {"type": "gh_fix_pr" if trivial else "gh_thread_reply", "params": {**ref, "comment": canonical(lead["subject"])}}
         urgency, silent = "normal", bool(trivial)
-    elif kind in ("mention", "ticket_change"):
+    elif kind == "invite":
+        conflicts = facts.get("conflicts") or []
+        response = "tentative" if conflicts and protected_meeting(profile, group) else "declined" if conflicts else "accepted"
+        action, urgency = {"type": "rsvp", "params": {"event_id": lead["native_id"], "response": response}}, "normal"
+        summary += f" — conflicts with {', '.join(conflicts)}" if conflicts else ""
+    elif kind == "action_item" and "linear" in profile:  # meeting commitments land in Triage so next-work sees them
+        params = {"team": profile["linear"]["team"], "state": "Triage", "assignee": "me", "link": lead["link"]}
+        action, urgency = {"type": "linear_create_issue", "params": params}, "normal"
+    elif lead["source"] == "slack" and facts.get("ask") == "task" and "linear" in profile:  # an immediate ask: a ticket for me, linking back
+        action, urgency = {"type": "linear_create_issue", "params": {"team": profile["linear"]["team"], "assignee": "me", "link": lead["link"]}}, "normal"
+    elif lead["source"] == "gmail" and facts.get("ask"):
+        action, urgency = {"type": "email_reply", "params": {"thread_id": lead["native_id"]}}, "normal"
+    elif lead["source"] == "slack" and facts.get("ask"):
+        channel, _, thread = lead["native_id"].partition("/")
+        action, urgency = {"type": "slack_reply", "params": {"channel": channel, "thread_ts": thread}}, "normal"
+    elif kind in ("mention", "ticket_change", "dm", "thread_question"):
         urgency = "normal"
     rules = profile.get("urgency", {})
     if {i["actor"]["name"] for i in group} & set(rules.get("people", [])) or {l for i in group for l in i.get("labels", [])} & set(rules.get("labels", [])):
@@ -1220,7 +1400,7 @@ def entry(name, profile, group):
     autonomy, status = "draft", "pending"
     if action["type"] == "none":
         autonomy, status = "silent", "info"
-    elif silent or action["type"] in profile["autonomy"]["silent"]:
+    elif silent or action["type"] in profile["autonomy"]["silent"] or action["type"] in TRIAGE_ACTIONS:
         autonomy, status = "silent", "approved"
     ids = [i["id"] for i in group]
     return {
