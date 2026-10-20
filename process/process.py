@@ -114,6 +114,28 @@ def forbidden_tool(tool):
     return not READ_ONLY.search(tool) and bool(SEND_WORDS.search(tool.lower()))
 
 
+# Denied to every sweep and triage phase, as a backstop for allow rules in the user's own settings.
+DENIED_TOOLS = [
+    "Bash(gh pr merge:*)",
+    "Bash(gh pr review:*)",
+    "Bash(gh pr comment:*)",
+    "Bash(gh api:*)",
+    "Bash(git push:*)",
+    "mcp__github__merge_pull_request",
+    "mcp__github__pull_request_review_write",
+    "mcp__github__add_comment_to_pending_review",
+    "mcp__github__add_issue_comment",
+    "mcp__github__add_reply_to_pull_request_comment",
+    "mcp__slack__slack_send_message",
+    "mcp__slack__slack_schedule_message",
+    "mcp__claude_ai_Gmail__send_message",
+    "mcp__claude_ai_Gmail__reply",
+    "mcp__claude_ai_Gmail__forward",
+    "mcp__claude_ai_Google_Calendar__respond_to_event",
+    "mcp__linear-server__save_comment",
+]
+
+
 def load_profile(path):
     """Parse a profile: TOML front matter between +++ lines, then the how-to-sweep prose. Raises on any problem."""
     match = re.match(r"\+\+\+\n(.*?)\n\+\+\+\n(.*)", path.read_text(), re.S)
@@ -214,6 +236,41 @@ class Process:
                 except json.JSONDecodeError as error:
                     raise SystemExit(f"process: {what} line {n} is not JSON: {error}")
         return records
+
+    def cmd_run(self, *args):
+        """Sweep every source, then triage, for each active profile (or --project), each phase headless under its
+        profile's model and allowlist; then render the brief. --fixtures points sweepers at fixture data and makes
+        triage a dry run."""
+        opts = flags(args, "--delta", "--project", "--fixtures")
+        profiles = self.profiles()  # refuses before any phase starts if one grants a send tool
+        if opts.get("--project") and opts["--project"] not in profiles:
+            raise SystemExit(f"process: no profile {opts['--project']!r} in {self.profiles_dir()}")
+        names = [opts["--project"]] if opts.get("--project") else [n for n, p in profiles.items() if p["active"]]
+        run = {"id": iso(self.clock()), "delta": bool(opts.get("--delta")), "problems": {}}
+        self.write_json(self.state_root() / "run.json", run)
+        sweep_args = (" --delta" if opts.get("--delta") else "") + (f" --fixtures {opts['--fixtures']}" if opts.get("--fixtures") else "")
+        for name in names:
+            profile = profiles[name]
+            phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in profile["sources"]]
+            phases.append(("triage", f"/triage {name}" + (" --dry-run" if opts.get("--fixtures") else "")))
+            for phase, prompt in phases:
+                self.out(f"{name}: {phase}")
+                try:
+                    self.headless(profile, phase, prompt)
+                except subprocess.CalledProcessError as error:
+                    detail = ((error.stderr or "").strip().splitlines() or [f"exit {error.returncode}"])[-1]
+                    run["problems"].setdefault(name, []).append(f"{phase} failed: {detail}")
+                    self.write_json(self.state_root() / "run.json", run)
+        self.cmd_brief(*(["--delta"] if opts.get("--delta") else []), *(["--project", opts["--project"]] if opts.get("--project") else []))
+        (self.state_root() / "run.json").unlink()
+
+    def headless(self, profile, phase, prompt):
+        """One phase as headless Claude: only its allowlist is pre-approved, and known send tools are denied outright
+        in case user settings allow them."""
+        config = profile["phases"][phase]
+        workdir = Path(profile["workdir"].replace("~", self.env["HOME"], 1) if profile["workdir"].startswith("~") else profile["workdir"])
+        cmd = ["claude", "-p", prompt, "--model", config["model"], "--allowedTools", ",".join(config["allowed_tools"]), "--disallowedTools", ",".join(DENIED_TOOLS)]
+        return self.run(cmd, cwd=workdir)
 
     def cmd_profiles(self):
         """List every profile, refusing if any is invalid or grants a send tool to a sweep or triage phase."""

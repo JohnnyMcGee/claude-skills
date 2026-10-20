@@ -428,6 +428,62 @@ class BriefTest(TriageTestCase):
         self.assertNotIn("## acme", brief)
 
 
+class RunTest(ProcessTestCase):
+    def claude_calls(self):
+        return [(c, cwd) for c, cwd in zip(self.run_fake.calls, self.run_fake.cwds) if c[0] == "claude"]
+
+    def opt(self, cmd, name):
+        return cmd[cmd.index(name) + 1]
+
+    def test_run_sweeps_each_source_then_triages_each_active_profile_headless_under_its_allowlist(self):
+        self.write_profile("acme")
+        self.write_profile("side", active=False)
+
+        self.process("run")
+
+        calls = self.claude_calls()
+        self.assertEqual([c[:3] for c, _ in calls], [["claude", "-p", "/sweep-github acme"], ["claude", "-p", "/sweep-linear acme"], ["claude", "-p", "/triage acme"]])
+        profile = process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")
+        for (cmd, cwd), phase in zip(calls, ["sweep-github", "sweep-linear", "triage"]):
+            self.assertEqual(self.opt(cmd, "--model"), profile["phases"][phase]["model"])
+            self.assertEqual(self.opt(cmd, "--allowedTools").split(","), profile["phases"][phase]["allowed_tools"])
+            self.assertIn("mcp__github__merge_pull_request", self.opt(cmd, "--disallowedTools").split(","))
+            self.assertEqual(cwd, str(self.tmp / "work" / "acme"))
+        self.assertTrue((self.state / "brief.md").exists())
+
+    def test_delta_project_and_fixtures_reach_every_phase_and_the_brief(self):
+        self.write_profile("acme")
+        self.write_profile("side")
+
+        self.process("run", "--delta", "--project", "side", "--fixtures", "/fx")
+
+        prompts = [c[2] for c, _ in self.claude_calls()]
+        self.assertEqual(prompts, ["/sweep-github side --delta --fixtures /fx", "/sweep-linear side --delta --fixtures /fx", "/triage side --dry-run"])
+        brief = (self.state / "brief.md").read_text()
+        self.assertIn("· delta", brief)
+        self.assertNotIn("## acme", brief)
+
+    def test_run_refuses_to_start_any_phase_when_a_profile_grants_a_send_tool(self):
+        self.write_profile("acme")
+        self.write_profile("side", triage_tools=["mcp__slack__slack_send_message"])
+
+        self.assertIn("slack_send_message", self.process("run", expect=1))
+        self.assertEqual(self.claude_calls(), [])
+
+    def test_a_failed_sweep_is_reported_in_the_brief_and_triage_still_runs(self):
+        self.write_profile("acme")
+
+        def fail(cmd):
+            raise process.subprocess.CalledProcessError(1, cmd, stderr="linear-server: not connected\n")
+
+        self.run_fake.responses[("claude", "-p", "/sweep-linear acme")] = fail
+
+        self.process("run")
+
+        self.assertEqual(self.claude_calls()[-1][0][2], "/triage acme")
+        self.assertIn("> ⚠ sweep-linear failed: linear-server: not connected", (self.state / "brief.md").read_text())
+
+
 class ProfileTest(ProcessTestCase):
     # Tools that send, review, RSVP or merge on my behalf. None may ever be in a sweep or triage allowlist.
     SEND_TOOLS = [
