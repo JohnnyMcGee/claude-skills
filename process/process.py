@@ -666,7 +666,7 @@ class Process:
         if problems:
             raise SystemExit("process: result not recorded:\n" + "\n".join(f"  {p}" for p in problems))
         status = {"success": "done", "failure": "failed", "skipped": "skipped"}[outcome]
-        note = result.get("link") or result.get("error") or ("dry run" if dry else None)
+        note = result.get("link") or result.get("error")
         e = {**found[0], "status": status, **({"note": note} if note else {})}
         self.append_jsonl(self.state_root() / "results.jsonl", [result])
         self.append_jsonl(self.state_root() / "queue.jsonl", [e])
@@ -693,19 +693,24 @@ class Process:
         latest = run.get("id") or max((e["run"] for e in queue), default=None)
         now = datetime.fromtimestamp(self.clock()).astimezone()
         midnight = iso(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        # Executor results show in the next brief: a delta's since the last brief, a full brief's since midnight.
+        last = self.read_json(self.state_root() / "brief.json", {}).get("at", "")
+        new = (lambda at: at > last) if opts.get("--delta") else (lambda at: at >= midnight)
+        acted = {r["entry_id"] for r in self.read_jsonl(self.state_root() / "results.jsonl") if new(r["at"])}
         if opts.get("--delta"):
-            shown = lambda e: e["run"] == latest
+            shown = lambda e: e["run"] == latest or e["id"] in acted
         else:
-            shown = lambda e: e["status"] == "pending" or e["created"] >= midnight
+            shown = lambda e: e["status"] in ("pending", "approved") or e["created"] >= midnight or e["id"] in acted
         mode = "delta" if opts.get("--delta") else "full"
         lines = [f"# Brief — {now:%a %Y-%m-%d %H:%M} · {mode}", ""]
         for name in names:
             entries = [e for e in queue if e["project"] == name and e["status"] != "superseded" and shown(e)]
             lines += [f"## {name}", ""] + [f"> ⚠ {p}" for p in run.get("problems", {}).get(name, [])]
-            lines += render_project(entries) or ["Nothing new.", ""]
+            lines += render_project(entries, acted) or ["Nothing new.", ""]
         brief = "\n".join(lines).rstrip() + "\n"
         self.state_root().mkdir(parents=True, exist_ok=True)
         (self.state_root() / "brief.md").write_text(brief)
+        self.write_json(self.state_root() / "brief.json", {"at": iso(self.clock())})
         archive = self.state_root() / "briefs" / f"{now:%Y-%m-%d}.md"
         archive.parent.mkdir(parents=True, exist_ok=True)
         with archive.open("a") as f:
@@ -775,10 +780,12 @@ def mark_read(name, items, summary):
 URGENCY = ["urgent", "normal", "low"]
 
 
-def render_project(entries):
-    """One project's brief sections: Needs approval, Done silently, FYI (collapsed). Empty sections are left out."""
+def render_project(entries, acted=()):
+    """One project's brief sections: Needs approval, Approved (what the executor did with what I approved), Done
+    silently, FYI (collapsed). Empty sections are left out."""
     entries = sorted(entries, key=lambda e: (URGENCY.index(e["urgency"]), e["created"]))
     needs = [e for e in entries if e["status"] == "pending"]
+    approved = [e for e in entries if e["autonomy"] == "draft" and (e["status"] == "approved" or e["id"] in acted)]
     silent = [e for e in entries if e["autonomy"] == "silent" and e["status"] in ("approved", "done", "failed", "skipped")]
     fyi = [e for e in entries if e["status"] == "info"]
     lines = []
@@ -790,10 +797,14 @@ def render_project(entries):
             lines.append(f"- {'**urgent** · ' if e['urgency'] == 'urgent' else ''}{e['summary']} · {' + '.join(e['sources'])} · {e['link']}")
             lines.append(f"  `{e['action']['type']}`{ref}{' ' + params['event'] if 'event' in params else ''} · `{e['id']}`")
             lines += [f"  > {line}" for line in (e["action"].get("draft") or "").splitlines()] + [""]
+    words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped (dry run)"}
+    outcome = lambda e: f"{words[e['status']]}{': ' + e['note'] if e.get('note') else ''}"
+    if approved:
+        lines += [f"### Approved ({len(approved)})", ""]
+        lines += [f"- {e['summary']} · {e['link']}\n  `{e['action']['type']}` — {outcome(e)}" for e in approved] + [""]
     if silent:
         lines += [f"### Done silently ({len(silent)})", ""]
-        words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped (dry run)"}
-        lines += [f"- {e['summary']} — {words[e['status']]}{': ' + e['note'] if e.get('note') else ''}" for e in silent] + [""]
+        lines += [f"- {e['summary']} — {outcome(e)}" for e in silent] + [""]
     if fyi:
         lines += [f"### FYI ({len(fyi)})", "", "<details>", f"<summary>{len(fyi)} item(s)</summary>", ""]
         lines += [f"- {'**urgent** · ' if e['urgency'] == 'urgent' else ''}{e['summary']} · {e['link']}" for e in fyi]

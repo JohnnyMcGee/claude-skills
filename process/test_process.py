@@ -543,6 +543,40 @@ class BriefTest(TriageTestCase):
 
         self.assertIn("#101", (self.state / "brief.md").read_text())
 
+    def decide_and_execute(self, entry, outcome, **flags):
+        with (self.state / "decisions.jsonl").open("a") as f:
+            f.write(json.dumps({"entry_id": entry["id"], "verdict": "approve", "at": process.iso(self.now)}) + "\n")
+        self.process("execute")
+        self.process("execute", "result", "acme", entry["id"], outcome, *[a for k, v in flags.items() for a in (f"--{k}", v)])
+
+    def test_the_next_brief_shows_what_the_executor_did_with_what_i_approved(self):
+        self.emit(item(), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", summary="Ben requested your review on #102"))
+        sent, failed = self.triage()
+        self.now += 24 * 3600  # the next morning: yesterday's entries are no longer today's
+        self.decide_and_execute(sent, "success", link="https://github.com/acme/widgets/pull/101#pullrequestreview-1")
+        self.decide_and_execute(failed, "failure", error="403 from GitHub")
+
+        self.process("brief")
+
+        approved = self.section((self.state / "brief.md").read_text(), "acme", "Approved (2)")
+        self.assertIn("Ana requested your review on #101", approved)
+        self.assertIn("done: https://github.com/acme/widgets/pull/101#pullrequestreview-1", approved)
+        self.assertIn("FAILED: 403 from GitHub", approved)
+
+    def test_a_delta_brief_shows_results_recorded_since_the_last_brief(self):
+        self.emit(item(), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", summary="Ben requested your review on #102"))
+        old, new = self.triage()
+        self.decide_and_execute(old, "success", link="https://example.com/old")
+        self.process("brief")
+        self.now += 3600
+        self.decide_and_execute(new, "success", link="https://example.com/new")
+
+        self.process("brief", "--delta")
+
+        delta = (self.state / "brief.md").read_text()
+        self.assertIn("https://example.com/new", delta)
+        self.assertNotIn("https://example.com/old", delta)
+
     def test_a_brief_before_any_run_says_nothing_new(self):
         self.process("brief")
 
@@ -774,7 +808,9 @@ class DryRunExecuteTest(ExecuteTestCase):
         [result] = self.jsonl(self.state / "results.jsonl")
         self.assertEqual(result["outcome"], "skipped")
         self.assertEqual(self.process("validate", "result", str(self.state / "results.jsonl")), "")
-        self.assertEqual((self.entry(self.review["id"])["status"], self.entry(self.review["id"])["note"]), ("skipped", "dry run"))
+        self.assertEqual(self.entry(self.review["id"])["status"], "skipped")
+        self.process("brief")
+        self.assertIn("`gh_review` — skipped (dry run)", (self.state / "brief.md").read_text())
 
     def test_a_dry_run_leaves_profiles_in_the_real_config_directory_alone(self):
         real = self.tmp / ".config" / "process" / "profiles" / "acme.md"
