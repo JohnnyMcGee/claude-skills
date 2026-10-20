@@ -1006,7 +1006,9 @@ def entry(name, profile, group):
         elif ready:
             summary += " — approved and green; merging is yours"  # merge is a never action: say so, never queue it
     elif kind == "pr_comment" and ref:
-        trivial = lead["actor"]["role"] == "bot" or NIT.match(lead["context"])  # fixed and pushed without asking
+        # Fixed and pushed without asking: a bot's finding, or a nit from someone with a say in the repo. Anyone else's
+        # "nit" could ask for any code at all, so it waits for me like any other comment.
+        trivial = lead["actor"]["role"] == "bot" or (NIT.match(lead["context"]) and facts.get("collaborator"))
         action = {"type": "gh_fix_pr" if trivial else "gh_thread_reply", "params": {**ref, "comment": canonical(lead["subject"])}}
         urgency, silent = "normal", bool(trivial)
     elif kind in ("mention", "ticket_change"):

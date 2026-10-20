@@ -51,7 +51,8 @@
             "checks": {"enum": ["passing", "failing", "pending", "none"]},
             "review": {"enum": ["approved", "changes_requested", "review_required", "none"]},
             "draft": {"type": "boolean"},
-            "notification_id": {"description": "Linear: the notification this item came from, to mark read.", "type": "string", "minLength": 1}
+            "notification_id": {"description": "Linear: the notification this item came from, to mark read.", "type": "string", "minLength": 1},
+            "collaborator": {"description": "pr_comment: the author is the repo's owner, a member or a collaborator, so their nit may be fixed without asking.", "type": "boolean"}
           }
         }
       }

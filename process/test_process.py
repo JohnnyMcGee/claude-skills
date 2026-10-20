@@ -1018,11 +1018,14 @@ class FixPrTest(ExecuteTestCase):
         before = len(self.git_calls())
 
         for args in (["log", "-1", "--output=../x"], ["diff", "--output", "../x"], ["commit", "-F", "/home/me/.ssh/id_rsa"], ["commit", "--file=/etc/passwd"],
-                     ["commit", "-Fsecret"], ["add", "--pathspec-from-file=../list"], ["diff", "--no-index", "/a", "/b"], ["diff", "--ext-diff"], ["commit", "-t", "../t"]):
+                     ["commit", "-Fsecret"], ["add", "--pathspec-from-file=../list"], ["diff", "--no-index", "/a", "/b"], ["diff", "--ext-diff"], ["commit", "-t", "../t"],
+                     ["commit", "--fil=/home/me/.ssh/id_rsa"], ["commit", "--templ=../t"], ["add", "--pathspec-from-f=../list"], ["log", "--out=../x"]):
             with self.subTest(args=args):
                 self.assertIn("not allowed in a fix", self.process("execute", "git", "acme", self.fix["id"], *args, expect=1))
         self.assertEqual(len(self.git_calls()), before)
         self.process("execute", "git", "acme", self.fix["id"], "commit", "-m", "fix: drop the unused import")
+        self.process("execute", "git", "acme", self.fix["id"], "commit", "--no-edit")
+        self.process("execute", "git", "acme", self.fix["id"], "log", "--oneline", "--format=%h")
 
     def test_a_workdir_whose_origin_is_not_the_prs_repo_is_never_fetched_or_pushed(self):
         for url in ("git@github.com:me-dev/widgets.git", "https://github.com/acme/widgets-fork.git"):
