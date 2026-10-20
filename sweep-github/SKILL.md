@@ -25,7 +25,7 @@ Live, for repo `R`:
 
 1. **Me**: `mcp__github__get_me`, for my login.
 2. **My open PRs**: `gh pr list --repo R --author @me --state open --json number,title,url,updatedAt,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid`.
-3. **PRs requesting my review**: `gh pr list --repo R --search "review-requested:@me" --state open --json number,title,url,updatedAt,author,labels,body`.
+3. **PRs requesting my review**: `gh pr list --repo R --search "review-requested:@me" --state open --json number,title,url,updatedAt,author,labels,body,headRefOid`.
 4. **Comments on my PRs**: for each PR from read 2, `gh pr view <n> --repo R --json comments,reviews`, and its inline review comments with `mcp__github__pull_request_read` (method `get_review_comments`). With a **since**, keep only comments created or edited after it.
 
 The read is complete when every PR from reads 2 and 3 has been mapped below.
@@ -36,7 +36,7 @@ One item per ask. Every item carries `source: "github"`, `actor` (`{"name": <log
 
 | Ask | `kind` | `native_id` | `version` | `subject` | Extra |
 |---|---|---|---|---|---|
-| A PR requests my review | `review_request` | `pr/<n>` | its `updatedAt` | PR URL | `labels`; context: the PR body |
+| A PR requests my review | `review_request` | `pr/<n>` | its `headRefOid`, so a new push resurfaces it and comments or labels do not | PR URL | `labels`; context: the PR body |
 | My open PR | `pr_status` | `pr/<n>` | `<mergeable>\|<checks>\|<review>\|<headRefOid>` | PR URL | `facts` below; context: failing check names |
 | Someone else's comment or review on my PR | `pr_comment` | `comment/<id>` | the comment's `updatedAt` | the comment's URL, `#fragment` included | context: the comment body |
 
