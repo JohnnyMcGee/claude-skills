@@ -155,6 +155,10 @@ class EmitTest(ProcessTestCase):
         self.assertEqual(self.process("validate", "item", str(self.profile_dir() / "items.jsonl")), "")
         self.assertEqual(self.process("watermark", "acme", "github").strip(), "2026-10-20T13:00:00Z")
 
+    def test_a_missing_argument_prints_the_commands_usage(self):
+        self.assertIn("usage: process emit <profile> <source>", self.process("emit", "acme", expect=2))
+        self.assertIn("usage: process triage <step> <profile>", self.process("triage", "plan", expect=2))
+
     def test_an_invalid_item_stores_nothing_and_leaves_the_watermark_alone(self):
         out = self.process(
             "emit", "acme", "github", stdin=json.dumps(item()) + "\n" + json.dumps(item(kind="gossip")) + "\n", expect=1

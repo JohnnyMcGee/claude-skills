@@ -5,6 +5,7 @@ stdlib only. Every external command (claude) goes through run().
 """
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -331,7 +332,7 @@ class Process:
         steps = {"plan": self.triage_plan, "draft": self.triage_draft, "silent": self.triage_silent, "commit": self.triage_commit}
         if step not in steps:
             raise SystemExit(f"process: triage step must be one of {', '.join(steps)}")
-        return steps[step](profile, *args)
+        return call(steps[step], (profile, *args), f"triage {step}")
 
     def triage_plan(self, name):
         """Turn every unhandled item into proposed queue entries in plan.json, and print what needs drafting."""
@@ -569,6 +570,21 @@ def entry(name, profile, group):
     }
 
 
+class Usage(Exception):
+    pass
+
+
+def call(handler, args, name):
+    """Call a command handler, turning a wrong argument count into its usage line instead of a traceback."""
+    signature = inspect.signature(handler)
+    try:
+        signature.bind(*args)
+    except TypeError:
+        words = [f"[{p.name}]" if p.default is not p.empty else "[options]" if p.kind is p.VAR_POSITIONAL else f"<{p.name}>" for p in signature.parameters.values()]
+        raise Usage(f"usage: process {name} {' '.join(words)}".replace("entry_id", "entry-id").replace("<name>", "<profile>"))
+    return handler(*args)
+
+
 def flags(args, *names):
     """--name value pairs; bare --name (no value) is True."""
     opts, args = {}, list(args)
@@ -597,7 +613,10 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         app.out(f"process: unknown command '{command}'")
         return 2
     try:
-        return handler(*args) or 0
+        return call(handler, args, command) or 0
+    except Usage as usage:
+        app.out(str(usage))
+        return 2
     except subprocess.CalledProcessError as error:
         app.out(f"process: `{shlex.join(error.cmd)}` failed: {(error.stderr or '').strip()}")
         return 1
