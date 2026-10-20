@@ -528,7 +528,6 @@ class Process:
         """Turn each decision on a still-pending entry into its new state. A decision on anything else is stale (the
         entry was superseded or already decided) and changes nothing, so applying twice is a no-op."""
         queue = {e["id"]: e for e in self.queue()}
-        changed, handled = [], {}
         for n, decision in enumerate(self.read_jsonl(self.state_root() / "decisions.jsonl"), 1):
             problems = validate(decision, "decision")
             if problems:
@@ -537,18 +536,28 @@ class Process:
             e = queue.get(decision["entry_id"])
             if not e or e["status"] != "pending" or e["project"] not in profiles:
                 continue
+            if decision["verdict"] == "approve":
+                draft = decision.get("draft") or e["action"].get("draft", "")
+                did = "edited" if draft != e["action"].get("draft", "") else "approved"
+                e = {**e, "status": "approved", "action": {**e["action"], "draft": draft}}
+            else:
+                did, e = "skipped", {**e, "status": "skipped"}
+            # The entry leaves pending first, so a crash below can never teach the same decision twice.
+            self.append_jsonl(self.state_root() / "queue.jsonl", [e])
+            queue[e["id"]] = e
+            if e["status"] == "skipped":
+                self.handle(e["project"], [e], "skipped")
             if decision.get("promote_to_silent"):
                 self.promote(e["project"], e["action"]["type"])
-            if decision["verdict"] == "approve":
-                e = {**e, "status": "approved", "action": {**e["action"], "draft": decision.get("draft") or e["action"].get("draft", "")}}
-            else:
-                e = {**e, "status": "skipped"}
-                handled.setdefault(e["project"], []).append(e)
-            queue[e["id"]] = e
-            changed.append(e)
-        self.append_jsonl(self.state_root() / "queue.jsonl", changed)
-        for name, entries in handled.items():
-            self.handle(name, entries, "skipped")
+            if decision.get("reason", "").strip():
+                self.learn(e, did, decision["reason"])
+
+    def learn(self, e, did, reason):
+        """A lesson is my reason, word for word, never a paraphrase: the profile is read by every phase, so nothing
+        a phase read from a PR or a ticket may reach it."""
+        when = f"{datetime.fromtimestamp(self.clock()).astimezone():%Y-%m-%d}"
+        lesson = f"Lesson ({when}, I {did} a {e['action']['type']}): {' '.join(reason.split())}"
+        self.edit_profile(e["project"], lesson=lesson, changelog=f"Lesson from my reason on {e['id']}.")
 
     def promote(self, name, action_type):
         """Add an action type to the profile's autonomy overrides, so triage approves it without asking next time."""

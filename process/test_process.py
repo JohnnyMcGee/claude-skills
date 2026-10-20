@@ -602,6 +602,34 @@ class LearningTest(ExecuteTestCase):
         [later] = [e for e in self.triage() if e["item_ids"][0].startswith("github:comment/2")]
         self.assertEqual((later["autonomy"], later["status"]), ("silent", "approved"))
 
+    def test_a_reason_i_typed_becomes_a_lesson_in_how_to_sweep_with_a_changelog_entry(self):
+        self.emit(self.comment(1), self.comment(2))
+        skipped, edited = self.triage()
+        self.decide(skipped, "skip", reason="Ana's questions on #7 were answered in standup")
+        self.decide(edited, draft="Yes, a dict.", reason="Too formal: I write one-liners")
+
+        self.process("execute")
+
+        profile = process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")
+        how_to, changelog = profile["body"].split("## How to sweep", 1)[1].split("## Changelog", 1)
+        self.assertIn("- Lesson (2026-10-20, I skipped a gh_thread_reply): Ana's questions on #7 were answered in standup", how_to)
+        self.assertIn("- Lesson (2026-10-20, I edited a gh_thread_reply): Too formal: I write one-liners", how_to)
+        self.assertIn(f"- 2026-10-20 — Lesson from my reason on {skipped['id']}.", changelog)
+        self.assertEqual(changelog.count("Lesson from my reason"), 2)
+
+    def test_no_reason_no_lesson_and_a_decision_teaches_once(self):
+        self.emit(self.comment(1), self.comment(2))
+        quiet, taught = self.triage()
+        self.decide(quiet, "skip")
+        self.decide(taught, "skip", reason="Noise")
+        self.process("execute")
+        before = self.profile_text()
+
+        self.process("execute")
+
+        self.assertEqual(self.profile_text(), before)
+        self.assertEqual(before.count("Lesson ("), 1)
+
     def test_a_review_is_never_promoted_to_silent(self):
         self.emit(item())
         [review] = self.triage()
