@@ -98,10 +98,15 @@ def validate(value, kind):
 
 # --- profiles ---------------------------------------------------------------------------------------------------
 
-# Words that name a send, review, RSVP or merge. A tool whose name holds one never belongs in a sweep or triage
-# allowlist, unless it only reads (get_/list_/search_/read_ prefixes, a _read suffix).
-SEND_WORDS = re.compile(r"send|reply|post|comment|review|rsvp|respond|event|merge|approve|submit|forward|publish|schedule|share|invite")
+# Words that name a send, review, RSVP, merge or other write others see. A tool whose name holds one never belongs
+# in a sweep or triage allowlist, unless it only reads (get_/list_/search_/read_ prefixes, a _read suffix).
+SEND_WORDS = re.compile(
+    r"send|reply|post|comment|review|rsvp|respond|event|merge|approve|submit|forward|publish|schedule|share|invite"
+    r"|write|delete|push|create|update|add_|reaction|assign"
+)
 READ_ONLY = re.compile(r"__(get|list|search|read|fetch)_|_read$")
+# Bash prefixes that run arbitrary commands, so no prefix after them is safe.
+LAUNCHERS = {"sh", "bash", "zsh", "env", "xargs", "eval", "exec", "sudo", "nohup", "timeout", "python", "python3", "node", "perl", "ruby", "curl", "wget"}
 
 
 def forbidden_tool(tool):
@@ -109,7 +114,7 @@ def forbidden_tool(tool):
     bash = re.fullmatch(r"Bash\((.*)\)", tool)
     if bash:
         words = bash[1].removesuffix(":*").removesuffix("*").split()
-        too_broad = len(words) < 2 or words[:2] == ["gh", "api"] or words[0] in ("curl", "wget")
+        too_broad = len(words) < 2 or words[0] in LAUNCHERS or (words[0] == "gh" and (len(words) < 3 or words[1] == "api"))
         return too_broad or bool(SEND_WORDS.search(" ".join(words)))
     if tool == "Bash" or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
         return True
@@ -244,37 +249,53 @@ class Process:
         profile's model and allowlist; then render the brief. --fixtures points sweepers at fixture data and makes
         triage a dry run."""
         opts = flags(args, "--delta", "--project", "--fixtures")
-        real = Path(self.env["HOME"]) / ".local" / "state" / "process"
-        if opts.get("--fixtures") and self.state_root().resolve() == real.resolve():
-            raise SystemExit("process: a --fixtures dry run needs a scratch XDG_STATE_HOME, not the real queue in " + str(real))
+        dry = bool(opts.get("--fixtures"))
+        if dry:
+            self.guard_dry_run()
+            opts["--fixtures"] = os.path.abspath(opts["--fixtures"])  # phases run in the profile's workdir
         profiles = self.profiles()  # refuses before any phase starts if one grants a send tool
         if opts.get("--project") and opts["--project"] not in profiles:
             raise SystemExit(f"process: no profile {opts['--project']!r} in {self.profiles_dir()}")
         names = [opts["--project"]] if opts.get("--project") else [n for n, p in profiles.items() if p["active"]]
         run = {"id": iso(self.clock()), "delta": bool(opts.get("--delta")), "problems": {}}
         self.write_json(self.state_root() / "run.json", run)
-        sweep_args = (" --delta" if opts.get("--delta") else "") + (f" --fixtures {opts['--fixtures']}" if opts.get("--fixtures") else "")
-        for name in names:
-            profile = profiles[name]
-            phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in profile["sources"]]
-            phases.append(("triage", f"/triage {name}" + (" --dry-run" if opts.get("--fixtures") else "")))
-            for phase, prompt in phases:
-                self.out(f"{name}: {phase}")
-                try:
-                    self.headless(profile, phase, prompt)
-                except subprocess.CalledProcessError as error:
-                    detail = ((error.stderr or "").strip().splitlines() or [f"exit {error.returncode}"])[-1]
-                    run["problems"].setdefault(name, []).append(f"{phase} failed: {detail}")
-                    self.write_json(self.state_root() / "run.json", run)
-        self.cmd_brief(*(["--delta"] if opts.get("--delta") else []), *(["--project", opts["--project"]] if opts.get("--project") else []))
-        (self.state_root() / "run.json").unlink()
+        sweep_args = (" --delta" if opts.get("--delta") else "") + (f" --fixtures {opts['--fixtures']}" if dry else "")
+        try:
+            for name in names:
+                profile = profiles[name]
+                phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in profile["sources"]]
+                phases.append(("triage", f"/triage {name}" + (" --dry-run" if dry else "")))
+                for phase, prompt in phases:
+                    self.out(f"{name}: {phase}")
+                    try:
+                        self.headless(profile, phase, prompt, dry)
+                    except (subprocess.CalledProcessError, OSError) as error:  # OSError: no workdir, no claude
+                        stderr = getattr(error, "stderr", None) or ""
+                        detail = (stderr.strip().splitlines() or [str(error)])[-1]
+                        run["problems"].setdefault(name, []).append(f"{phase} failed: {detail}")
+                        self.write_json(self.state_root() / "run.json", run)
+            self.cmd_brief(*(["--delta"] if opts.get("--delta") else []), *(["--project", opts["--project"]] if opts.get("--project") else []))
+        finally:
+            (self.state_root() / "run.json").unlink()
 
-    def headless(self, profile, phase, prompt):
-        """One phase as headless Claude: only its allowlist is pre-approved, and known send tools are denied outright
-        in case user settings allow them."""
+    def guard_dry_run(self):
+        """A dry run writes only to a scratch state directory: never the default one, never one a real run used."""
+        root = self.state_root()
+        real = Path(self.env["HOME"]) / ".local" / "state" / "process"
+        used = (root / "queue.jsonl").exists() and not (root / "dry-run").exists()
+        if root.resolve() == real.resolve() or used:
+            raise SystemExit(f"process: a --fixtures dry run needs a scratch XDG_STATE_HOME, not the real queue in {root}")
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "dry-run").touch()
+
+    def headless(self, profile, phase, prompt, dry=False):
+        """One phase as headless Claude in dontAsk mode: only its allowlist is approved, everything else is denied, and
+        known send tools are denied by name too. A dry run gets no service (MCP) tools at all."""
         config = profile["phases"][phase]
+        tools = [t for t in config["allowed_tools"] if not (dry and t.startswith("mcp__"))]
         workdir = Path(profile["workdir"].replace("~", self.env["HOME"], 1) if profile["workdir"].startswith("~") else profile["workdir"])
-        cmd = ["claude", "-p", prompt, "--model", config["model"], "--allowedTools", ",".join(config["allowed_tools"]), "--disallowedTools", ",".join(DENIED_TOOLS)]
+        cmd = ["claude", "-p", prompt, "--model", config["model"], "--permission-mode", "dontAsk"]
+        cmd += ["--allowedTools", ",".join(tools), "--disallowedTools", ",".join(DENIED_TOOLS)]
         return self.run(cmd, cwd=workdir)
 
     def cmd_profiles(self):
@@ -344,7 +365,8 @@ class Process:
         pdir = self.profile_state(name)
         handled = {line["item_id"] for line in self.read_jsonl(pdir / "ledger.jsonl")}
         items = [i for i in self.read_jsonl(pdir / "items.jsonl") if i["id"] not in handled]
-        first_run = "bankrupt_at" not in self.read_json(pdir / "state.json", {})
+        # The one-time clear-out happens on the first triage that sees Linear notifications, not merely the first triage.
+        first_run = "bankrupt_at" not in self.read_json(pdir / "state.json", {}) and any(notification(i) for i in items)
         cutoff = iso(self.clock() - BANKRUPTCY_AGE)
         stale = [i for i in items if first_run and i["source"] == "linear" and notification(i) and i["timestamp"] < cutoff]
         dropped = [i for i in items if i["actor"]["role"] == "me" and i["kind"] != "pr_status"]
@@ -355,14 +377,14 @@ class Process:
         entries = [entry(name, profile, group) for group in groups.values()]
         if stale:
             entries.append(mark_read(name, stale, f"Cleared {len(stale)} Linear notification(s) older than 7 days (first run)"))
-        if [i for i in live if notification(i)]:
-            read = [i for i in live if notification(i)]
+        read = [i for i in live + dropped if notification(i)]  # my own get marked read too
+        if read:
             entries.append(mark_read(name, read, f"Marked {len(read)} processed Linear notification(s) read"))
         plan = {"profile": name, "first_run": first_run, "dropped": [i["id"] for i in dropped], "entries": entries}
         self.write_json(pdir / "plan.json", plan)
         by_id = {i["id"]: i for i in items}
         for e in entries:
-            todo = "draft" if e["autonomy"] == "draft" else "do, then report" if e["action"]["type"] == "linear_mark_read" else e["status"]
+            todo = "draft" if needs_draft(e) else "do, then report" if e["action"]["type"] == "linear_mark_read" else e["status"]
             self.out(f"{e['id']}  [{todo}]  {e['action']['type']} {json.dumps(e['action']['params'])}  {e['summary']}  {e['link']}")
             if todo == "draft":
                 for item_id in e["item_ids"]:
@@ -389,6 +411,8 @@ class Process:
         if outcome not in ("done", "failed", "skipped"):
             raise SystemExit("process: a silent outcome is done, failed or skipped")
         plan, e = self.plan_entry(name, entry_id)
+        if e["action"]["type"] != "linear_mark_read":
+            raise SystemExit(f"process: {entry_id} is {e['action']['type']}, not a silent action triage performs")
         e["status"] = outcome
         if note:
             e["note"] = note
@@ -405,7 +429,7 @@ class Process:
         problems = []
         for e in entries:
             problems += [f"{e['id']}: {p}" for p in validate(e, "queue_entry")]
-            if e["autonomy"] == "draft" and not e["action"].get("draft"):
+            if needs_draft(e) and not e["action"].get("draft"):
                 problems.append(f"{e['id']}: no draft (process triage draft {name} {e['id']})")
             if e["action"]["type"] == "linear_mark_read" and e["status"] == "approved":
                 problems.append(f"{e['id']}: no outcome (process triage silent {name} {e['id']} done|failed|skipped)")
@@ -451,6 +475,7 @@ class Process:
             lines += [f"## {name}", ""] + [f"> ⚠ {p}" for p in run.get("problems", {}).get(name, [])]
             lines += render_project(entries) or ["Nothing new.", ""]
         brief = "\n".join(lines).rstrip() + "\n"
+        self.state_root().mkdir(parents=True, exist_ok=True)
         (self.state_root() / "brief.md").write_text(brief)
         archive = self.state_root() / "briefs" / f"{now:%Y-%m-%d}.md"
         archive.parent.mkdir(parents=True, exist_ok=True)
@@ -465,6 +490,11 @@ class Process:
 
 BANKRUPTCY_AGE = 7 * 24 * 3600
 PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
+
+
+def needs_draft(e):
+    """Every action that carries text needs a draft, even one promoted to silent: the executor sends that text."""
+    return e["action"]["type"] not in ("none", "linear_mark_read")
 
 
 def canonical(url):

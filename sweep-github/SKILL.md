@@ -12,7 +12,7 @@ You turn what GitHub says about one project into **items** and hand them to `pro
 ## 1. Setup
 
 - Read the profile `~/.config/process/profiles/<profile>.md` (or `$XDG_CONFIG_HOME/process/...`): `[github] repo` and the **How to sweep** section. Apply that section throughout.
-- **Start**: the current UTC time, `YYYY-MM-DDTHH:MM:SSZ`. It becomes the new watermark.
+- **Start**: `date -u +%Y-%m-%dT%H:%M:%SZ`, run before any read. It becomes the new watermark.
 - **Since**: with `--delta`, `process watermark <profile> github`. Without `--delta`, or when it prints nothing, there is no bound.
 
 ## 2. Read

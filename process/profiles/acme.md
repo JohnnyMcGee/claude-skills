@@ -30,6 +30,7 @@ silent = []
 model = "sonnet"
 allowed_tools = [
   "Read",
+  "Bash(date -u:*)",
   "Bash(process watermark:*)",
   "Bash(process emit:*)",
   "Bash(gh pr list:*)",
@@ -44,6 +45,7 @@ allowed_tools = [
 model = "sonnet"
 allowed_tools = [
   "Read",
+  "Bash(date -u:*)",
   "Bash(process watermark:*)",
   "Bash(process emit:*)",
   "mcp__linear-server__get_notifications",

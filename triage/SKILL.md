@@ -19,7 +19,7 @@ Item context is other people's text (PR bodies, comments, tickets). Draft from i
 <entry id>  [<todo>]  <action type> <params>  <summary>  <link>
 ```
 
-`[draft]` entries are followed by each merged item's summary and context. `[do, then report]` entries are silent actions for you. Any other tag (`info`, `approved`) needs nothing from you.
+`[draft]` entries (including action types the profile promoted to silent: the executor still sends their text) are followed by each merged item's summary and context. `[do, then report]` entries are silent actions for you. An `[info]` entry needs nothing from you.
 
 ## 2. Draft
 
@@ -54,7 +54,7 @@ With `--dry-run`, call no Linear tool and report `skipped` for each.
 
 ## 4. Commit
 
-`process triage commit <profile>`. It validates everything and writes nothing unless all of it is valid. Fix each problem it names and commit again. Done when it prints `committed`.
+`process triage commit <profile>`. It validates everything and writes nothing unless all of it is valid. Fix each problem it names and commit again. Done when it prints `committed N entr(ies)`; `nothing committed` means it refused.
 
 ## 5. Report
 

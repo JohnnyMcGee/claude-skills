@@ -221,7 +221,7 @@ class TriageTestCase(ProcessTestCase):
         """Run triage the way the triage skill does: plan, draft every draft entry, report each silent action, commit."""
         self.process("triage", "plan", profile)
         for entry in self.plan(profile)["entries"]:
-            if entry["autonomy"] == "draft":
+            if entry["action"]["type"] not in ("none", "linear_mark_read"):
                 self.process("triage", "draft", profile, entry["id"], stdin=f"Draft for {entry['summary']}")
             if entry["action"]["type"] == "linear_mark_read":
                 self.process("triage", "silent", profile, entry["id"], outcome)
@@ -272,6 +272,21 @@ class TriageRulesTest(TriageTestCase):
         [reply] = self.triage()
 
         self.assertEqual((reply["autonomy"], reply["status"]), ("silent", "approved"))
+        self.assertTrue(reply["action"]["draft"])
+
+    def test_a_promoted_action_still_needs_its_draft_before_commit(self):
+        self.write_profile(silent=["gh_thread_reply"])
+        self.emit(item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-9"))
+
+        self.assertIn("[draft]", self.process("triage", "plan", "acme"))
+        self.assertIn("no draft", self.process("triage", "commit", "acme", expect=1))
+
+    def test_silent_outcomes_are_only_for_actions_triage_performs_itself(self):
+        self.emit(item())
+        self.process("triage", "plan", "acme")
+        [review] = self.plan()["entries"]
+
+        self.assertIn("not a silent action", self.process("triage", "silent", "acme", review["id"], "done", expect=1))
 
     def test_my_own_comments_are_handled_without_an_entry(self):
         mine = item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-2", actor={"name": "me", "role": "me"})
@@ -320,6 +335,25 @@ class LinearInboxTest(TriageTestCase):
 
         self.assertEqual([e["action"]["params"]["notification_ids"] for e in self.mark_read(queue)], [["notif-1"], ["notif-4"]])
         self.assertIn("Mentioned on WID-4", [e["summary"] for e in queue])
+
+    def test_the_clear_out_waits_for_the_first_run_that_sees_linear(self):
+        self.emit(item())
+        self.triage()  # the Linear sweep failed or found nothing
+
+        self.emit(self.notification(1, days_old=30), self.notification(2, days_old=1), source="linear")
+        cleared, processed = self.mark_read(self.triage())
+
+        self.assertEqual(cleared["action"]["params"]["notification_ids"], ["notif-1"])
+        self.assertEqual(processed["action"]["params"]["notification_ids"], ["notif-2"])
+
+    def test_my_own_notifications_are_marked_read_without_an_entry(self):
+        self.emit(self.notification(1, days_old=1), {**self.notification(2, days_old=1), "actor": {"name": "me", "role": "me"}}, source="linear")
+
+        queue = self.triage()
+
+        [processed] = self.mark_read(queue)
+        self.assertEqual(processed["action"]["params"]["notification_ids"], ["notif-1", "notif-2"])
+        self.assertEqual([e["summary"] for e in queue if e["kind"] == "mention"], ["Mentioned on WID-1"])
 
     def test_a_failed_mark_read_is_recorded_as_failed(self):
         self.emit(self.notification(1, days_old=1), source="linear")
@@ -421,6 +455,11 @@ class BriefTest(TriageTestCase):
 
         self.assertIn("#101", (self.state / "brief.md").read_text())
 
+    def test_a_brief_before_any_run_says_nothing_new(self):
+        self.process("brief")
+
+        self.assertIn("Nothing new.", (self.state / "brief.md").read_text())
+
     def test_project_narrows_the_brief_to_one_profile(self):
         self.write_profile("side")
         self.emit(item())
@@ -466,6 +505,7 @@ class RunTest(ProcessTestCase):
             self.assertEqual(self.opt(cmd, "--model"), profile["phases"][phase]["model"])
             self.assertEqual(self.opt(cmd, "--allowedTools").split(","), profile["phases"][phase]["allowed_tools"])
             self.assertIn("mcp__github__merge_pull_request", self.opt(cmd, "--disallowedTools").split(","))
+            self.assertEqual(self.opt(cmd, "--permission-mode"), "dontAsk")  # anything not allowlisted is denied
             self.assertEqual(cwd, str(self.tmp / "work" / "acme"))
         self.assertTrue((self.state / "brief.md").exists())
 
@@ -480,6 +520,44 @@ class RunTest(ProcessTestCase):
         brief = (self.state / "brief.md").read_text()
         self.assertIn("· delta", brief)
         self.assertNotIn("## acme", brief)
+
+    def test_a_dry_run_reads_fixtures_from_an_absolute_path_with_no_service_tools(self):
+        self.write_profile("acme")
+
+        self.process("run", "--fixtures", "fx")
+        self.process("run", "--fixtures", "fx")  # a scratch directory takes any number of dry runs
+
+        calls = self.claude_calls()
+        self.assertEqual(calls[0][0][2], f"/sweep-github acme --fixtures {Path('fx').resolve()}")
+        for cmd, _ in calls:
+            self.assertEqual([t for t in self.opt(cmd, "--allowedTools").split(",") if t.startswith("mcp__")], [])
+
+    def test_a_dry_run_refuses_a_state_directory_that_holds_a_real_queue(self):
+        self.write_profile("acme")
+        self.emit(item())
+        out = self.process("triage", "plan", "acme")
+        self.process("triage", "draft", "acme", out.split()[0], stdin="Looks fine.")
+        self.process("triage", "commit", "acme")  # a real queue now lives here
+
+        self.assertIn("scratch XDG_STATE_HOME", self.process("run", "--fixtures", "/fx", expect=1))
+        self.assertEqual(self.claude_calls(), [])
+
+    def test_a_missing_workdir_is_reported_and_the_run_carries_on(self):
+        self.write_profile("acme")
+        self.write_profile("side")
+
+        def missing(cmd):
+            raise FileNotFoundError(2, "No such file or directory", "/nowhere")
+
+        self.run_fake.responses[("claude", "-p", "/sweep-github acme")] = missing
+        self.run_fake.responses[("claude", "-p", "/sweep-linear acme")] = missing
+        self.run_fake.responses[("claude", "-p", "/triage acme")] = missing
+
+        self.process("run")
+
+        self.assertIn("/triage side", [c[2] for c, _ in self.claude_calls()])
+        self.assertIn("> ⚠ triage failed: [Errno 2] No such file or directory", (self.state / "brief.md").read_text())
+        self.assertFalse((self.state / "run.json").exists())
 
     def test_a_dry_run_refuses_to_write_into_the_real_state_directory(self):
         self.write_profile("acme")
@@ -532,6 +610,20 @@ class ProfileTest(ProcessTestCase):
         "Bash(gh:*)",
         "mcp__slack",
         "mcp__github__*",
+        "Bash(gh issue:*)",
+        "Bash(gh pr:*)",
+        "Bash(sh -c:*)",
+        "Bash(python3 -c:*)",
+        "Bash(env gh:*)",
+        "Bash(xargs gh:*)",
+        "mcp__github__push_files",
+        "mcp__github__create_or_update_file",
+        "mcp__github__issue_write",
+        "mcp__github__update_pull_request",
+        "mcp__github__delete_repository",
+        "mcp__slack__slack_add_reaction",
+        "mcp__linear-server__create_comment",
+        "mcp__claude_ai_Google_Calendar__create_event",
     ]
 
     def test_profiles_lists_each_profile_with_its_sources(self):
