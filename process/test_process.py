@@ -1360,6 +1360,35 @@ class AfkLaunchTest(NextWorkTestCase):
 
         self.assertEqual((self.picks(result), result["afk"]), ([], []))
 
+    def starts(self):
+        return [c[4] for c in self.run_fake.calls if c[:4] == ["env", "AFK_PROJECT=process-acme", "afk", "start"]]
+
+    def test_no_more_than_two_afk_workers_run_at_once_and_extra_approvals_wait_for_a_free_slot(self):
+        self.afk_workers([{"ticket": "01", "phase": "implement"}, {"ticket": "02", "phase": "review"}, {"ticket": "03", "phase": "hitl"}])
+        first, second = self.approve_launch(ticket("WID-1", estimate="S"), ticket("WID-2", estimate="S"))
+
+        out = self.process("execute")
+
+        self.assertEqual(self.starts(), ["01"])  # a worker in review is parked on me, a hitl one is mine: neither runs
+        self.assertEqual((self.entry(first["id"])["status"], self.entry(second["id"])["status"]), ("done", "approved"))
+        self.assertIn("waits for a free AFK slot", out)
+        self.process("brief")
+        self.assertIn("waits for a free AFK slot", (self.state / "brief.md").read_text())
+
+        self.afk_workers([{"ticket": "01", "phase": "review"}])
+        self.process("execute")
+        self.assertEqual(self.starts(), ["01", "02"])
+        self.assertEqual(self.entry(second["id"])["status"], "done")
+
+    def test_the_profile_sets_how_many_afk_workers_may_run(self):
+        self.write_profile(afk={**TRIVIAL, "max_workers": 3})
+        self.afk_workers([{"ticket": "01", "phase": "implement"}, {"ticket": "02", "phase": "verify"}])
+        self.approve_launch(ticket("WID-1", estimate="S"), ticket("WID-2", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(len(self.starts()), 1)
+
     def test_a_failed_start_is_recorded_as_a_failure(self):
         def refuse(cmd):
             raise subprocess.CalledProcessError(1, cmd, stderr="afk: base branch 'main' does not exist")

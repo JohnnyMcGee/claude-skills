@@ -730,19 +730,30 @@ class Process:
 
     def launch_afk(self, profile, dry):
         """Start a worker for each approved afk_launch, oldest first, and record how each went."""
-        name = profile["name"]
+        name, limit, running = profile["name"], profile.get("afk", {}).get("max_workers", AFK_MAX_WORKERS), None
         for e in self.approved(name, "afk_launch"):
             if dry:
                 self.record(name, e, "skipped")
                 continue
             try:
                 project, spec = self.afk_project(profile)
+                if running is None:
+                    running = self.afk_running(project, profile)
+                if running >= limit:  # still approved: the next executor run tries again
+                    self.out(f"{e['id']}: waits for a free AFK slot ({running} of {limit} running)")
+                    continue
                 number = self.afk_ticket(spec, e)
                 self.run(["env", f"AFK_PROJECT={project}", "afk", "start", number], cwd=self.workdir(profile))
-            except (subprocess.CalledProcessError, OSError) as error:
+            except (subprocess.CalledProcessError, OSError, ValueError) as error:  # ValueError: afk printed no JSON
                 self.record(name, e, "failure", error=failure("afk", error).removeprefix("afk failed: "))
                 continue
+            running += 1
             self.record(name, e, "success", link=e["action"]["params"]["url"])
+
+    def afk_running(self, project, profile):
+        """Workers running in the project, counted as afk counts them: one in review is parked on me, a hitl one is mine."""
+        workers = json.loads(self.run(["env", f"AFK_PROJECT={project}", "afk", "next"], cwd=self.workdir(profile)))["workers"]
+        return sum(w["phase"] not in ("review", "hitl") for w in workers)
 
     def afk_project(self, profile):
         """The profile's afk project and its spec directory, bound to a tmux session of the same name on first use."""
@@ -1060,6 +1071,7 @@ MERGE_BASE = (
     "Merge the base branch into the PR branch (never rebase) and resolve the conflicts. Push only if every conflict is "
     "mechanical: both sides kept, nothing about behaviour decided. Otherwise abort and report the conflicting files."
 )
+AFK_MAX_WORKERS = 2
 # How an AFK worker's PR differs from afk's default: it is a draft, so it reads as unreviewed.
 AFK_PR = """## Pull request
 
@@ -1135,7 +1147,8 @@ def render_project(entries, acted=()):
             lines.append(f"  `{e['action']['type']}`{ref}{' ' + params['event'] if 'event' in params else ''} · `{e['id']}`")
             lines += [f"  > {line}" for line in (e["action"].get("draft") or "").splitlines()] + [""]
     words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped (dry run)"}
-    outcome = lambda e: f"{words[e['status']]}{': ' + e['note'] if e.get('note') else ''}"
+    words_for = lambda e: "approved, waits for a free AFK slot" if e["status"] == "approved" and e["action"]["type"] == "afk_launch" else words[e["status"]]
+    outcome = lambda e: f"{words_for(e)}{': ' + e['note'] if e.get('note') else ''}"
     if approved:
         lines += [f"### Approved ({len(approved)})", ""]
         lines += [f"- {e['summary']} · {e['link']}\n  `{e['action']['type']}` — {outcome(e)}" for e in approved] + [""]

@@ -272,7 +272,8 @@
           "properties": {
             "estimates": {"type": "array", "items": {"type": "string", "minLength": 1}},
             "labels": {"type": "array", "items": {"type": "string", "minLength": 1}},
-            "exclude_labels": {"type": "array", "items": {"type": "string", "minLength": 1}}
+            "exclude_labels": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "max_workers": {"description": "AFK workers that may run at once (default 2). As in afk, a worker in review or a hitl one is not running. More approved launches wait for a free slot.", "type": "integer"}
           }
         },
         "autonomy": {
