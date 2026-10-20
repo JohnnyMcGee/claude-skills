@@ -150,6 +150,23 @@ allowed_tools = [
   "mcp__claude_ai_Gmail__unlabel_thread",
   "mcp__claude_ai_Google_Calendar__get_event",
 ]
+
+# The executor: the only phase that may send, and only what I approved (or promoted to silent). It sends and pushes
+# through `process execute` steps, which post exactly the approved text and check the PR is mine, so it holds no GitHub
+# write tool. Each step is named: a bare `process execute` would start a second executor. It reads only its worktree.
+[phases.execute]
+model = "opus"
+allowed_tools = [
+  "Bash(process profile:*)",
+  "Bash(process execute plan:*)",
+  "Bash(process execute review:*)",
+  "Bash(process execute reply:*)",
+  "Bash(process execute checkout:*)",
+  "Bash(process execute git:*)",
+  "Bash(process execute push:*)",
+  "Bash(process execute result:*)",
+  "mcp__github__pull_request_read",
+]
 +++
 
 # Acme widgets

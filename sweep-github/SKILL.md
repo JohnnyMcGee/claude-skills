@@ -38,7 +38,7 @@ One item per ask. Every item carries `source: "github"`, `actor` (`{"name": <log
 |---|---|---|---|---|---|
 | A PR requests my review | `review_request` | `pr/<n>` | its `headRefOid`, so a new push resurfaces it and comments or labels do not | PR URL | `labels`; context: the PR body |
 | My open PR | `pr_status` | `pr/<n>` | `<mergeable>\|<checks>\|<review>\|<headRefOid>` | PR URL | `facts` below; context: failing check names |
-| Someone else's comment or review on my PR | `pr_comment` | `comment/<id>` | the comment's `updatedAt` | the comment's URL, `#fragment` included | context: the comment body |
+| Someone else's comment or review on my PR | `pr_comment` | `comment/<id>` | the comment's `updatedAt` | the comment's URL, `#fragment` included | context: the comment body; `facts.collaborator` below |
 
 Emit every one of my open PRs on every run, even unchanged: `emit` drops versions it already holds, and the version changes only when the status does.
 
@@ -47,6 +47,8 @@ Emit every one of my open PRs on every run, even unchanged: `emit` drops version
 - `mergeable`: `MERGEABLE` → `mergeable`, `CONFLICTING` → `conflicting`, else `unknown`.
 - `checks`: any `FAILURE`, `ERROR`, `CANCELLED` or `TIMED_OUT` conclusion → `failing`; else any still running → `pending`; no checks → `none`; else `passing`.
 - `review`: `APPROVED` → `approved`, `CHANGES_REQUESTED` → `changes_requested`, `REVIEW_REQUIRED` → `review_required`, empty → `none`.
+
+`facts` for `pr_comment`: `collaborator: true` when the comment's `authorAssociation` (`author_association` on inline comments) is `OWNER`, `MEMBER` or `COLLABORATOR`, else `false`. Triage fixes a nit without asking only from a collaborator.
 
 The full item shape is `$defs.item` in `~/.claude/skills/process/schema.json`; `emit` fills in `id` and `profile`.
 

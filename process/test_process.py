@@ -22,7 +22,9 @@ class FakeRun:
         if not matches:
             return ""
         response = self.responses[max(matches, key=len)]
-        return response(cmd) if callable(response) else response
+        if not callable(response):
+            return response
+        return response(cmd, input=input) if input is not None else response(cmd)
 
 
 # 2026-10-20T13:00:00Z, 08:00 in Chicago.
@@ -79,6 +81,10 @@ allowed_tools = ["Read", "Bash(process emit:*)", "mcp__linear-server__get_notifi
 [phases.triage]
 model = "opus"
 allowed_tools = {triage_tools}
+
+[phases.execute]
+model = "opus"
+allowed_tools = {execute_tools}
 +++
 
 # {name}
@@ -197,7 +203,7 @@ class ProcessTestCase(unittest.TestCase):
     def state(self):
         return self.tmp / "state" / "process"
 
-    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None, repo="acme/widgets", team="WID", sweep_tools=("Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__github__pull_request_read")):
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Bash(process execute plan:*)", "Bash(process execute result:*)"), text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None, repo="acme/widgets", team="WID", sweep_tools=("Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__github__pull_request_read")):
         path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         extra = ""
@@ -222,6 +228,7 @@ class ProcessTestCase(unittest.TestCase):
                 silent=json.dumps(list(silent)),
                 triage_tools=json.dumps(list(triage_tools)),
                 sweep_tools=json.dumps(list(sweep_tools)),
+                execute_tools=json.dumps(list(execute_tools)),
             )
         )
         return path
@@ -814,6 +821,53 @@ class NeverActionTest(TriageTestCase):
         self.assertIn("no draft", self.process("triage", "commit", "acme", expect=1))
 
 
+class GitHubActionsTest(TriageTestCase):
+    def comment(self, n, body, actor=("ana", "person"), collaborator=None):
+        facts = {} if collaborator is None else {"facts": {"collaborator": collaborator}}
+        return item(kind="pr_comment", native_id=f"comment/{n}", subject=f"https://github.com/acme/widgets/pull/8#discussion_r{n}", context=body, actor={"name": actor[0], "role": actor[1]}, summary=f"Comment {n} on #8", **facts)
+
+    def test_a_nit_from_someone_outside_the_repo_still_needs_my_approval(self):
+        self.emit(self.comment(7, "nit: add this helper", collaborator=False), self.comment(8, "nit: add that helper"))
+
+        for reply in self.triage():
+            self.assertEqual((reply["action"]["type"], reply["autonomy"], reply["status"]), ("gh_thread_reply", "draft", "pending"))
+
+    def test_bot_and_nit_comments_on_my_pr_are_fixed_without_asking(self):
+        self.emit(self.comment(1, "orders.py:42 — unused import `itertools`.", actor=("lint-bot[bot]", "bot")), self.comment(2, "nit: trailing whitespace on line 9", collaborator=True), self.comment(3, "Nit — rename `x` to `count`", collaborator=True))
+
+        for fix in self.triage():
+            self.assertEqual((fix["action"]["type"], fix["autonomy"], fix["status"]), ("gh_fix_pr", "silent", "approved"))
+            self.assertEqual(fix["action"]["params"], {"repo": "acme/widgets", "number": 8, "comment": fix["subject"]})
+
+    def test_a_human_design_comment_gets_a_drafted_reply_and_fix_for_my_approval(self):
+        self.emit(self.comment(4, "Why offset pagination? Cursor pagination would survive inserts between pages."))
+
+        [reply] = self.triage()
+
+        self.assertEqual((reply["action"]["type"], reply["autonomy"], reply["status"]), ("gh_thread_reply", "draft", "pending"))
+        self.assertEqual(reply["action"]["params"]["comment"], "https://github.com/acme/widgets/pull/8#discussion_r4")
+
+    def test_a_conflict_on_my_otherwise_healthy_pr_is_merged_up_silently_with_no_draft_needed(self):
+        self.emit(my_pr(8, mergeable="conflicting", checks="passing", review="review_required"))
+
+        out = self.process("triage", "plan", "acme")
+        self.assertNotIn("[draft]", out)
+        self.process("triage", "commit", "acme")
+
+        [fix] = self.queue()
+        self.assertEqual((fix["action"]["type"], fix["autonomy"], fix["status"]), ("gh_fix_pr", "silent", "approved"))
+        self.assertEqual(fix["action"]["params"], {"repo": "acme/widgets", "number": 8, "fix": "merge_base"})
+        self.assertIn("Merge the base branch", fix["action"]["draft"])
+
+    def test_a_conflict_with_failing_checks_still_needs_my_approval(self):
+        self.emit(my_pr(8, mergeable="conflicting", checks="failing", review="review_required"))
+
+        [fix] = self.triage()
+
+        self.assertEqual((fix["action"]["type"], fix["autonomy"]), ("gh_fix_pr", "draft"))
+        self.assertNotIn("fix", fix["action"]["params"])
+
+
 class BriefTest(TriageTestCase):
     def section(self, brief, project, heading):
         """The lines under one project's ### heading, up to the next heading."""
@@ -864,6 +918,70 @@ class BriefTest(TriageTestCase):
 
         self.assertIn("#101", (self.state / "brief.md").read_text())
 
+    def decide_and_execute(self, entry, outcome, **flags):
+        with (self.state / "decisions.jsonl").open("a") as f:
+            f.write(json.dumps({"entry_id": entry["id"], "verdict": "approve", "at": process.iso(self.now)}) + "\n")
+        self.process("execute")
+        self.process("execute", "result", "acme", entry["id"], outcome, *[a for k, v in flags.items() for a in (f"--{k}", v)])
+
+    def test_the_next_brief_shows_what_the_executor_did_with_what_i_approved(self):
+        self.emit(item(), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", summary="Ben requested your review on #102"))
+        sent, failed = self.triage()
+        self.now += 24 * 3600  # the next morning: yesterday's entries are no longer today's
+        self.decide_and_execute(sent, "success", link="https://github.com/acme/widgets/pull/101#pullrequestreview-1")
+        self.decide_and_execute(failed, "failure", error="403 from GitHub")
+
+        self.process("brief")
+
+        approved = self.section((self.state / "brief.md").read_text(), "acme", "Approved (2)")
+        self.assertIn("Ana requested your review on #101", approved)
+        self.assertIn("done: https://github.com/acme/widgets/pull/101#pullrequestreview-1", approved)
+        self.assertIn("FAILED: 403 from GitHub", approved)
+
+    def test_a_delta_brief_shows_results_recorded_since_the_last_brief(self):
+        self.emit(item(), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", summary="Ben requested your review on #102"))
+        old, new = self.triage()
+        self.decide_and_execute(old, "success", link="https://example.com/old")
+        self.process("brief")
+        self.now += 3600
+        self.decide_and_execute(new, "success", link="https://example.com/new")
+
+        self.process("brief", "--delta")
+
+        delta = (self.state / "brief.md").read_text()
+        self.assertIn("https://example.com/new", delta)
+        self.assertNotIn("https://example.com/old", delta)
+
+    def test_a_result_recorded_after_the_last_brief_of_the_day_shows_the_next_morning(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.process("brief")
+        self.now += 3600  # late: I work the queue in proc, and no brief runs again today
+        self.decide_and_execute(review, "success", link="https://example.com/late")
+        self.now += 24 * 3600
+
+        self.process("brief")
+
+        self.assertIn("https://example.com/late", (self.state / "brief.md").read_text())
+
+    def test_a_brief_narrowed_to_one_project_does_not_swallow_another_projects_results(self):
+        self.write_profile("side")
+        self.emit(item(summary="Side review"), profile="side")
+        [side] = self.triage("side")
+        self.process("brief", "--delta")
+        self.now += 60
+        with (self.state / "decisions.jsonl").open("a") as f:
+            f.write(json.dumps({"entry_id": side["id"], "verdict": "approve", "at": process.iso(self.now)}) + "\n")
+        self.process("execute")
+        self.process("execute", "result", "side", side["id"], "success", "--link", "https://example.com/side")
+        self.now += 300
+        self.process("brief", "--delta", "--project", "acme")
+        self.now += 3600
+
+        self.process("brief", "--delta")
+
+        self.assertIn("https://example.com/side", (self.state / "brief.md").read_text())
+
     def test_a_brief_before_any_run_says_nothing_new(self):
         self.process("brief")
 
@@ -881,6 +999,491 @@ class BriefTest(TriageTestCase):
         brief = (self.state / "brief.md").read_text()
         self.assertIn("## side", brief)
         self.assertNotIn("## acme", brief)
+
+
+class ExecuteTestCase(TriageTestCase):
+    def decide(self, entry, verdict="approve", **over):
+        """Append a decision the way proc does."""
+        record = {"entry_id": entry["id"], "verdict": verdict, "at": process.iso(self.now), **over}
+        with (self.state / "decisions.jsonl").open("a") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def entry(self, entry_id):
+        [found] = [e for e in self.queue() if e["id"] == entry_id]
+        return found
+
+    def executor_calls(self):
+        return [c for c in self.run_fake.calls if c[0] == "claude"]
+
+
+class ExecuteTest(ExecuteTestCase):
+    def test_execute_approves_decided_entries_with_my_edit_and_runs_the_executor_for_their_profile(self):
+        self.emit(item(), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", summary="Ben requested your review on #102"))
+        review, other = self.triage()
+        self.decide(review, draft="My edited review.")
+
+        self.process("execute")
+
+        approved = self.entry(review["id"])
+        self.assertEqual((approved["status"], approved["action"]["draft"]), ("approved", "My edited review."))
+        self.assertEqual(self.entry(other["id"])["status"], "pending")
+        [call] = self.executor_calls()
+        self.assertEqual(call[:3], ["claude", "-p", "/execute acme"])
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+
+    def test_the_executor_runs_headless_with_its_send_tools_but_never_a_merge(self):
+        self.write_profile(execute_tools=["Bash(process execute plan:*)", "mcp__github__add_issue_comment"])
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review)
+
+        self.process("execute")
+
+        [cmd] = self.executor_calls()
+        opt = lambda name: cmd[cmd.index(name) + 1].split(",")
+        self.assertIn("mcp__github__add_issue_comment", opt("--allowedTools"))
+        self.assertNotIn("mcp__github__add_issue_comment", opt("--disallowedTools"))
+        self.assertIn("mcp__github__pull_request_review_write", opt("--disallowedTools"))
+        self.assertIn("mcp__github__merge_pull_request", opt("--disallowedTools"))
+        self.assertIn("Bash(git push:*)", opt("--disallowedTools"))
+        work = self.profile_dir() / "work"
+        self.assertIn(f"Edit(/{work}/**)", opt("--allowedTools"))  # a fix edits files in its scratch worktree only
+        self.assertIn(f"Read(/{work}/**)", opt("--allowedTools"))
+        self.assertEqual(cmd[cmd.index("--add-dir") + 1:cmd.index("--add-dir") + 3], [str(self.profile_dir() / "inbox"), str(work)])
+        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
+        self.assertEqual(cmd[cmd.index("--model") + 1], "opus")
+
+    def test_a_profile_without_an_executor_keeps_its_approved_entries_waiting(self):
+        path = self.write_profile()
+        path.write_text(path.read_text().split("[phases.execute]")[0].rstrip() + "\n+++" + path.read_text().split("+++", 2)[2])
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review)
+
+        self.assertIn("acme has no [phases.execute]", self.process("execute"))
+
+        self.assertEqual(self.executor_calls(), [])
+        self.assertEqual(self.entry(review["id"])["status"], "approved")
+
+    def test_a_skipped_entry_is_handled_and_its_items_stay_handled_until_they_change(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review, "skip")
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(review["id"])["status"], "skipped")
+        self.assertEqual(self.executor_calls(), [])  # nothing approved, nothing to run
+        ledger = self.jsonl(self.profile_dir() / "ledger.jsonl")
+        self.assertIn({"item_id": review["item_ids"][0], "at": process.iso(self.now), "entry_id": review["id"], "outcome": "skipped"}, ledger)
+        self.emit(item())
+        self.assertEqual([e["status"] for e in self.triage()], ["skipped"])
+        self.emit(item(version="v2"))
+        self.assertEqual([e["status"] for e in self.triage()], ["skipped", "pending"])
+
+    def test_a_malformed_decision_is_reported_and_the_others_still_apply(self):
+        self.emit(item())
+        [review] = self.triage()
+        with (self.state / "decisions.jsonl").open("a") as f:
+            f.write('{"entry_id": "q-0123456789ab", "verdict": "merge", "at": "2026-10-20T13:00:00Z"}\n{"entry_id": "q-01\n')
+        self.decide(review)
+
+        out = self.process("execute")
+
+        self.assertIn("decision 1 ignored", out)
+        self.assertIn("decision 2 ignored: not JSON", out)
+        self.assertEqual(self.entry(review["id"])["status"], "approved")
+
+    def test_an_executor_that_cannot_start_is_reported_without_a_traceback(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review)
+        self.run_fake.responses[("claude", "-p", "/execute acme")] = lambda cmd: (_ for _ in ()).throw(FileNotFoundError(2, "No such file or directory", "/nowhere"))
+
+        out = self.process("execute", expect=1)
+
+        self.assertIn("process: acme: execute failed: [Errno 2] No such file or directory", out)
+        self.assertEqual(self.entry(review["id"])["status"], "approved")  # still waits for the next run
+
+    def test_only_one_executor_runs_at_a_time(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review)
+        nested = []
+
+        def executor(cmd):  # while this executor runs, proc quits and starts another
+            nested.append(self.process("execute"))
+            nested.append(self.process("execute", "plan", "acme"))  # the running executor's own steps still work
+
+        self.run_fake.responses[("claude", "-p", "/execute acme")] = executor
+
+        self.process("execute")
+
+        self.assertIn("another executor is running", nested[0])
+        self.assertIn(review["id"], nested[1])
+        self.assertEqual(len(self.executor_calls()), 1)
+
+    def test_a_decision_on_an_entry_no_longer_pending_changes_nothing(self):
+        self.emit(item())
+        [old] = self.triage()
+        self.emit(item(version="v2"))
+        self.triage()  # supersedes the first entry
+        self.decide(old)
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(old["id"])["status"], "superseded")
+        self.assertEqual(self.executor_calls(), [])
+
+
+class LearningTest(ExecuteTestCase):
+    def comment(self, n, body="Could this be a dict?"):
+        return item(kind="pr_comment", native_id=f"comment/{n}", subject=f"https://github.com/acme/widgets/pull/7#issuecomment-{n}", context=body, summary=f"Ana commented on #7 ({n})")
+
+    def profile_text(self):
+        return (self.tmp / "config" / "process" / "profiles" / "acme.md").read_text()
+
+    def test_promote_to_silent_adds_the_action_type_to_the_profiles_autonomy_overrides(self):
+        self.emit(self.comment(1))
+        [reply] = self.triage()
+        self.decide(reply, promote_to_silent=True)
+
+        self.process("execute")
+
+        profile = process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")
+        self.assertEqual(profile["autonomy"]["silent"], ["gh_thread_reply"])
+        self.assertIn("— Promoted gh_thread_reply to silent", profile["body"].split("## Changelog", 1)[1])
+        self.emit(self.comment(2))
+        [later] = [e for e in self.triage() if e["item_ids"][0].startswith("github:comment/2")]
+        self.assertEqual((later["autonomy"], later["status"]), ("silent", "approved"))
+
+    def test_a_reason_i_typed_becomes_a_lesson_in_how_to_sweep_with_a_changelog_entry(self):
+        self.emit(self.comment(1), self.comment(2))
+        skipped, edited = self.triage()
+        self.decide(skipped, "skip", reason="Ana's questions on #7 were answered in standup")
+        self.decide(edited, draft="Yes, a dict.", reason="Too formal: I write one-liners")
+
+        self.process("execute")
+
+        profile = process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")
+        how_to, changelog = profile["body"].split("## How to sweep", 1)[1].split("## Changelog", 1)
+        self.assertIn("- Lesson (2026-10-20, I skipped a gh_thread_reply): Ana's questions on #7 were answered in standup", how_to)
+        self.assertIn("- Lesson (2026-10-20, I edited a gh_thread_reply): Too formal: I write one-liners", how_to)
+        self.assertIn(f"- 2026-10-20 — Lesson from my reason on {skipped['id']}.", changelog)
+        self.assertEqual(changelog.count("Lesson from my reason"), 2)
+
+    def test_no_reason_no_lesson_and_a_decision_teaches_once(self):
+        self.emit(self.comment(1), self.comment(2))
+        quiet, taught = self.triage()
+        self.decide(quiet, "skip")
+        self.decide(taught, "skip", reason="Noise")
+        self.process("execute")
+        before = self.profile_text()
+
+        self.process("execute")
+
+        self.assertEqual(self.profile_text(), before)
+        self.assertEqual(before.count("Lesson ("), 1)
+
+    def test_a_profile_that_cannot_be_rewritten_is_reported_and_the_other_decisions_still_apply(self):
+        path = self.tmp / "config" / "process" / "profiles" / "acme.md"
+        text = path.read_text().replace("[autonomy]\nsilent = []\n", "")
+        path.write_text(text.replace('sources = ["github", "linear"]', 'sources = ["github", "linear"]\nautonomy = { silent = [] }'))
+        self.emit(self.comment(1), self.comment(2))
+        promoted, skipped = self.triage()
+        before = self.profile_text()
+        self.decide(promoted, promote_to_silent=True)
+        self.decide(skipped, "skip")
+
+        out = self.process("execute")
+
+        self.assertIn("could not rewrite autonomy.silent", out)
+        self.assertEqual(self.profile_text(), before)
+        self.assertEqual(self.entry(skipped["id"])["status"], "skipped")
+
+    def test_a_review_is_never_promoted_to_silent(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review, promote_to_silent=True)
+
+        out = self.process("execute")
+
+        self.assertIn("gh_review cannot be silent", out)
+        self.assertEqual(process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")["autonomy"]["silent"], [])
+        self.assertEqual(self.entry(review["id"])["status"], "approved")  # the approval itself still stands
+
+
+class ExecutorStepsTest(ExecuteTestCase):
+    def setUp(self):
+        super().setUp()
+        self.emit(item(), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", summary="Ben requested your review on #102"))
+        self.review, self.waiting = self.triage()
+        self.decide(self.review, draft="Two questions on the export.")
+        self.process("execute")
+
+    def test_the_plan_lists_only_approved_entries_with_their_final_draft(self):
+        out = self.process("execute", "plan", "acme")
+
+        self.assertIn(self.review["id"], out)
+        self.assertIn('gh_review {"repo": "acme/widgets", "number": 101, "event": "COMMENT"}', out)
+        self.assertIn("| Two questions on the export.", out)
+        self.assertNotIn(self.waiting["id"], out)
+
+    def test_a_result_is_recorded_schema_valid_and_closes_the_entry(self):
+        link = "https://github.com/acme/widgets/pull/101#pullrequestreview-1"
+
+        self.process("execute", "result", "acme", self.review["id"], "success", "--link", link)
+
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual(result, {"entry_id": self.review["id"], "outcome": "success", "link": link, "at": process.iso(self.now)})
+        self.assertEqual(self.process("validate", "result", str(self.state / "results.jsonl")), "")
+        done = self.entry(self.review["id"])
+        self.assertEqual((done["status"], done["note"]), ("done", link))
+        self.assertIn({"item_id": self.review["item_ids"][0], "at": process.iso(self.now), "entry_id": self.review["id"], "outcome": "done"}, self.jsonl(self.profile_dir() / "ledger.jsonl"))
+        self.assertNotIn(self.review["id"], self.process("execute", "plan", "acme"))
+
+    def test_a_failure_records_its_error(self):
+        self.process("execute", "result", "acme", self.review["id"], "failure", "--error", "403 from GitHub")
+
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual((result["outcome"], result["error"]), ("failure", "403 from GitHub"))
+        self.assertEqual((self.entry(self.review["id"])["status"], self.entry(self.review["id"])["note"]), ("failed", "403 from GitHub"))
+
+    def test_a_result_for_an_entry_i_did_not_approve_is_refused(self):
+        out = self.process("execute", "result", "acme", self.waiting["id"], "success", expect=1)
+
+        self.assertIn("not approved", out)
+        self.assertEqual(self.jsonl(self.state / "results.jsonl"), [])
+        self.assertEqual(self.entry(self.waiting["id"])["status"], "pending")
+
+
+class SendTest(ExecuteTestCase):
+    """Reviews and replies go out through `process execute`, which posts exactly the approved text and pins the event."""
+
+    def setUp(self):
+        super().setUp()
+        self.posted = []
+
+        def api(cmd, input=None):
+            self.posted.append((cmd, json.loads(input)))
+            return json.dumps({"html_url": "https://github.com/acme/widgets/pull/101#pullrequestreview-77"})
+
+        self.run_fake.responses[("gh", "api", "-X", "POST")] = api
+        self.emit(item(), item(kind="pr_comment", native_id="comment/5", subject="https://github.com/acme/widgets/pull/8#discussion_r5", summary="Ana on #8"), item(kind="pr_comment", native_id="comment/6", subject="https://github.com/acme/widgets/pull/8#issuecomment-6", summary="Ben on #8"))
+        self.review, self.inline, self.top = self.triage()
+
+    def test_review_posts_the_approved_draft_with_its_pinned_event_and_records_the_result(self):
+        self.decide(self.review, draft="Does the export stream?")
+        self.process("execute")
+
+        self.process("execute", "review", "acme", self.review["id"])
+
+        [(cmd, body)] = self.posted
+        self.assertEqual(cmd[:5], ["gh", "api", "-X", "POST", "repos/acme/widgets/pulls/101/reviews"])
+        self.assertEqual(body, {"event": "COMMENT", "body": "Does the export stream?"})
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual((result["outcome"], result["link"]), ("success", "https://github.com/acme/widgets/pull/101#pullrequestreview-77"))
+
+    def test_an_approving_event_is_never_posted_even_if_the_queue_was_edited(self):
+        self.decide(self.review)
+        self.process("execute")
+        with (self.state / "queue.jsonl").open("a") as f:
+            f.write(json.dumps({**self.entry(self.review["id"]), "action": {**self.review["action"], "params": {**self.review["action"]["params"], "event": "APPROVE"}}}) + "\n")
+
+        self.assertIn("never APPROVE", self.process("execute", "review", "acme", self.review["id"], expect=1))
+        self.assertEqual(self.posted, [])
+
+    def test_reply_posts_the_text_above_the_fix_section_to_the_comments_thread(self):
+        self.decide(self.inline, draft="Good catch, switching to cursors.\n\n## Fix\n\n1. Use a cursor.")
+        self.decide(self.top, draft="Thanks, done.")
+        self.process("execute")
+
+        self.process("execute", "reply", "acme", self.inline["id"])
+        self.process("execute", "reply", "acme", self.top["id"])
+
+        (inline, inline_body), (top, top_body) = self.posted
+        self.assertEqual(inline[4], "repos/acme/widgets/pulls/8/comments/5/replies")
+        self.assertEqual(inline_body, {"body": "Good catch, switching to cursors."})
+        self.assertEqual(top[4], "repos/acme/widgets/issues/8/comments")
+        self.assertEqual(top_body, {"body": "Thanks, done."})
+        self.assertEqual([r["outcome"] for r in self.jsonl(self.state / "results.jsonl")], ["success", "success"])
+
+    def test_a_failed_send_is_recorded_as_a_failure(self):
+        self.decide(self.review)
+        self.process("execute")
+        self.run_fake.responses[("gh", "api", "-X", "POST")] = lambda cmd, input=None: (_ for _ in ()).throw(process.subprocess.CalledProcessError(1, cmd, stderr="HTTP 403: Resource not accessible\n"))
+
+        self.process("execute", "review", "acme", self.review["id"], expect=1)
+
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual((result["outcome"], result["error"]), ("failure", "HTTP 403: Resource not accessible"))
+
+    def test_send_steps_are_only_for_approved_entries_of_their_type(self):
+        self.assertIn("not an approved gh_review", self.process("execute", "review", "acme", self.review["id"], expect=1))
+        self.decide(self.review)
+        self.process("execute")
+        self.assertIn("not an approved gh_thread_reply", self.process("execute", "reply", "acme", self.review["id"], expect=1))
+        self.assertEqual(self.posted, [])
+
+
+class FixPrTest(ExecuteTestCase):
+    """The executor fixes my PRs in a scratch worktree and pushes only through `process execute push`."""
+
+    def setUp(self):
+        super().setUp()
+        self.pr = {"headRefName": "paginate-orders", "baseRefName": "main", "author": {"login": "me-dev"}, "isCrossRepository": False, "state": "OPEN"}
+        self.run_fake.responses[("gh", "pr", "view")] = lambda cmd: json.dumps(self.pr)
+        self.run_fake.responses[("gh", "api", "user")] = "me-dev\n"
+        self.run_fake.responses[("git", "-C")] = self.git
+        bot = item(kind="pr_comment", native_id="comment/9", subject="https://github.com/acme/widgets/pull/8#discussion_r9", actor={"name": "lint-bot[bot]", "role": "bot"}, context="unused import")
+        self.emit(bot)
+        [self.fix] = self.triage()  # silent, so already approved
+        self.worktree = self.profile_dir() / "work" / self.fix["id"]
+
+    origin = "https://github.com/acme/widgets.git"
+
+    def git(self, cmd):
+        if cmd[3:5] == ["worktree", "add"]:
+            Path(cmd[6]).mkdir(parents=True)
+        if cmd[3:5] == ["worktree", "remove"]:
+            Path(cmd[-1]).rmdir()
+        if cmd[3:5] == ["remote", "get-url"]:
+            return self.origin + "\n"
+        return "abc1234\n" if "rev-parse" in cmd else ""
+
+    def git_calls(self):
+        return [c for c in self.run_fake.calls if c[0] == "git"]
+
+    def test_checkout_puts_my_prs_head_in_a_scratch_worktree_away_from_my_own_checkout(self):
+        out = self.process("execute", "checkout", "acme", self.fix["id"])
+
+        self.assertIn(str(self.worktree), out)
+        workdir = str(self.tmp / "work" / "acme")
+        self.assertIn(["git", "-C", workdir, "fetch", "origin", "paginate-orders", "main"], self.git_calls())
+        self.assertIn(["git", "-C", workdir, "worktree", "add", "--detach", str(self.worktree), "origin/paginate-orders"], self.git_calls())
+
+    def test_a_pr_that_is_not_mine_or_not_open_or_from_a_fork_is_never_touched(self):
+        for change in ({"author": {"login": "ana"}}, {"state": "MERGED"}, {"isCrossRepository": True}):
+            with self.subTest(change=change):
+                self.pr = {**self.pr, **change}
+                self.assertIn("not my open PR", self.process("execute", "checkout", "acme", self.fix["id"], expect=1))
+                self.assertEqual(self.git_calls(), [])
+
+    def test_git_runs_in_the_worktree_and_only_the_subcommands_a_fix_needs(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+
+        self.process("execute", "git", "acme", self.fix["id"], "merge", "origin/main")
+
+        self.assertEqual(self.git_calls()[-1], ["git", "-C", str(self.worktree), "merge", "origin/main"])
+        for sub in ("push", "config", "remote", "reset", "rebase", "-c"):
+            with self.subTest(sub=sub):
+                self.assertIn("not a fix step", self.process("execute", "git", "acme", self.fix["id"], sub, "x", expect=1))
+
+    def test_git_refuses_arguments_that_write_or_read_files_outside_the_worktree(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+        before = len(self.git_calls())
+
+        for args in (["log", "-1", "--output=../x"], ["diff", "--output", "../x"], ["commit", "-F", "/home/me/.ssh/id_rsa"], ["commit", "--file=/etc/passwd"],
+                     ["commit", "-Fsecret"], ["add", "--pathspec-from-file=../list"], ["diff", "--no-index", "/a", "/b"], ["diff", "--ext-diff"], ["commit", "-t", "../t"],
+                     ["commit", "--fil=/home/me/.ssh/id_rsa"], ["commit", "--templ=../t"], ["add", "--pathspec-from-f=../list"], ["log", "--out=../x"]):
+            with self.subTest(args=args):
+                self.assertIn("not allowed in a fix", self.process("execute", "git", "acme", self.fix["id"], *args, expect=1))
+        self.assertEqual(len(self.git_calls()), before)
+        self.process("execute", "git", "acme", self.fix["id"], "commit", "-m", "fix: drop the unused import")
+        self.process("execute", "git", "acme", self.fix["id"], "commit", "--no-edit")
+        self.process("execute", "git", "acme", self.fix["id"], "log", "--oneline", "--format=%h")
+
+    def test_a_workdir_whose_origin_is_not_the_prs_repo_is_never_fetched_or_pushed(self):
+        for url in ("git@github.com:me-dev/widgets.git", "https://github.com/acme/widgets-fork.git"):
+            with self.subTest(url=url):
+                self.origin = url
+                self.assertIn("origin is not acme/widgets", self.process("execute", "checkout", "acme", self.fix["id"], expect=1))
+        self.assertEqual([c for c in self.git_calls() if "fetch" in c or "push" in c], [])
+
+    def test_checkout_replaces_a_worktree_a_crashed_run_left_behind(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])  # the run crashed before recording a result
+
+        self.process("execute", "checkout", "acme", self.fix["id"])
+
+        workdir = str(self.tmp / "work" / "acme")
+        self.assertIn(["git", "-C", workdir, "worktree", "remove", "--force", str(self.worktree)], self.git_calls())
+        self.assertEqual(self.git_calls()[-1], ["git", "-C", workdir, "worktree", "add", "--detach", str(self.worktree), "origin/paginate-orders"])
+
+    def test_push_sends_the_worktree_to_my_prs_branch_and_never_forces(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+
+        out = self.process("execute", "push", "acme", self.fix["id"])
+
+        self.assertEqual([c for c in self.git_calls() if "push" in c], [["git", "-C", str(self.worktree), "push", "origin", "HEAD:refs/heads/paginate-orders"]])
+        self.assertIn("https://github.com/acme/widgets/pull/8/commits/abc1234", out)
+
+    def test_push_checks_the_pr_is_still_mine(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+        self.pr = {**self.pr, "state": "CLOSED"}
+
+        self.assertIn("not my open PR", self.process("execute", "push", "acme", self.fix["id"], expect=1))
+        self.assertNotIn("push", [c[3] for c in self.git_calls()])
+
+    def test_fix_steps_are_only_for_approved_fixes(self):
+        self.process("execute", "checkout", "acme", self.fix["id"])
+        self.process("execute", "result", "acme", self.fix["id"], "success")
+
+        self.assertIn("not an approved fix", self.process("execute", "push", "acme", self.fix["id"], expect=1))
+        self.assertIn(["git", "-C", str(self.tmp / "work" / "acme"), "worktree", "remove", "--force", str(self.worktree)], self.git_calls())
+
+
+class DryRunExecuteTest(ExecuteTestCase):
+    def setUp(self):
+        super().setUp()
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "dry-run").touch()  # what `process run --fixtures` leaves in a scratch state directory
+        self.emit(item())
+        [self.review] = self.triage()
+
+    def test_a_dry_run_executor_records_skipped_and_never_success(self):
+        self.decide(self.review)
+        self.process("execute")
+        self.assertEqual(self.executor_calls()[0][2], "/execute acme --dry-run")
+
+        self.assertIn("a dry run records skipped", self.process("execute", "result", "acme", self.review["id"], "success", expect=1))
+        self.process("execute", "result", "acme", self.review["id"], "skipped")
+
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual(result["outcome"], "skipped")
+        self.assertEqual(self.process("validate", "result", str(self.state / "results.jsonl")), "")
+        self.assertEqual(self.entry(self.review["id"])["status"], "skipped")
+        self.process("brief")
+        self.assertIn("`gh_review` — skipped (dry run)", (self.state / "brief.md").read_text())
+
+    def test_a_dry_run_leaves_profiles_in_the_real_config_directory_alone(self):
+        real = self.tmp / ".config" / "process" / "profiles" / "acme.md"
+        real.parent.mkdir(parents=True)
+        real.write_text((self.tmp / "config" / "process" / "profiles" / "acme.md").read_text())
+        del self.env["XDG_CONFIG_HOME"]
+        before = real.read_text()
+        self.decide(self.review, "skip", reason="Noise", promote_to_silent=True)
+
+        out = self.process("execute")
+
+        self.assertIn("dry run: acme's profile is real, so no lesson or promotion is written", out)
+        self.assertEqual(real.read_text(), before)
+        self.assertEqual(self.entry(self.review["id"])["status"], "skipped")
+
+    def test_a_dry_run_never_checks_out_or_pushes_a_pr(self):
+        self.emit(item(kind="pr_comment", native_id="comment/9", subject="https://github.com/acme/widgets/pull/8#discussion_r9", actor={"name": "lint-bot[bot]", "role": "bot"}))
+        [fix] = [e for e in self.triage() if e["action"]["type"] == "gh_fix_pr"]
+
+        for step in ("checkout", "push"):
+            with self.subTest(step=step):
+                self.assertIn("a dry run touches no PR", self.process("execute", step, "acme", fix["id"], expect=1))
+        self.assertEqual(self.run_fake.calls, [])
+
+    def test_a_real_executor_never_records_skipped(self):
+        (self.state / "dry-run").unlink()
+        self.decide(self.review)
+        self.process("execute")
+
+        self.assertIn("only a dry run records skipped", self.process("execute", "result", "acme", self.review["id"], "skipped", expect=1))
 
 
 class ContractTest(ProcessTestCase):
@@ -1019,6 +1622,52 @@ class RunTest(ProcessTestCase):
         self.assertIn("/triage side", [c[2] for c, _ in self.claude_calls()])
         self.assertIn("> ⚠ triage failed: [Errno 2] No such file or directory", (self.state / "brief.md").read_text())
         self.assertFalse((self.state / "run.json").exists())
+
+    def silent_fix_run(self, *flags):
+        """A run whose GitHub sweeper finds a bot comment and whose triage approves its fix silently."""
+        main = lambda *argv, stdin="": process.main(list(argv), run=self.run_fake, env=self.env, stdin=io.StringIO(stdin), stdout=io.StringIO(), clock=lambda: self.now)
+        bot = item(kind="pr_comment", native_id="comment/9", subject="https://github.com/acme/widgets/pull/8#discussion_r9", actor={"name": "lint-bot[bot]", "role": "bot"})
+
+        def triage(cmd):
+            main("triage", "plan", "acme")
+            plan = json.loads((self.profile_dir() / "plan.json").read_text())
+            main("triage", "draft", "acme", plan["entries"][0]["id"], stdin="Drop the unused import.")
+            main("triage", "commit", "acme")
+
+        sweep = lambda cmd: main("emit", "acme", "github", stdin=json.dumps(bot) + "\n")
+        self.run_fake.responses[("claude", "-p", "/sweep-github acme")] = sweep
+        self.run_fake.responses[("claude", "-p", "/sweep-github acme --fixtures /fx")] = sweep
+        self.run_fake.responses[("claude", "-p", "/triage acme")] = triage
+        self.run_fake.responses[("claude", "-p", "/triage acme --dry-run --fixtures /fx")] = triage
+        self.process("run", *flags)
+        return [c[2] for c, _ in self.claude_calls()]
+
+    def test_run_executes_what_triage_approved_silently_right_after_triage(self):
+        self.write_profile("acme")
+
+        prompts = self.silent_fix_run()
+
+        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", "/triage acme", "/execute acme"])
+        self.assertIn("> ⚠ execute left 1 approved entr(ies) without a result", (self.state / "brief.md").read_text())
+
+    def test_run_skips_its_executor_while_procs_executor_is_running(self):
+        self.write_profile("acme")
+        self.state.mkdir(parents=True, exist_ok=True)
+        with (self.state / "execute.lock").open("w") as held:
+            process.fcntl.flock(held, process.fcntl.LOCK_EX | process.fcntl.LOCK_NB)
+            prompts = self.silent_fix_run()
+
+        self.assertNotIn("/execute acme", prompts)
+        self.assertIn("> ⚠ execute skipped: another executor is running", (self.state / "brief.md").read_text())
+
+    def test_a_dry_run_executes_as_a_dry_run_with_no_service_tools(self):
+        self.write_profile("acme", execute_tools=["Bash(process execute plan:*)", "mcp__github__add_issue_comment"])
+
+        prompts = self.silent_fix_run("--fixtures", "/fx")
+
+        self.assertEqual(prompts[-1], "/execute acme --dry-run")
+        cmd = self.claude_calls()[-1][0]
+        self.assertEqual([t for t in self.opt(cmd, "--allowedTools").split(",") if t.startswith("mcp__")], [])
 
     def test_a_phase_that_exits_cleanly_but_does_nothing_is_flagged_in_the_brief(self):
         self.write_profile("acme")
@@ -1187,19 +1836,68 @@ class ProfileTest(ProcessTestCase):
 
         self.assertIn("'unsorted' is reserved", self.process("profiles", expect=1))
 
+    # Tools that send what I approved: the executor's, and only the executor's.
+    EXECUTOR_TOOLS = [
+        "mcp__github__add_issue_comment",
+        "mcp__github__add_reply_to_pull_request_comment",
+        "mcp__slack__slack_send_message",
+        "Bash(process execute review:*)",
+        "Bash(process execute reply:*)",
+        "Bash(process execute push:*)",
+    ]
+    # Never actions, or tools broad enough to reach one. No phase may hold them, the executor included.
+    NEVER_TOOLS = [
+        "mcp__github__merge_pull_request",
+        "mcp__github__pull_request_review_write",  # its event can be APPROVE: reviews go through `process execute review`
+        "Bash(process execute:*)",  # a bare `process execute` would start a second executor on the same entries
+        "Read",  # the executor pushes code, so it reads only its worktree: nothing else can end up in a commit
+        "Bash(gh pr merge:*)",
+        "Bash(gh pr review:*)",
+        "Bash(gh api:*)",
+        "Bash(git push:*)",
+        "mcp__github__push_files",
+        "mcp__github__create_or_update_file",
+        "mcp__github__delete_repository",
+        "Bash",
+        "Bash(gh:*)",
+        "Bash(git:*)",
+        "Bash(sh -c:*)",
+        "mcp__github__*",
+        "mcp__slack",
+        "Edit",
+        "Write",
+        "WebFetch",
+    ]
+
+    def test_the_executor_may_hold_send_tools(self):
+        self.write_profile(execute_tools=self.EXECUTOR_TOOLS)
+
+        self.assertIn("acme  active", self.process("profiles"))
+
+    def test_no_phase_may_hold_a_never_tool_not_even_the_executor(self):
+        for tool in self.NEVER_TOOLS:
+            with self.subTest(tool=tool):
+                self.write_profile(execute_tools=["Bash(process execute plan:*)", tool])
+                self.assertIn(f"phases.execute grants {tool!r}", self.process("profiles", expect=1))
+
     def test_a_profile_missing_its_how_to_sweep_section_is_refused(self):
         self.write_profile(text=self.write_profile().read_text().replace("## How to sweep", "## Notes"))
 
         self.assertIn("## How to sweep", self.process("profiles", expect=1))
 
-    def test_every_shipped_profile_is_valid_and_its_sweep_and_triage_allowlists_hold_no_send_tool(self):
+    def test_every_shipped_profile_is_valid_and_only_its_executor_holds_send_tools(self):
         self.assertTrue(SHIPPED_PROFILES, "no profiles shipped")
         for path in SHIPPED_PROFILES:
             with self.subTest(profile=path.name):
                 profile = process.load_profile(path)  # raises SystemExit with every problem
-                for phase in profile["phases"].values():
-                    self.assertFalse(set(phase["allowed_tools"]) & set(self.SEND_TOOLS))
+                phases = dict(profile["phases"])
+                executor = phases.pop("execute")["allowed_tools"]
+                for phase in phases.values():
+                    self.assertFalse(set(phase["allowed_tools"]) & set(self.SEND_TOOLS + self.EXECUTOR_TOOLS))
                     self.assertEqual([t for t in phase["allowed_tools"] if process.forbidden_tool(t)], [])
+                self.assertIn("Bash(process execute review:*)", executor)
+                self.assertFalse(set(executor) & set(self.NEVER_TOOLS))
+                self.assertEqual([t for t in executor if process.never_tool(t)], [])
 
     def test_the_example_profile_declares_its_repo_team_account_models_and_how_to_sweep(self):
         acme = process.load_profile(Path(__file__).parent / "profiles" / "acme.md")

@@ -9,8 +9,8 @@
     {"number": 102, "title": "Fix checkout rounding", "url": "https://github.com/acme/widgets/pull/102", "updatedAt": "now", "headRefOid": "f0a1b2c", "author": {"login": "ben"}, "labels": [{"name": "deploy-blocking"}], "body": "Totals were rounded per line instead of per order. Blocks today's deploy."}
   ],
   "comments": [
-    {"pr": 8, "id": 9001, "url": "https://github.com/acme/widgets/pull/8#issuecomment-9001", "author": {"login": "ana"}, "createdAt": "now", "updatedAt": "now", "body": "Why offset pagination? Cursor pagination would survive inserts between pages."},
-    {"pr": 8, "id": 9002, "url": "https://github.com/acme/widgets/pull/8#discussion_r9002", "author": {"login": "lint-bot[bot]"}, "createdAt": "now", "updatedAt": "now", "body": "orders.py:42 — unused import `itertools`."},
-    {"pr": 7, "id": 9003, "url": "https://github.com/acme/widgets/pull/7#issuecomment-9003", "author": {"login": "me-dev"}, "createdAt": "now", "updatedAt": "now", "body": "Thanks for the review!"}
+    {"pr": 8, "id": 9001, "url": "https://github.com/acme/widgets/pull/8#issuecomment-9001", "author": {"login": "ana"}, "authorAssociation": "COLLABORATOR", "createdAt": "now", "updatedAt": "now", "body": "Why offset pagination? Cursor pagination would survive inserts between pages."},
+    {"pr": 8, "id": 9002, "url": "https://github.com/acme/widgets/pull/8#discussion_r9002", "author": {"login": "lint-bot[bot]"}, "authorAssociation": "NONE", "createdAt": "now", "updatedAt": "now", "body": "orders.py:42 — unused import `itertools`."},
+    {"pr": 7, "id": 9003, "url": "https://github.com/acme/widgets/pull/7#issuecomment-9003", "author": {"login": "me-dev"}, "authorAssociation": "OWNER", "createdAt": "now", "updatedAt": "now", "body": "Thanks for the review!"}
   ]
 }

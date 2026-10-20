@@ -58,7 +58,8 @@
             "noise": {"description": "Gmail: a newsletter or notification mail, to label and archive.", "type": "boolean"},
             "external_guests": {"description": "Calendar: a guest outside my Google account's domain is invited.", "type": "boolean"},
             "with_manager": {"description": "Calendar: my manager organizes or attends.", "type": "boolean"},
-            "conflicts": {"description": "Calendar: titles of my accepted events that overlap it.", "type": "array", "items": {"type": "string"}}
+            "conflicts": {"description": "Calendar: titles of my accepted events that overlap it.", "type": "array", "items": {"type": "string"}},
+            "collaborator": {"description": "pr_comment: the author is the repo's owner, a member or a collaborator, so their nit may be fixed without asking.", "type": "boolean"}
           }
         }
       }
@@ -215,7 +216,7 @@
       "additionalProperties": false,
       "properties": {
         "entry_id": {"type": "string", "pattern": "^q-[0-9a-f]{12}$"},
-        "outcome": {"enum": ["success", "failure"]},
+        "outcome": {"description": "skipped: a dry run, nothing was done.", "enum": ["success", "failure", "skipped"]},
         "link": {"type": "string"},
         "error": {"type": "string"},
         "at": {"$ref": "#/$defs/timestamp"}
@@ -318,7 +319,8 @@
             "sweep-gmail": {"$ref": "#/$defs/phase"},
             "sweep-calendar": {"$ref": "#/$defs/phase"},
             "sweep-meetings": {"$ref": "#/$defs/phase"},
-            "triage": {"$ref": "#/$defs/phase"}
+            "triage": {"$ref": "#/$defs/phase"},
+            "execute": {"description": "The executor: the one phase whose allowlist may hold send tools. It acts only on approved entries.", "$ref": "#/$defs/phase"}
           }
         }
       }
