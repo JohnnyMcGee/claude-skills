@@ -428,6 +428,17 @@ class BriefTest(TriageTestCase):
         self.assertNotIn("## acme", brief)
 
 
+class ContractTest(ProcessTestCase):
+    def test_decisions_and_results_validate_against_the_shared_schema(self):
+        approve = {"entry_id": "q-0123456789ab", "verdict": "approve", "draft": "Edited.", "reason": "too formal", "promote_to_silent": False, "at": "2026-10-20T13:05:00Z"}
+        success = {"entry_id": "q-0123456789ab", "outcome": "success", "link": "https://github.com/acme/widgets/pull/101#pullrequestreview-1", "at": "2026-10-20T13:06:00Z"}
+
+        self.assertEqual(self.process("validate", "decision", stdin=json.dumps(approve)), "")
+        self.assertEqual(self.process("validate", "result", stdin=json.dumps(success)), "")
+        self.assertIn("'merge' is not one of", self.process("validate", "decision", stdin=json.dumps({**approve, "verdict": "merge"}), expect=1))
+        self.assertIn("missing 'outcome'", self.process("validate", "result", stdin=json.dumps({"entry_id": "q-0123456789ab", "at": "2026-10-20T13:06:00Z"}), expect=1))
+
+
 class RunTest(ProcessTestCase):
     def claude_calls(self):
         return [(c, cwd) for c, cwd in zip(self.run_fake.calls, self.run_fake.cwds) if c[0] == "claude"]
