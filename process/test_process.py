@@ -902,7 +902,7 @@ class RunTest(ProcessTestCase):
         self.process("run", "--delta", "--project", "side", "--fixtures", "/fx")
 
         prompts = [c[2] for c, _ in self.claude_calls()]
-        self.assertEqual(prompts, ["/sweep-github side --delta --fixtures /fx", "/sweep-linear side --delta --fixtures /fx", "/triage side --dry-run"])
+        self.assertEqual(prompts, ["/sweep-github side --delta --fixtures /fx", "/sweep-linear side --delta --fixtures /fx", "/triage side --dry-run --fixtures /fx"])
         brief = (self.state / "brief.md").read_text()
         self.assertIn("· delta", brief)
         self.assertNotIn("## acme", brief)
@@ -1118,6 +1118,17 @@ class ProfileTest(ProcessTestCase):
 
         self.assertTrue(out.startswith(f"{path}\ninbox: {self.profile_dir('acme') / 'inbox'}\n"))
         self.assertIn("## How to sweep", out)
+
+    def test_profile_names_who_shares_each_feed_and_every_watchlist_its_sweep_covers(self):
+        self.write_profile("acme", sources=ALL_SOURCES, watchlist=["#deploys"])
+        self.write_profile("side", sources=["github", "linear", "slack"], watchlist=["#gadgets", "#deploys"])
+        self.write_profile("solo", sources=["github", "linear", "gmail"], account="me@solo.example")
+
+        out = self.process("profile", "acme")
+
+        self.assertIn("shared slack: acme, side (one sweep serves all; emit attributes each item)\n", out)
+        self.assertIn("watchlist: #deploys, #gadgets\n", out)
+        self.assertNotIn("shared gmail", out)
 
     def test_profiles_lists_each_profile_with_its_sources(self):
         self.write_profile("acme")

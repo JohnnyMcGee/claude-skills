@@ -324,7 +324,7 @@ class Process:
                 sources = [s for s in profile["sources"] if share_key(profile, s) not in swept]
                 swept |= {share_key(profile, s) for s in sources} - {None}
                 phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in sources]
-                phases.append(("triage", f"/triage {name}" + (" --dry-run" if dry else "")))
+                phases.append(("triage", f"/triage {name}" + (f" --dry-run --fixtures {opts['--fixtures']}" if dry else "")))
                 for phase, prompt in phases:
                     self.out(f"{name}: {phase}")
                     before = self.watermarks(name)
@@ -396,9 +396,16 @@ class Process:
 
     def cmd_profile(self, name):
         """Print one validated profile, path first, so a phase reads it without guessing XDG_CONFIG_HOME."""
-        self.profile(name)
+        profile = self.profile(name)
         path = self.profiles_dir() / f"{name}.md"
-        self.out(f"{path}\ninbox: {self.inbox(name)}\n{path.read_text()}")
+        lines = [str(path), f"inbox: {self.inbox(name)}"]
+        for source in profile["sources"]:
+            group = self.share_group(name, source)
+            if len(group) > 1:
+                lines.append(f"shared {source}: {', '.join(group)} (one sweep serves all; emit attributes each item)")
+            if source == "slack":
+                lines.append("watchlist: " + ", ".join(dict.fromkeys(c for p in group.values() for c in p["slack"].get("watchlist", []))))
+        self.out("\n".join(lines) + "\n" + path.read_text())
 
     def cmd_profiles(self):
         """List every profile, refusing if any is invalid or grants a send tool to a sweep or triage phase."""
