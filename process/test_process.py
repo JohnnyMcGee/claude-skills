@@ -508,7 +508,9 @@ class SlackTriageTest(TriageTestCase):
         ask = slack(summary="Dee asked you to add an index on orders.created_at", facts={"channel": "#deploys", "ask": "task"})
         self.emit(ask, source="slack")
 
-        self.assertIn("[do, then report]", self.process("triage", "plan", "acme"))
+        plan = self.process("triage", "plan", "acme")
+        self.assertIn("[do, then report]", plan)
+        self.assertIn("| @me-dev does the export query use the new index?", plan)  # the ticket's description comes from it
         [ticket] = self.triage(note="https://linear.app/acme/issue/WID-30")
 
         self.assertEqual(ticket["action"]["type"], "linear_create_issue")
@@ -1182,6 +1184,8 @@ class ProfileTest(ProcessTestCase):
         self.assertEqual(acme["github"]["repo"], "acme/widgets")
         self.assertEqual(acme["linear"]["team"], "WID")
         self.assertEqual(acme["google"]["account"], "me@acme.example")
+        self.assertEqual(acme["sources"], ALL_SOURCES)
+        self.assertEqual(acme["slack"]["watchlist"], ["#incidents", "#deploys"])
         self.assertEqual({p["model"] for p in acme["phases"].values()}, {"sonnet", "opus"})
         self.assertIn("## Changelog", acme["body"])
 

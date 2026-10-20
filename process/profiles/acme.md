@@ -6,7 +6,7 @@ active = true
 # Headless phases run here, so project-scoped MCP servers (e.g. a Linear server in the repo's .mcp.json) load.
 workdir = "~/code/widgets"
 timezone = "America/New_York"
-sources = ["github", "linear"]
+sources = ["github", "linear", "slack", "gmail", "calendar", "meetings"]
 
 [github]
 repo = "acme/widgets"
@@ -15,8 +15,26 @@ review_skill = "/review"
 [linear]
 team = "WID"
 
+[slack]
+# Profiles naming the same workspace share one Slack sweep; emit attributes each item with [match].
+workspace = "acme"
+# Channels swept even without a mention.
+watchlist = ["#incidents", "#deploys"]
+
 [google]
+# Gmail, Calendar and Meetings read this account. Profiles naming the same account share one sweep of each.
 account = "me@acme.example"
+# Declining a meeting my manager organizes or attends is never proposed.
+manager = "boss@acme.example"
+# Noise mail is filed under this label as it is archived.
+noise_label = "Noise"
+
+[match]
+# How items from a shared Slack workspace or Google account are attributed to this project, besides the repo, the
+# Linear team's ticket prefix and the watchlist. Items no profile claims land in the brief's Unsorted section.
+keywords = ["widgets"]
+channels = ["#widgets"]
+senders = ["@acme.example"]
 
 [urgency]
 people = ["my-manager"]
@@ -57,22 +75,85 @@ allowed_tools = [
   "mcp__linear-server__get_user",
 ]
 
+[phases.sweep-slack]
+model = "sonnet"
+allowed_tools = [
+  "Read",
+  "Bash(date -u:*)",
+  "Bash(process profile:*)",
+  "Bash(process watermark:*)",
+  "Bash(process emit:*)",
+  "mcp__slack__slack_read_user_profile",
+  "mcp__slack__slack_search_public_and_private",
+  "mcp__slack__slack_read_channel",
+  "mcp__slack__slack_read_thread",
+  "mcp__slack__slack_get_reactions",
+]
+
+[phases.sweep-gmail]
+model = "sonnet"
+allowed_tools = [
+  "Read",
+  "Bash(date -u:*)",
+  "Bash(process profile:*)",
+  "Bash(process watermark:*)",
+  "Bash(process emit:*)",
+  "mcp__claude_ai_Gmail__search_threads",
+  "mcp__claude_ai_Gmail__get_thread",
+]
+
+[phases.sweep-calendar]
+model = "sonnet"
+allowed_tools = [
+  "Read",
+  "Bash(date -u:*)",
+  "Bash(process profile:*)",
+  "Bash(process watermark:*)",
+  "Bash(process emit:*)",
+  "mcp__claude_ai_Google_Calendar__list_events",
+  "mcp__claude_ai_Google_Calendar__get_event",
+]
+
+[phases.sweep-meetings]
+model = "sonnet"
+allowed_tools = [
+  "Read",
+  "Bash(date -u:*)",
+  "Bash(process profile:*)",
+  "Bash(process watermark:*)",
+  "Bash(process emit:*)",
+  "mcp__claude_ai_Google_Calendar__list_events",
+  "mcp__claude_ai_Google_Drive__search_files",
+  "mcp__claude_ai_Google_Drive__get_file_metadata",
+  "mcp__claude_ai_Google_Drive__read_file_content",
+]
+
 [phases.triage]
 model = "opus"
+# The silent writes live here and nowhere else: marking Linear notifications read, creating tickets assigned to me,
+# and labeling and archiving Gmail noise. No send, reply, RSVP, review or merge tool: drafts wait for my approval.
 allowed_tools = [
   "Read",
   "Bash(process profile:*)",
   "Bash(process triage:*)",
   "mcp__linear-server__mark_notification",
+  "mcp__linear-server__create_issue",
+  "mcp__linear-server__list_issues",
   "mcp__linear-server__get_issue",
   "mcp__linear-server__list_comments",
   "mcp__github__pull_request_read",
+  "mcp__slack__slack_read_thread",
+  "mcp__claude_ai_Gmail__get_thread",
+  "mcp__claude_ai_Gmail__list_labels",
+  "mcp__claude_ai_Gmail__label_thread",
+  "mcp__claude_ai_Gmail__unlabel_thread",
+  "mcp__claude_ai_Google_Calendar__get_event",
 ]
 +++
 
 # Acme widgets
 
-An example project: GitHub `acme/widgets`, Linear team `WID`, Google account `me@acme.example`.
+An example project: GitHub `acme/widgets`, Linear team `WID`, Slack workspace `acme`, Google account `me@acme.example`.
 
 ## How to sweep
 
@@ -80,8 +161,12 @@ Free text the sweepers and triage read before every run: what matters on this pr
 
 - **Review requests.** Draft each review with the repo's review skill (`review_skill` above). A review draft is never an approving verdict.
 - **Linear mirrors GitHub.** Linear's GitHub integration posts a notification for review requests and PR comments on linked tickets. Give those items the PR URL as their subject so triage merges them with the GitHub sweeper's item.
+- **Slack asks.** An immediate ask (do X today, can you look at Y) becomes a ticket; a question gets a drafted reply. `#incidents` matters even without a mention.
+- **Gmail noise.** Vendor newsletters and CI notification mail are noise. Mail from people at acme.example never is.
+- **Meetings.** Only the Widgets standup and planning meetings have Gemini notes worth reading.
 - **Volume.** Note the usual daily volume here, so a sweep that finds far more than that is a sign it is re-reading old items.
 
 ## Changelog
 
 - 2026-10-20 — Created with the GitHub and Linear sources.
+- 2026-10-20 — Added the Slack, Gmail, Calendar and Meetings sources.

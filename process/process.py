@@ -529,7 +529,7 @@ class Process:
         for e in entries:
             todo = "draft" if needs_draft(e) else "do, then report" if e["action"]["type"] in TRIAGE_ACTIONS else e["status"]
             self.out(f"{e['id']}  [{todo}]  {e['action']['type']} {json.dumps(e['action']['params'])}  {e['summary']}  {e['link']}")
-            if todo == "draft":
+            if todo == "draft" or e["action"]["type"] == "linear_create_issue":  # a ticket is written from its ask
                 for item_id in e["item_ids"]:
                     self.out(f"    {item_id}: {by_id[item_id]['summary']}\n" + indent(by_id[item_id]["context"], "      | "))
         self.out(f"{len(entries)} entr(ies) planned in {pdir / 'plan.json'}; {len(dropped)} item(s) dropped (my own, or echoes of a review already queued)")
