@@ -361,7 +361,7 @@ class Process:
         text = path.read_text() if path else self.stdin.read()
         pdir = self.profile_state(profile)
         known = {i["id"] for i in self.read_jsonl(pdir / "items.jsonl")}
-        fresh, problems = [], []
+        fresh, problems, answered = [], [], 0
         for n, candidate in enumerate(self.parse_jsonl(text, "item"), 1):
             candidate.pop("id", None)
             record = {"id": f"{candidate.get('source')}:{candidate.get('native_id')}@{digest(str(candidate.get('version')))}", "profile": profile, **candidate}
@@ -369,7 +369,9 @@ class Process:
             if not errors and record["source"] != source:
                 errors = [f"$.source: {record['source']!r} emitted by the {source} sweeper"]
             problems += [f"item {n}: {e}" for e in errors]
-            if record["id"] not in known:
+            if (record.get("facts") or {}).get("answered"):  # I already replied or reacted: not an ask any more
+                answered += 1
+            elif record["id"] not in known:
                 known.add(record["id"])
                 fresh.append(record)
         if problems:
@@ -380,7 +382,7 @@ class Process:
         self.write_json(pdir / "watermarks.json", marks)
         if path:
             path.unlink()  # consumed, so a later sweep can never re-send it
-        self.out(f"stored {len(fresh)} new item(s) for {profile}/{source}; watermark {marks[source]}")
+        self.out(f"stored {len(fresh)} new item(s) for {profile}/{source}; watermark {marks[source]}" + (f"; skipped {answered} already answered" if answered else ""))
 
     def cmd_watermark(self, profile, source):
         """Print the source's watermark for the profile; nothing when it has never been swept."""

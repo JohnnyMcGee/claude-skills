@@ -287,6 +287,16 @@ class EmitTest(ProcessTestCase):
         self.assertEqual([i["source"] for i in stored], list(NEW_SOURCE_ITEMS))
         self.assertEqual(self.process("validate", "item", str(self.profile_dir() / "items.jsonl")), "")
 
+    def test_a_slack_thread_i_already_replied_or_reacted_to_does_not_become_an_item(self):
+        self.write_profile(sources=ALL_SOURCES)
+
+        out = self.emit(slack(facts={"channel": "#deploys", "ask": "question", "answered": True}), source="slack", watermark="2026-10-20T13:00:00Z")
+
+        self.assertIn("stored 0 new item(s)", out)
+        self.assertIn("1 already answered", out)
+        self.assertEqual(self.jsonl(self.profile_dir() / "items.jsonl"), [])
+        self.assertEqual(self.process("watermark", "acme", "slack").strip(), "2026-10-20T13:00:00Z")
+
     def test_re_emitting_an_unchanged_item_is_a_no_op_but_a_new_version_is_a_new_item(self):
         self.emit(item())
         self.emit(item())
