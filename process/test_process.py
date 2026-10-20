@@ -88,6 +88,10 @@ allowed_tools = ["Read", "Bash(process emit:*)", "mcp__linear-server__get_notifi
 model = "opus"
 allowed_tools = {triage_tools}
 
+[phases.next-work]
+model = "opus"
+allowed_tools = ["Read", "Bash(process next:*)", "mcp__linear-server__list_issues"]
+
 [phases.execute]
 model = "opus"
 allowed_tools = {execute_tools}
@@ -1453,9 +1457,9 @@ class RunTest(ProcessTestCase):
         self.process("run")
 
         calls = self.claude_calls()
-        self.assertEqual([c[:3] for c, _ in calls], [["claude", "-p", "/sweep-github acme"], ["claude", "-p", "/sweep-linear acme"], ["claude", "-p", "/triage acme"]])
+        self.assertEqual([c[2] for c, _ in calls], ["/sweep-github acme", "/sweep-linear acme", "/triage acme", "/next-work acme"])
         profile = process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")
-        for (cmd, cwd), phase in zip(calls, ["sweep-github", "sweep-linear", "triage"]):
+        for (cmd, cwd), phase in zip(calls, ["sweep-github", "sweep-linear", "triage", "next-work"]):
             self.assertEqual(self.opt(cmd, "--model"), profile["phases"][phase]["model"])
             inbox = self.profile_dir("acme") / "inbox"
             self.assertEqual(self.opt(cmd, "--allowedTools").split(","), profile["phases"][phase]["allowed_tools"] + [f"Edit(/{inbox}/**)"])
@@ -1476,6 +1480,16 @@ class RunTest(ProcessTestCase):
         brief = (self.state / "brief.md").read_text()
         self.assertIn("· delta", brief)
         self.assertNotIn("## acme", brief)
+
+    def test_next_work_runs_with_the_full_brief_only_and_reads_fixtures_in_a_dry_run(self):
+        self.write_profile("acme")
+
+        self.process("run", "--delta")
+        self.assertNotIn("/next-work acme", [c[2] for c, _ in self.claude_calls()])
+
+        self.env["XDG_STATE_HOME"] = str(self.tmp / "scratch")
+        self.process("run", "--fixtures", "/fx")
+        self.assertIn("/next-work acme --fixtures /fx", [c[2] for c, _ in self.claude_calls()])
 
     def test_a_dry_run_reads_fixtures_from_an_absolute_path_with_no_service_tools(self):
         self.write_profile("acme")
@@ -1552,7 +1566,7 @@ class RunTest(ProcessTestCase):
 
         prompts = self.silent_fix_run()
 
-        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", "/triage acme", "/execute acme"])
+        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", "/triage acme", "/next-work acme", "/execute acme"])
         self.assertIn("> ⚠ execute left 1 approved entr(ies) without a result", (self.state / "brief.md").read_text())
 
     def test_run_skips_its_executor_while_procs_executor_is_running(self):
@@ -1588,6 +1602,7 @@ class RunTest(ProcessTestCase):
         self.assertNotIn("sweep-github", brief)
         self.assertIn("> ⚠ sweep-linear stored nothing: its watermark did not move", brief)
         self.assertIn("> ⚠ triage left 1 item(s) unhandled", brief)
+        self.assertIn("> ⚠ next-work ranked nothing: next.json was not written", brief)
 
     def test_a_dry_run_refuses_to_write_into_the_real_state_directory(self):
         self.write_profile("acme")
@@ -1614,7 +1629,7 @@ class RunTest(ProcessTestCase):
 
         self.process("run")
 
-        self.assertEqual(self.claude_calls()[-1][0][2], "/triage acme")
+        self.assertIn("/triage acme", [c[2] for c, _ in self.claude_calls()])
         self.assertIn("> ⚠ sweep-linear failed: linear-server: not connected", (self.state / "brief.md").read_text())
 
 

@@ -300,9 +300,11 @@ class Process:
                 profile = profiles[name]
                 phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in profile["sources"]]
                 phases.append(("triage", f"/triage {name}" + (" --dry-run" if dry else "")))
+                if "next-work" in profile["phases"] and not opts.get("--delta"):  # it runs with the full brief, after triage
+                    phases.append(("next-work", f"/next-work {name}" + (f" --fixtures {opts['--fixtures']}" if dry else "")))
                 for phase, prompt in phases:
                     self.out(f"{name}: {phase}")
-                    before = self.watermarks(name)
+                    before = {**self.watermarks(name), "next-work": self.read_json(self.profile_state(name) / "next.json", {}).get("at")}
                     try:
                         self.headless(profile, phase, prompt, dry)
                         problem = self.phase_problem(name, phase, before)
@@ -349,6 +351,9 @@ class Process:
             source = phase.removeprefix("sweep-")
             if self.watermarks(name).get(source) in (None, before.get(source)):
                 return f"{phase} stored nothing: its watermark did not move"
+        elif phase == "next-work":
+            if self.read_json(self.profile_state(name) / "next.json", {}).get("at") in (None, before["next-work"]):
+                return "next-work ranked nothing: next.json was not written"
         elif self.unhandled(name):
             return f"triage left {len(self.unhandled(name))} item(s) unhandled"
 

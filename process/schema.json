@@ -296,6 +296,7 @@
             "sweep-github": {"$ref": "#/$defs/phase"},
             "sweep-linear": {"$ref": "#/$defs/phase"},
             "triage": {"$ref": "#/$defs/phase"},
+            "next-work": {"description": "Ranks my next tickets and the AFK list. Runs with the full brief; read-only like a sweeper.", "$ref": "#/$defs/phase"},
             "execute": {"description": "The executor: the one phase whose allowlist may hold send tools. It acts only on approved entries.", "$ref": "#/$defs/phase"}
           }
         }
