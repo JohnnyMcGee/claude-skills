@@ -537,6 +537,36 @@ class SlackTriageTest(TriageTestCase):
             (self.state / "brief.md").read_text(),
         )
 
+    def digest_dm(self, number=101):
+        """GitHub's daily review digest DM in Slack, as the sweeper maps it: one review request per PR it names."""
+        return slack(
+            native_id=f"D9/1792490000.000100#pr-{number}",
+            kind="review_request",
+            subject=f"https://github.com/acme/widgets/pull/{number}",
+            actor={"name": "GitHub", "role": "bot"},
+            summary=f"GitHub digest: review requested on #{number}",
+            facts={"channel": "DM"},
+        )
+
+    def test_the_github_review_digest_dm_merges_into_the_github_review_request(self):
+        self.emit(item())
+        self.emit(self.digest_dm(), source="slack")
+
+        [review] = self.triage()
+
+        self.assertEqual((review["sources"], review["action"]["type"]), (["github", "slack"], "gh_review"))
+
+    def test_a_review_digest_or_linear_mirror_naming_a_review_already_queued_adds_nothing(self):
+        self.emit(item())
+        [review] = self.triage()
+
+        self.emit(self.digest_dm(), source="slack")
+        self.emit(linear(), source="linear")
+        queue = self.triage()
+
+        self.assertEqual([e["kind"] for e in queue], ["review_request", "housekeeping"])  # the mirror's notification is still marked read
+        self.assertEqual(self.process("triage", "plan", "acme").splitlines()[-1].split(";")[0], "0 entr(ies) planned in " + str(self.profile_dir() / "plan.json"))
+
     def test_a_slack_message_that_asks_nothing_is_an_fyi(self):
         self.emit(slack(kind="channel_message", summary="Deploy 412 finished", facts={"channel": "#deploys"}), source="slack")
 

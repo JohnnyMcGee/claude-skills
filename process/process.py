@@ -481,7 +481,12 @@ class Process:
         dropped = [i for i in items if i["actor"]["role"] == "me" and i["kind"] != "pr_status"]
         noise = [i for i in items if i["source"] == "gmail" and (i.get("facts") or {}).get("noise") and i not in dropped]
         live = [i for i in items if i not in stale and i not in dropped and i not in noise]
-        entries = [entry(name, profile, group) for group in asks(live)]
+        queued = {(e["kind"], e["subject"]) for e in self.queue() if e["project"] == name}
+        groups = asks(live)
+        # Linear's mirror or GitHub's Slack digest of a review request already queued: the GitHub item was the ask.
+        echoes = [g for g in groups if g[0]["kind"] == "review_request" and g[0]["source"] != "github" and (g[0]["kind"], canonical(g[0]["subject"])) in queued]
+        dropped += [i for g in echoes for i in g]
+        entries = [entry(name, profile, group) for group in groups if group not in echoes]
         ticketed = {e["subject"]: e.get("note", "") for e in self.queue() if e["project"] == name and e["action"]["type"] == "linear_create_issue" and e["status"] == "done"}
         for e in entries:
             if e["action"]["type"] == "linear_create_issue" and e["subject"] in ticketed:  # a changed ask I already made a ticket for
@@ -502,7 +507,7 @@ class Process:
             if todo == "draft":
                 for item_id in e["item_ids"]:
                     self.out(f"    {item_id}: {by_id[item_id]['summary']}\n" + indent(by_id[item_id]["context"], "      | "))
-        self.out(f"{len(entries)} entr(ies) planned in {pdir / 'plan.json'}; {len(dropped)} item(s) of my own dropped")
+        self.out(f"{len(entries)} entr(ies) planned in {pdir / 'plan.json'}; {len(dropped)} item(s) dropped (my own, or echoes of a review already queued)")
 
     def plan_entry(self, name, entry_id):
         plan = self.read_json(self.profile_state(name) / "plan.json", None)
