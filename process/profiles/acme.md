@@ -25,7 +25,7 @@ watchlist = ["#incidents", "#deploys"]
 # Gmail, Calendar and Meetings read this account. Profiles naming the same account share one sweep of each.
 account = "me@acme.example"
 # Declining a meeting my manager organizes or attends is never proposed.
-manager = "boss@acme.example"
+manager = "mo@acme.example"
 # Noise mail is filed under this label as it is archived. Create it in Gmail first: triage cannot create labels.
 noise_label = "Noise"
 
