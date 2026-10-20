@@ -103,9 +103,19 @@ def validate(value, kind):
 # in a sweep or triage allowlist, unless it only reads (get_/list_/search_/read_ prefixes, a _read suffix).
 SEND_WORDS = re.compile(
     r"send|reply|post|comment|review|rsvp|respond|event|merge|approve|submit|forward|publish|schedule|share|invite"
-    r"|write|delete|push|create|update|add_|reaction|assign"
+    r"|write|delete|push|create|update|add_|reaction|assign|trash|spam"
 )
-READ_ONLY = re.compile(r"__(get|list|search|read|fetch)_|_read$")
+READ_ONLY = re.compile(r"__(slack_)?(get|list|search|read|fetch)_|_read$")
+# The silent writes the PRD allows: triage performs them on my own things. A sweeper only reads, so never holds one.
+SILENT_WRITES = {
+    "mcp__linear-server__mark_notification",
+    "mcp__linear-server__save_issue",
+    "mcp__linear-server__create_issue",
+    "mcp__claude_ai_Gmail__label_thread",
+    "mcp__claude_ai_Gmail__unlabel_thread",
+    "mcp__claude_ai_Gmail__label_message",
+    "mcp__claude_ai_Gmail__unlabel_message",
+}
 # Built-in tools that reach any file or any host unless the rule names a path or a domain.
 UNSCOPED = {"Bash", "Edit", "MultiEdit", "NotebookEdit", "Write", "WebFetch", "WebSearch"}
 # Bash prefixes that run arbitrary commands, so no prefix after them is safe.
@@ -121,6 +131,8 @@ def forbidden_tool(tool):
         return too_broad or bool(SEND_WORDS.search(" ".join(words)))
     if tool in UNSCOPED or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
         return True
+    if tool in SILENT_WRITES:
+        return False
     return not READ_ONLY.search(tool) and bool(SEND_WORDS.search(tool.lower()))
 
 
@@ -141,7 +153,11 @@ DENIED_TOOLS = [
     "mcp__claude_ai_Gmail__send_message",
     "mcp__claude_ai_Gmail__reply",
     "mcp__claude_ai_Gmail__forward",
+    "mcp__claude_ai_Gmail__trash_thread",
+    "mcp__claude_ai_Gmail__trash_message",
     "mcp__claude_ai_Google_Calendar__respond_to_event",
+    "mcp__claude_ai_Google_Calendar__update_event",
+    "mcp__claude_ai_Google_Calendar__delete_event",
     "mcp__linear-server__save_comment",
 ]
 
@@ -203,6 +219,8 @@ def load_profile(path):
             problems.append(f"source {source!r} has no [phases.sweep-{source}]")
     for name, phase in phases.items():
         problems += [f"phases.{name} grants {t!r}, which can send, review, RSVP or merge" for t in phase.get("allowed_tools", []) if forbidden_tool(t)]
+        if name.startswith("sweep-"):
+            problems += [f"phases.{name} grants {t!r}, a silent write only triage may hold" for t in phase.get("allowed_tools", []) if t in SILENT_WRITES]
     if problems:
         raise SystemExit(f"process: profile {path}:\n" + "\n".join(f"  {p}" for p in problems))
     return {**profile, "body": match[2]}

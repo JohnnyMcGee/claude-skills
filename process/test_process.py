@@ -70,7 +70,7 @@ silent = {silent}
 
 [phases.sweep-github]
 model = "sonnet"
-allowed_tools = ["Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__github__pull_request_read"]
+allowed_tools = {sweep_tools}
 
 [phases.sweep-linear]
 model = "sonnet"
@@ -197,7 +197,7 @@ class ProcessTestCase(unittest.TestCase):
     def state(self):
         return self.tmp / "state" / "process"
 
-    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None, repo="acme/widgets", team="WID"):
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None, repo="acme/widgets", team="WID", sweep_tools=("Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__github__pull_request_read")):
         path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         extra = ""
@@ -221,6 +221,7 @@ class ProcessTestCase(unittest.TestCase):
                 phases=phases,
                 silent=json.dumps(list(silent)),
                 triage_tools=json.dumps(list(triage_tools)),
+                sweep_tools=json.dumps(list(sweep_tools)),
             )
         )
         return path
@@ -1079,7 +1080,36 @@ class ProfileTest(ProcessTestCase):
         "NotebookEdit",
         "WebFetch",
         "WebSearch",
+        "mcp__claude_ai_Gmail__trash_thread",
+        "mcp__claude_ai_Gmail__mark_thread_spam",
+        "mcp__claude_ai_Gmail__create_draft",
+        "mcp__slack__slack_send_message_draft",
     ]
+    # The silent writes: triage may perform them, a sweeper never.
+    SILENT_WRITES = [
+        "mcp__linear-server__mark_notification",
+        "mcp__linear-server__save_issue",
+        "mcp__linear-server__create_issue",
+        "mcp__claude_ai_Gmail__label_thread",
+        "mcp__claude_ai_Gmail__unlabel_thread",
+        "mcp__claude_ai_Gmail__label_message",
+        "mcp__claude_ai_Gmail__unlabel_message",
+    ]
+
+    def test_triage_may_grant_the_silent_writes_but_a_sweeper_may_not(self):
+        self.write_profile(triage_tools=["Read", *self.SILENT_WRITES])
+        self.assertIn("acme  active", self.process("profiles"))
+
+        for tool in self.SILENT_WRITES:
+            with self.subTest(tool=tool):
+                self.write_profile(sweep_tools=["Read", tool])
+                self.assertIn(f"phases.sweep-github grants {tool!r}", self.process("profiles", expect=1))
+
+    def test_sweepers_may_read_slack_reactions_calendars_and_meeting_notes(self):
+        reads = ["mcp__slack__slack_get_reactions", "mcp__slack__slack_read_thread", "mcp__claude_ai_Google_Calendar__list_events", "mcp__claude_ai_Google_Drive__read_file_content", "mcp__claude_ai_Gmail__search_threads"]
+        self.write_profile(sweep_tools=["Read", *reads])
+
+        self.assertIn("acme  active", self.process("profiles"))
 
     def test_profile_prints_one_profile_so_phases_never_guess_its_path(self):
         path = self.write_profile("acme")
