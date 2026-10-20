@@ -500,6 +500,55 @@ class Process:
         (pdir / "plan.json").unlink()
         self.out(f"committed {len(entries)} entr(ies) for {name}; superseded {len(superseded)}; {len(handled)} item(s) handled")
 
+    # -- executor side --
+
+    def cmd_execute(self, *args):
+        """Apply proc's decisions to the queue, then run the executor headless for each profile (or --project) that
+        has approved actions waiting. proc runs this when I quit it; `process run` runs it after triage."""
+        opts = flags(args, "--project")
+        profiles = self.profiles()
+        if opts.get("--project") and opts["--project"] not in profiles:
+            raise SystemExit(f"process: no profile {opts['--project']!r} in {self.profiles_dir()}")
+        self.apply_decisions(profiles)
+        names = [opts["--project"]] if opts.get("--project") else list(profiles)
+        for name in names:
+            if self.approved(name):
+                self.out(f"{name}: execute")
+                self.headless(profiles[name], "execute", f"/execute {name}")
+
+    def approved(self, name):
+        """Entries waiting on the executor: approved by me, or promoted to silent, with an action that carries text."""
+        return [e for e in self.queue() if e["project"] == name and e["status"] == "approved" and needs_draft(e)]
+
+    def apply_decisions(self, profiles):
+        """Turn each decision on a still-pending entry into its new state. A decision on anything else is stale (the
+        entry was superseded or already decided) and changes nothing, so applying twice is a no-op."""
+        queue = {e["id"]: e for e in self.queue()}
+        changed, handled = [], {}
+        for n, decision in enumerate(self.read_jsonl(self.state_root() / "decisions.jsonl"), 1):
+            problems = validate(decision, "decision")
+            if problems:
+                self.out(f"process: decision {n} ignored: {problems[0]}")
+                continue
+            e = queue.get(decision["entry_id"])
+            if not e or e["status"] != "pending" or e["project"] not in profiles:
+                continue
+            if decision["verdict"] == "approve":
+                e = {**e, "status": "approved", "action": {**e["action"], "draft": decision.get("draft") or e["action"].get("draft", "")}}
+            else:
+                e = {**e, "status": "skipped"}
+                handled.setdefault(e["project"], []).append(e)
+            queue[e["id"]] = e
+            changed.append(e)
+        self.append_jsonl(self.state_root() / "queue.jsonl", changed)
+        for name, entries in handled.items():
+            self.handle(name, entries, "skipped")
+
+    def handle(self, name, entries, outcome):
+        """Record entries' items in the ledger with how they ended, so the same version never comes back."""
+        at = iso(self.clock())
+        self.append_jsonl(self.profile_state(name) / "ledger.jsonl", [{"item_id": i, "at": at, "entry_id": e["id"], "outcome": outcome} for e in entries for i in e["item_ids"]])
+
     # -- the brief --
 
     def cmd_brief(self, *args):
@@ -690,7 +739,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: process <run|emit|watermark|triage|brief|profile|profiles|validate> ...")
+        app.out("usage: process <run|emit|watermark|triage|execute|brief|profile|profiles|validate> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command.replace("-", "_"), None)

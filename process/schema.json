@@ -223,7 +223,8 @@
           "properties": {
             "sweep-github": {"$ref": "#/$defs/phase"},
             "sweep-linear": {"$ref": "#/$defs/phase"},
-            "triage": {"$ref": "#/$defs/phase"}
+            "triage": {"$ref": "#/$defs/phase"},
+            "execute": {"description": "The executor: the one phase whose allowlist may hold send tools. It acts only on approved entries.", "$ref": "#/$defs/phase"}
           }
         }
       }

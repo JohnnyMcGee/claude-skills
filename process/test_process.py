@@ -79,6 +79,10 @@ allowed_tools = ["Read", "Bash(process emit:*)", "mcp__linear-server__get_notifi
 [phases.triage]
 model = "opus"
 allowed_tools = {triage_tools}
+
+[phases.execute]
+model = "opus"
+allowed_tools = {execute_tools}
 +++
 
 # {name}
@@ -119,7 +123,7 @@ class ProcessTestCase(unittest.TestCase):
     def state(self):
         return self.tmp / "state" / "process"
 
-    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), text=None):
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Read", "Bash(process execute:*)"), text=None):
         path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -130,6 +134,7 @@ class ProcessTestCase(unittest.TestCase):
                 workdir=self.tmp / "work" / name,
                 silent=json.dumps(list(silent)),
                 triage_tools=json.dumps(list(triage_tools)),
+                execute_tools=json.dumps(list(execute_tools)),
             )
         )
         return path
@@ -515,6 +520,65 @@ class BriefTest(TriageTestCase):
         brief = (self.state / "brief.md").read_text()
         self.assertIn("## side", brief)
         self.assertNotIn("## acme", brief)
+
+
+class ExecuteTestCase(TriageTestCase):
+    def decide(self, entry, verdict="approve", **over):
+        """Append a decision the way proc does."""
+        record = {"entry_id": entry["id"], "verdict": verdict, "at": process.iso(self.now), **over}
+        with (self.state / "decisions.jsonl").open("a") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def entry(self, entry_id):
+        [found] = [e for e in self.queue() if e["id"] == entry_id]
+        return found
+
+    def executor_calls(self):
+        return [c for c in self.run_fake.calls if c[0] == "claude"]
+
+
+class ExecuteTest(ExecuteTestCase):
+    def test_execute_approves_decided_entries_with_my_edit_and_runs_the_executor_for_their_profile(self):
+        self.emit(item(), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", summary="Ben requested your review on #102"))
+        review, other = self.triage()
+        self.decide(review, draft="My edited review.")
+
+        self.process("execute")
+
+        approved = self.entry(review["id"])
+        self.assertEqual((approved["status"], approved["action"]["draft"]), ("approved", "My edited review."))
+        self.assertEqual(self.entry(other["id"])["status"], "pending")
+        [call] = self.executor_calls()
+        self.assertEqual(call[:3], ["claude", "-p", "/execute acme"])
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+
+    def test_a_skipped_entry_is_handled_and_its_items_stay_handled_until_they_change(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review, "skip")
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(review["id"])["status"], "skipped")
+        self.assertEqual(self.executor_calls(), [])  # nothing approved, nothing to run
+        ledger = self.jsonl(self.profile_dir() / "ledger.jsonl")
+        self.assertIn({"item_id": review["item_ids"][0], "at": process.iso(self.now), "entry_id": review["id"], "outcome": "skipped"}, ledger)
+        self.emit(item())
+        self.assertEqual([e["status"] for e in self.triage()], ["skipped"])
+        self.emit(item(version="v2"))
+        self.assertEqual([e["status"] for e in self.triage()], ["skipped", "pending"])
+
+    def test_a_decision_on_an_entry_no_longer_pending_changes_nothing(self):
+        self.emit(item())
+        [old] = self.triage()
+        self.emit(item(version="v2"))
+        self.triage()  # supersedes the first entry
+        self.decide(old)
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(old["id"])["status"], "superseded")
+        self.assertEqual(self.executor_calls(), [])
 
 
 class ContractTest(ProcessTestCase):
