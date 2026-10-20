@@ -664,6 +664,11 @@ class ProfileTest(ProcessTestCase):
         "mcp__slack__slack_add_reaction",
         "mcp__linear-server__create_comment",
         "mcp__claude_ai_Google_Calendar__create_event",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
     ]
 
     def test_profile_prints_one_profile_so_phases_never_guess_its_path(self):

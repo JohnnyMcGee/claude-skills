@@ -105,6 +105,8 @@ SEND_WORDS = re.compile(
     r"|write|delete|push|create|update|add_|reaction|assign"
 )
 READ_ONLY = re.compile(r"__(get|list|search|read|fetch)_|_read$")
+# Built-in tools that reach any file or any host unless the rule names a path or a domain.
+UNSCOPED = {"Bash", "Edit", "MultiEdit", "NotebookEdit", "Write", "WebFetch", "WebSearch"}
 # Bash prefixes that run arbitrary commands, so no prefix after them is safe.
 LAUNCHERS = {"sh", "bash", "zsh", "env", "xargs", "eval", "exec", "sudo", "nohup", "timeout", "python", "python3", "node", "perl", "ruby", "curl", "wget"}
 
@@ -116,7 +118,7 @@ def forbidden_tool(tool):
         words = bash[1].removesuffix(":*").removesuffix("*").split()
         too_broad = len(words) < 2 or words[0] in LAUNCHERS or (words[0] == "gh" and (len(words) < 3 or words[1] == "api"))
         return too_broad or bool(SEND_WORDS.search(" ".join(words)))
-    if tool == "Bash" or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
+    if tool in UNSCOPED or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
         return True
     return not READ_ONLY.search(tool) and bool(SEND_WORDS.search(tool.lower()))
 
