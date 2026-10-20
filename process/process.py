@@ -184,12 +184,13 @@ def claims(profile, item):
     rules = profile.get("match", {})
     text = " ".join([item["summary"], item["subject"], item["link"], item["context"]]).lower()
     channels = {c.lower() for c in rules.get("channels", []) + profile.get("slack", {}).get("watchlist", [])}
+    keywords = rules.get("keywords", []) + ([profile["github"]["repo"]] if "github" in profile else [])
     actor = item["actor"]["name"].lower()
     team = profile.get("linear", {}).get("team")
     return (
         (item.get("facts") or {}).get("channel", "").lower() in channels
         or any(actor == s.lower() or (s.startswith("@") and actor.endswith(s.lower())) for s in rules.get("senders", []))
-        or any(k.lower() in text for k in rules.get("keywords", []) + [profile.get("github", {}).get("repo", "\0")])
+        or any(k.lower() in text for k in keywords)
         or bool(team and re.search(rf"\b{re.escape(team)}-\d+\b", text, re.I))
     )
 
