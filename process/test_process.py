@@ -254,6 +254,16 @@ class EmitTest(ProcessTestCase):
         self.assertEqual(self.process("validate", "item", str(self.profile_dir() / "items.jsonl")), "")
         self.assertEqual(self.process("watermark", "acme", "github").strip(), "2026-10-20T13:00:00Z")
 
+    def test_an_item_cannot_name_the_profile_it_is_stored_under(self):
+        self.write_profile("acme")
+        self.write_profile("beta")
+
+        self.emit({**item(), "profile": "beta"})
+
+        [stored] = self.jsonl(self.profile_dir() / "items.jsonl")
+        self.assertEqual(stored["profile"], "acme")
+        self.assertEqual(self.jsonl(self.profile_dir("beta") / "items.jsonl"), [])
+
     def test_emit_consumes_an_inbox_file(self):
         inbox = self.profile_dir() / "inbox"
         inbox.mkdir(parents=True)

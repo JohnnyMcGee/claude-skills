@@ -488,6 +488,7 @@ class Process:
         fresh, problems, answered = [], [], 0
         for n, candidate in enumerate(self.parse_jsonl(text, "item"), 1):
             candidate.pop("id", None)
+            candidate.pop("profile", None)  # emit decides where an item goes, never the item
             record = {"id": f"{candidate.get('source')}:{candidate.get('native_id')}@{digest(str(candidate.get('version')))}", "profile": profile, **candidate}
             errors = validate(record, "item")
             if not errors and record["source"] != source:
