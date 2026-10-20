@@ -4,6 +4,7 @@
 stdlib only. Every external command (claude) goes through run().
 """
 
+import fcntl
 import hashlib
 import inspect
 import json
@@ -123,6 +124,29 @@ def forbidden_tool(tool):
     return not READ_ONLY.search(tool) and bool(SEND_WORDS.search(tool.lower()))
 
 
+# Never actions, or what reaches one: merging, approving, deleting, deploying, and pushing (the executor pushes only
+# through `process execute push`, which checks the branch is my PR's). No phase may hold these, the executor included.
+EXECUTE_STEPS = {"plan", "review", "reply", "checkout", "git", "push", "result"}
+# A review tool is one too: its event can be APPROVE, so reviews go through `process execute review`, which pins it.
+NEVER_WORDS = re.compile(r"merge|approve|review_write|delete|deploy|release|push|create_or_update_file|transfer|fork|secret")
+# The executor pushes code, so it reads only its worktree (granted per run): nothing else can end up in a commit.
+EXECUTOR_UNSCOPED = {"Read", "Glob", "Grep"}
+
+
+def never_tool(tool):
+    """True when an executor allowlist entry could take a never action, or is broad enough to reach one."""
+    bash = re.fullmatch(r"Bash\((.*)\)", tool)
+    if bash:
+        words = bash[1].removesuffix(":*").removesuffix("*").split()
+        too_broad = len(words) < 2 or words[0] in LAUNCHERS or (words[0] in ("gh", "git") and (len(words) < 3 or words[1] == "api"))
+        if words[:2] == ["process", "execute"]:  # its steps are the guarded way to send and push; bare, a second executor
+            return len(words) < 3 or words[2] not in EXECUTE_STEPS
+        return too_broad or words[:3] == ["gh", "pr", "review"] or bool(NEVER_WORDS.search(" ".join(words)))
+    if tool in UNSCOPED | EXECUTOR_UNSCOPED or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
+        return True
+    return bool(NEVER_WORDS.search(tool.lower()))
+
+
 # Denied to every sweep and triage phase, as a backstop for allow rules in the user's own settings.
 DENIED_TOOLS = [
     "Bash(gh pr merge:*)",
@@ -143,6 +167,10 @@ DENIED_TOOLS = [
     "mcp__claude_ai_Google_Calendar__respond_to_event",
     "mcp__linear-server__save_comment",
 ]
+
+
+# Denied to the executor: the never actions among DENIED_TOOLS. It keeps the send tools its allowlist grants.
+NEVER_DENIED = [t for t in DENIED_TOOLS if never_tool(t)] + ["mcp__github__push_files", "mcp__github__create_or_update_file"]
 
 
 def load_profile(path):
@@ -167,7 +195,10 @@ def load_profile(path):
         if f"sweep-{source}" not in phases:
             problems.append(f"source {source!r} has no [phases.sweep-{source}]")
     for name, phase in phases.items():
-        problems += [f"phases.{name} grants {t!r}, which can send, review, RSVP or merge" for t in phase.get("allowed_tools", []) if forbidden_tool(t)]
+        if name == "execute":
+            problems += [f"phases.execute grants {t!r}, which can merge, approve, delete or push" for t in phase.get("allowed_tools", []) if never_tool(t)]
+        else:
+            problems += [f"phases.{name} grants {t!r}, which can send, review, RSVP or merge" for t in phase.get("allowed_tools", []) if forbidden_tool(t)]
     if problems:
         raise SystemExit(f"process: profile {path}:\n" + "\n".join(f"  {p}" for p in problems))
     return {**profile, "body": match[2]}
@@ -247,9 +278,9 @@ class Process:
         return records
 
     def cmd_run(self, *args):
-        """Sweep every source, then triage, for each active profile (or --project), each phase headless under its
-        profile's model and allowlist; then render the brief. --fixtures points sweepers at fixture data and makes
-        triage a dry run."""
+        """Sweep every source, triage, then execute what triage approved silently, for each active profile (or
+        --project), each phase headless under its profile's model and allowlist; then render the brief. --fixtures
+        points sweepers at fixture data and makes triage and the executor dry runs."""
         opts = flags(args, "--delta", "--project", "--fixtures")
         dry = bool(opts.get("--fixtures"))
         if dry:
@@ -276,14 +307,25 @@ class Process:
                         self.headless(profile, phase, prompt, dry)
                         problem = self.phase_problem(name, phase, before)
                     except (subprocess.CalledProcessError, OSError) as error:  # OSError: no workdir, no claude
-                        stderr = getattr(error, "stderr", None) or ""
-                        problem = f"{phase} failed: {(stderr.strip().splitlines() or [str(error)])[-1]}"
-                    if problem:
-                        run["problems"].setdefault(name, []).append(problem)
-                        self.write_json(self.state_root() / "run.json", run)
+                        problem = failure(phase, error)
+                    self.report(run, name, problem)
+                lock = self.executor_lock()
+                try:  # what triage approved silently (bot fixes, merges of the base) happens now, not when I open proc
+                    problem = self.execute(profile, dry) if lock else "execute skipped: another executor is running"
+                except (subprocess.CalledProcessError, OSError) as error:
+                    problem = failure("execute", error)
+                finally:
+                    if lock:
+                        lock.close()
+                self.report(run, name, problem)
             self.cmd_brief(*(["--delta"] if opts.get("--delta") else []), *(["--project", opts["--project"]] if opts.get("--project") else []))
         finally:
             (self.state_root() / "run.json").unlink()
+
+    def report(self, run, name, problem):
+        if problem:
+            run["problems"].setdefault(name, []).append(problem)
+            self.write_json(self.state_root() / "run.json", run)
 
     def inbox(self, name):
         """The one directory a phase may write: sweepers' item files and triage's drafts, each consumed on use."""
@@ -327,15 +369,24 @@ class Process:
 
     def headless(self, profile, phase, prompt, dry=False):
         """One phase as headless Claude in dontAsk mode: only its allowlist is approved, everything else is denied, and
-        known send tools are denied by name too. A dry run gets no service (MCP) tools at all."""
+        known send tools (for the executor, known never actions) are denied by name too. A dry run gets no service (MCP)
+        tools at all."""
         config = profile["phases"][phase]
         tools = [t for t in config["allowed_tools"] if not (dry and t.startswith("mcp__"))]
         inbox = self.inbox(profile["name"])
-        tools.append(f"Edit(/{inbox}/**)")  # dontAsk refuses heredocs, so items and drafts travel as inbox files
-        workdir = Path(profile["workdir"].replace("~", self.env["HOME"], 1) if profile["workdir"].startswith("~") else profile["workdir"])
+        dirs = [inbox]  # dontAsk refuses heredocs, so items and drafts travel as inbox files
+        if phase == "execute":
+            dirs.append(self.profile_state(profile["name"]) / "work")  # a fix edits files in its scratch worktree only
+            dirs[-1].mkdir(exist_ok=True)
+        tools += [f"Edit(/{d}/**)" for d in dirs] + ([f"Read(/{d}/**)" for d in dirs] if phase == "execute" else [])
+        workdir = self.workdir(profile)
         cmd = ["claude", "-p", prompt, "--model", config["model"], "--permission-mode", "dontAsk"]
-        cmd += ["--add-dir", str(inbox), "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(DENIED_TOOLS)]
+        denied = NEVER_DENIED if phase == "execute" else DENIED_TOOLS
+        cmd += ["--add-dir", *map(str, dirs), "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(denied)]
         return self.run(cmd, cwd=workdir)
+
+    def workdir(self, profile):
+        return Path(profile["workdir"].replace("~", self.env["HOME"], 1) if profile["workdir"].startswith("~") else profile["workdir"])
 
     def cmd_profile(self, name):
         """Print one validated profile, path first, so a phase reads it without guessing XDG_CONFIG_HOME."""
@@ -431,7 +482,7 @@ class Process:
         self.write_json(pdir / "plan.json", plan)
         by_id = {i["id"]: i for i in items}
         for e in entries:
-            todo = "draft" if needs_draft(e) else "do, then report" if e["action"]["type"] == "linear_mark_read" else e["status"]
+            todo = "draft" if needs_draft(e) and not e["action"].get("draft") else "do, then report" if e["action"]["type"] == "linear_mark_read" else e["status"]
             self.out(f"{e['id']}  [{todo}]  {e['action']['type']} {json.dumps(e['action']['params'])}  {e['summary']}  {e['link']}")
             if todo == "draft":
                 for item_id in e["item_ids"]:
@@ -500,6 +551,292 @@ class Process:
         (pdir / "plan.json").unlink()
         self.out(f"committed {len(entries)} entr(ies) for {name}; superseded {len(superseded)}; {len(handled)} item(s) handled")
 
+    # -- executor side --
+
+    def cmd_execute(self, *args):
+        """Apply proc's decisions to the queue, then run the executor headless for each profile (or --project) that
+        has approved actions waiting. proc runs this when I quit it; `process run` runs it after triage. The executor
+        skill drives the steps: `process execute plan|review|reply|checkout|git|push|result <profile> ...`."""
+        steps = {
+            "plan": self.execute_plan,
+            "result": self.execute_result,
+            "review": self.execute_review,
+            "reply": self.execute_reply,
+            "checkout": self.execute_checkout,
+            "git": self.execute_git,
+            "push": self.execute_push,
+        }
+        if args and args[0] in steps:
+            return call(steps[args[0]], args[1:], f"execute {args[0]}")
+        opts = flags(args, "--project")
+        profiles = self.profiles()
+        if opts.get("--project") and opts["--project"] not in profiles:
+            raise SystemExit(f"process: no profile {opts['--project']!r} in {self.profiles_dir()}")
+        lock = self.executor_lock()
+        if lock is None:
+            self.out("process: another executor is running; these decisions apply on the next run")
+            return 0
+        with lock:
+            self.apply_decisions(profiles)
+            dry = (self.state_root() / "dry-run").exists()
+            failed = False
+            for name in [opts["--project"]] if opts.get("--project") else list(profiles):
+                try:
+                    problem = self.execute(profiles[name], dry)
+                except (subprocess.CalledProcessError, OSError) as error:  # one profile's executor must not stop the rest
+                    problem, failed = failure("execute", error), True
+                if problem:
+                    self.out(f"process: {name}: {problem}")
+        return 1 if failed else 0
+
+    def executor_lock(self):
+        """One executor at a time (proc's on quit, or a run's after triage), or both could send the same approved
+        review. Returns the held lock, released when closed or when this process exits; None if another holds it."""
+        self.state_root().mkdir(parents=True, exist_ok=True)
+        lock = (self.state_root() / "execute.lock").open("w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            return None
+        return lock
+
+    def execute(self, profile, dry):
+        """Run the executor phase for one profile when it has approved entries; return what went wrong, if anything.
+        A dry run (a dry-run state directory) gets --dry-run and no service tools."""
+        name, waiting = profile["name"], len(self.approved(profile["name"]))
+        if not waiting:
+            return None
+        if "execute" not in profile["phases"]:
+            return f"{name} has no [phases.execute]; {waiting} approved entr(ies) wait"
+        self.out(f"{name}: execute")
+        self.headless(profile, "execute", f"/execute {name}" + (" --dry-run" if dry else ""), dry)
+        if self.approved(name):
+            return f"execute left {len(self.approved(name))} approved entr(ies) without a result"
+
+    def approved(self, name):
+        """Entries waiting on the executor: approved by me, or promoted to silent, with an action that carries text."""
+        return [e for e in self.queue() if e["project"] == name and e["status"] == "approved" and needs_draft(e)]
+
+    def apply_decisions(self, profiles):
+        """Turn each decision on a still-pending entry into its new state. A decision on anything else is stale (the
+        entry was superseded or already decided) and changes nothing, so applying twice is a no-op."""
+        queue = {e["id"]: e for e in self.queue()}
+        path = self.state_root() / "decisions.jsonl"
+        for n, line in enumerate(path.read_text().splitlines() if path.exists() else [], 1):
+            if not line.strip():
+                continue
+            try:  # proc appends; a line it never finished must not block every decision after it
+                decision = json.loads(line)
+            except json.JSONDecodeError:
+                self.out(f"process: decision {n} ignored: not JSON")
+                continue
+            problems = validate(decision, "decision")
+            if problems:
+                self.out(f"process: decision {n} ignored: {problems[0]}")
+                continue
+            e = queue.get(decision["entry_id"])
+            if not e or e["status"] != "pending" or e["project"] not in profiles:
+                continue
+            if decision["verdict"] == "approve":
+                draft = decision.get("draft") or e["action"].get("draft", "")
+                did = "edited" if draft != e["action"].get("draft", "") else "approved"
+                e = {**e, "status": "approved", "action": {**e["action"], "draft": draft}}
+            else:
+                did, e = "skipped", {**e, "status": "skipped"}
+            # The entry leaves pending first, so a crash below can never teach the same decision twice.
+            self.append_jsonl(self.state_root() / "queue.jsonl", [e])
+            queue[e["id"]] = e
+            if e["status"] == "skipped":
+                self.handle(e["project"], [e], "skipped")
+            if (decision.get("promote_to_silent") or decision.get("reason", "").strip()) and self.real_profiles_in_dry_run():
+                self.out(f"process: dry run: {e['project']}'s profile is real, so no lesson or promotion is written")
+                continue
+            try:  # the profile is restored on a failed rewrite; the rest of the decisions still apply
+                if decision.get("promote_to_silent"):
+                    self.promote(e["project"], e["action"]["type"])
+                if decision.get("reason", "").strip():
+                    self.learn(e, did, decision["reason"])
+            except SystemExit as error:
+                self.out(f"{error.code}; edit the profile by hand")
+
+    def real_profiles_in_dry_run(self):
+        """A dry run may teach only scratch profiles: an XDG_CONFIG_HOME other than ~/.config."""
+        real = Path(self.env["HOME"]) / ".config" / "process" / "profiles"
+        return (self.state_root() / "dry-run").exists() and self.profiles_dir().resolve() == real.resolve()
+
+    def learn(self, e, did, reason):
+        """A lesson is my reason, word for word, never a paraphrase: the profile is read by every phase, so nothing
+        a phase read from a PR or a ticket may reach it."""
+        when = f"{datetime.fromtimestamp(self.clock()).astimezone():%Y-%m-%d}"
+        lesson = f"Lesson ({when}, I {did} a {e['action']['type']}): {' '.join(reason.split())}"
+        self.edit_profile(e["project"], lesson=lesson, changelog=f"Lesson from my reason on {e['id']}.")
+
+    def promote(self, name, action_type):
+        """Add an action type to the profile's autonomy overrides, so triage approves it without asking next time."""
+        silent = self.profile(name)["autonomy"]["silent"]
+        if action_type not in SCHEMA["$defs"]["profile"]["properties"]["autonomy"]["properties"]["silent"]["items"]["enum"]:
+            self.out(f"process: {name}: {action_type} cannot be silent; not promoted")
+        elif action_type not in silent:
+            self.edit_profile(name, silent=silent + [action_type], changelog=f"Promoted {action_type} to silent.")
+
+    def edit_profile(self, name, changelog, silent=None, lesson=None):
+        """Rewrite a profile in place: the autonomy overrides, a lesson at the end of How to sweep, and always a
+        Changelog line. The result must load cleanly, or the profile is left as it was."""
+        path = self.profiles_dir() / f"{name}.md"
+        text = path.read_text()
+        match = re.match(r"(\+\+\+\n.*?\n\+\+\+\n)(.*)", text, re.S)
+        front, body = match[1], match[2]
+        if silent is not None:
+            front = re.sub(r"^silent\s*=\s*\[[^\]]*\]", lambda _: "silent = " + json.dumps(silent), front, count=1, flags=re.M)
+        if lesson:
+            body = insert_in_section(body, "## How to sweep", f"- {lesson}")
+        body = insert_in_section(body, "## Changelog", f"- {datetime.fromtimestamp(self.clock()).astimezone():%Y-%m-%d} — {changelog}")
+        path.write_text(front + body)
+        try:
+            profile = load_profile(path)
+            if silent is not None and profile["autonomy"]["silent"] != silent:
+                raise SystemExit(f"process: {path}: could not rewrite autonomy.silent")
+        except SystemExit:
+            path.write_text(text)
+            raise
+
+    def execute_plan(self, name):
+        """Print every approved entry for the executor: its action, params, link and the exact text to send."""
+        self.profile(name)
+        entries = self.approved(name)
+        for e in entries:
+            self.out(f"{e['id']}  {e['action']['type']} {json.dumps(e['action']['params'])}  {e['summary']}  {e['link']}")
+            self.out(indent(e["action"]["draft"], "    | ", limit=None))
+        self.out(f"{len(entries)} approved entr(ies) for {name}")
+
+    def execute_result(self, name, entry_id, outcome, *args):
+        """Record what the executor did with one approved entry: success (--link), failure (--error), or skipped in a
+        dry run."""
+        opts = flags(args, "--link", "--error")
+        found = [e for e in self.approved(name) if e["id"] == entry_id]
+        if not found:
+            raise SystemExit(f"process: {entry_id} is not approved for {name}; the executor acts only on approved entries")
+        dry = (self.state_root() / "dry-run").exists()
+        if dry != (outcome == "skipped"):
+            raise SystemExit("process: a dry run records skipped" if dry else "process: only a dry run records skipped")
+        self.record(name, found[0], outcome, **{k[2:]: v for k, v in opts.items() if isinstance(v, str)})
+
+    def record(self, name, e, outcome, **details):
+        result = {"entry_id": e["id"], "outcome": outcome, **details, "at": iso(self.clock())}
+        problems = validate(result, "result")
+        if problems:
+            raise SystemExit("process: result not recorded:\n" + "\n".join(f"  {p}" for p in problems))
+        status = {"success": "done", "failure": "failed", "skipped": "skipped"}[outcome]
+        note = result.get("link") or result.get("error")
+        e = {**e, "status": status, **({"note": note} if note else {})}
+        self.append_jsonl(self.state_root() / "results.jsonl", [result])
+        self.append_jsonl(self.state_root() / "queue.jsonl", [e])
+        self.handle(name, [e], status)
+        worktree = self.profile_state(name) / "work" / e["id"]
+        if worktree.exists():
+            self.run(["git", "-C", str(self.workdir(self.profile(name))), "worktree", "remove", "--force", str(worktree)])
+        self.out(f"{e['id']}: {status}{': ' + note if note else ''}")
+
+    # Reviews and replies are sent here, not by a GitHub tool in the executor's allowlist: the text is exactly what I
+    # approved, the event is pinned, and a review tool could otherwise approve.
+
+    def send_entry(self, name, entry_id, action_type):
+        found = [e for e in self.approved(name) if e["id"] == entry_id and e["action"]["type"] == action_type]
+        if not found:
+            raise SystemExit(f"process: {entry_id} is not an approved {action_type} for {name}")
+        if (self.state_root() / "dry-run").exists():
+            raise SystemExit("process: a dry run touches no PR; record the entry as skipped")
+        return found[0]
+
+    def send(self, name, e, endpoint, body):
+        """POST one review or comment, then record the result: its URL, or the error."""
+        try:
+            response = self.run(["gh", "api", "-X", "POST", endpoint, "--input", "-"], input=json.dumps(body), cwd=self.workdir(self.profile(name)))
+        except (subprocess.CalledProcessError, OSError) as error:
+            problem = failure("send", error)
+            self.record(name, e, "failure", error=problem.removeprefix("send failed: "))
+            raise SystemExit(f"process: {problem}")
+        self.record(name, e, "success", link=json.loads(response)["html_url"])
+
+    def execute_review(self, name, entry_id):
+        """Submit an approved gh_review: its approved draft, as a COMMENT or REQUEST_CHANGES review."""
+        e = self.send_entry(name, entry_id, "gh_review")
+        params = e["action"]["params"]
+        if params.get("event") not in ("COMMENT", "REQUEST_CHANGES"):
+            raise SystemExit(f"process: {entry_id} asks for a {params.get('event')!r} review; the executor will never APPROVE")
+        self.send(name, e, f"repos/{params['repo']}/pulls/{params['number']}/reviews", {"event": params["event"], "body": e["action"]["draft"]})
+
+    def execute_reply(self, name, entry_id):
+        """Post an approved gh_thread_reply: the draft above its `## Fix` section, in the comment's own thread."""
+        e = self.send_entry(name, entry_id, "gh_thread_reply")
+        params = e["action"]["params"]
+        body = re.split(r"^## Fix\s*$", e["action"]["draft"], maxsplit=1, flags=re.M)[0].strip()
+        inline = re.search(r"#discussion_r(\d+)$", params.get("comment", ""))
+        endpoint = f"repos/{params['repo']}/pulls/{params['number']}/comments/{inline[1]}/replies" if inline else f"repos/{params['repo']}/issues/{params['number']}/comments"
+        self.send(name, e, endpoint, {"body": body})
+
+    # The executor fixes my PRs in a scratch worktree per entry, never in my own checkout, and pushes only here.
+
+    def fix_entry(self, name, entry_id):
+        found = [e for e in self.approved(name) if e["id"] == entry_id and e["action"]["type"] in ("gh_fix_pr", "gh_thread_reply")]
+        if not found:
+            raise SystemExit(f"process: {entry_id} is not an approved fix for {name}")
+        if (self.state_root() / "dry-run").exists():
+            raise SystemExit("process: a dry run touches no PR; record the entry as skipped")
+        return self.profile(name), found[0], self.profile_state(name) / "work" / entry_id
+
+    def my_open_pr(self, profile, e):
+        """The PR's branches, after checking it is mine, open and on the repo itself (a fork's branch is not mine)."""
+        repo, number = e["action"]["params"]["repo"], e["action"]["params"]["number"]
+        fields = "headRefName,baseRefName,author,isCrossRepository,state"
+        pr = json.loads(self.run(["gh", "pr", "view", str(number), "--repo", repo, "--json", fields], cwd=self.workdir(profile)))
+        me = self.run(["gh", "api", "user", "--jq", ".login"], cwd=self.workdir(profile)).strip()
+        if pr["author"]["login"] != me or pr["state"] != "OPEN" or pr["isCrossRepository"]:
+            raise SystemExit(f"process: {repo}#{number} is not my open PR on {repo}; the executor never touches it")
+        origin = self.run(["git", "-C", str(self.workdir(profile)), "remote", "get-url", "origin"]).strip()
+        if not re.fullmatch(rf"(https://|ssh://git@|git@)github\.com[:/]{re.escape(repo)}(\.git)?/?", origin, re.I):
+            raise SystemExit(f"process: the workdir's origin is not {repo} ({origin}); fetching or pushing there would miss the PR")
+        return pr
+
+    def execute_checkout(self, name, entry_id):
+        """Check out my PR's head in the entry's scratch worktree and print its path."""
+        profile, e, worktree = self.fix_entry(name, entry_id)
+        pr = self.my_open_pr(profile, e)
+        repo = str(self.workdir(profile))
+        self.run(["git", "-C", repo, "fetch", "origin", pr["headRefName"], pr["baseRefName"]])
+        if worktree.exists():  # left by a run that crashed before its result: start again from the PR's head
+            self.run(["git", "-C", repo, "worktree", "remove", "--force", str(worktree)])
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        self.run(["git", "-C", repo, "worktree", "add", "--detach", str(worktree), f"origin/{pr['headRefName']}"])
+        self.out(f"worktree: {worktree}\nhead: {pr['headRefName']}\nbase: origin/{pr['baseRefName']}")
+
+    def execute_git(self, name, entry_id, subcommand, *args):
+        """Run one git step of a fix in the entry's worktree. Pushing goes through `execute push` instead."""
+        _, _, worktree = self.fix_entry(name, entry_id)
+        if subcommand not in FIX_GIT:
+            raise SystemExit(f"process: git {subcommand} is not a fix step; use one of {', '.join(sorted(FIX_GIT))}")
+        refused = [a for a in args if fix_git_refused(a)]
+        if refused:
+            raise SystemExit(f"process: git {refused[0]} is not allowed in a fix: it reads or writes files outside the worktree")
+        try:
+            self.out(self.run(["git", "-C", str(worktree), subcommand, *args]).rstrip())
+        except subprocess.CalledProcessError as error:  # a merge conflict says what conflicts on stdout
+            raise SystemExit(f"process: git {subcommand} failed:\n{(error.stdout or '').strip()}\n{(error.stderr or '').strip()}".rstrip())
+
+    def execute_push(self, name, entry_id):
+        """Push the worktree's commits to my PR's branch: no force, no other branch. Prints the commit's link."""
+        profile, e, worktree = self.fix_entry(name, entry_id)
+        pr = self.my_open_pr(profile, e)
+        self.run(["git", "-C", str(worktree), "push", "origin", f"HEAD:refs/heads/{pr['headRefName']}"])
+        sha = self.run(["git", "-C", str(worktree), "rev-parse", "--short", "HEAD"]).strip()
+        self.out(f"pushed: https://github.com/{e['action']['params']['repo']}/pull/{e['action']['params']['number']}/commits/{sha}")
+
+    def handle(self, name, entries, outcome):
+        """Record entries' items in the ledger with how they ended, so the same version never comes back."""
+        at = iso(self.clock())
+        self.append_jsonl(self.profile_state(name) / "ledger.jsonl", [{"item_id": i, "at": at, "entry_id": e["id"], "outcome": outcome} for e in entries for i in e["item_ids"]])
+
     # -- the brief --
 
     def cmd_brief(self, *args):
@@ -515,19 +852,24 @@ class Process:
         latest = run.get("id") or max((e["run"] for e in queue), default=None)
         now = datetime.fromtimestamp(self.clock()).astimezone()
         midnight = iso(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        if opts.get("--delta"):
-            shown = lambda e: e["run"] == latest
-        else:
-            shown = lambda e: e["status"] == "pending" or e["created"] >= midnight
+        # An executor result shows until a brief of its own project has shown it; a full brief also shows today's.
+        last = self.read_json(self.state_root() / "brief.json", {})
+        results = self.read_jsonl(self.state_root() / "results.jsonl")
         mode = "delta" if opts.get("--delta") else "full"
         lines = [f"# Brief — {now:%a %Y-%m-%d %H:%M} · {mode}", ""]
         for name in names:
-            entries = [e for e in queue if e["project"] == name and e["status"] != "superseded" and shown(e)]
+            acted = {r["entry_id"] for r in results if r["at"] > last.get(name, "") or (mode == "full" and r["at"] >= midnight)}
+            if mode == "delta":
+                shown = [e for e in queue if e["run"] == latest or e["id"] in acted]
+            else:
+                shown = [e for e in queue if e["status"] in ("pending", "approved") or e["created"] >= midnight or e["id"] in acted]
+            entries = [e for e in shown if e["project"] == name and e["status"] != "superseded"]
             lines += [f"## {name}", ""] + [f"> ⚠ {p}" for p in run.get("problems", {}).get(name, [])]
-            lines += render_project(entries) or ["Nothing new.", ""]
+            lines += render_project(entries, acted) or ["Nothing new.", ""]
         brief = "\n".join(lines).rstrip() + "\n"
         self.state_root().mkdir(parents=True, exist_ok=True)
         (self.state_root() / "brief.md").write_text(brief)
+        self.write_json(self.state_root() / "brief.json", {**last, **{name: iso(self.clock()) for name in names}})
         archive = self.state_root() / "briefs" / f"{now:%Y-%m-%d}.md"
         archive.parent.mkdir(parents=True, exist_ok=True)
         with archive.open("a") as f:
@@ -540,6 +882,26 @@ class Process:
 
 
 BANKRUPTCY_AGE = 7 * 24 * 3600
+# A reviewer's nit, by the usual convention: the comment opens with "nit" (nit:, Nit —, [nit], nitpick).
+NIT = re.compile(r"\s*\[?nit(pick)?\b", re.I)
+# What a fix may do in its worktree: look, stage, commit, and merge the base branch in (never rebase, as open-pr).
+FIX_GIT = {"status", "diff", "log", "show", "add", "rm", "mv", "restore", "commit", "merge"}
+# Options that reach files outside the worktree (--output writes anywhere, -F/--file reads anywhere into a commit I then
+# push) or run external programs.
+FIX_GIT_REFUSED = {"output", "file", "template", "pathspec-from-file", "no-index", "ext-diff", "exec"}
+
+
+def fix_git_refused(arg):
+    """git takes any unambiguous prefix of a long option (--fil is --file), so refuse every prefix of a refused one.
+    Short -F and -t also match stuck forms like -Fpath."""
+    if arg.startswith("--"):
+        name = arg[2:].split("=", 1)[0]
+        return bool(name) and any(option.startswith(name) for option in FIX_GIT_REFUSED)
+    return bool(re.match(r"-[a-zA-Z]*[Ft]", arg))
+MERGE_BASE = (
+    "Merge the base branch into the PR branch (never rebase) and resolve the conflicts. Push only if every conflict is "
+    "mechanical: both sides kept, nothing about behaviour decided. Otherwise abort and report the conflicting files."
+)
 PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 
 
@@ -558,8 +920,16 @@ def notification(i):
     return (i.get("facts") or {}).get("notification_id")
 
 
-def indent(text, prefix):
-    return "\n".join(prefix + line for line in (text or "").splitlines()[:20])
+def insert_in_section(body, heading, line):
+    """Add a line at the end of a markdown section: before the next ## heading, or at the end of the body."""
+    start = body.index(heading) + len(heading)
+    end = body.find("\n## ", start)
+    end = len(body) if end == -1 else end + 1
+    return body[:end].rstrip("\n") + f"\n{line}\n" + ("\n" + body[end:] if end < len(body) else "")
+
+
+def indent(text, prefix, limit=20):
+    return "\n".join(prefix + line for line in (text or "").splitlines()[:limit])
 
 
 def mark_read(name, items, summary):
@@ -583,10 +953,12 @@ def mark_read(name, items, summary):
 URGENCY = ["urgent", "normal", "low"]
 
 
-def render_project(entries):
-    """One project's brief sections: Needs approval, Done silently, FYI (collapsed). Empty sections are left out."""
+def render_project(entries, acted=()):
+    """One project's brief sections: Needs approval, Approved (what the executor did with what I approved), Done
+    silently, FYI (collapsed). Empty sections are left out."""
     entries = sorted(entries, key=lambda e: (URGENCY.index(e["urgency"]), e["created"]))
     needs = [e for e in entries if e["status"] == "pending"]
+    approved = [e for e in entries if e["autonomy"] == "draft" and (e["status"] == "approved" or e["id"] in acted)]
     silent = [e for e in entries if e["autonomy"] == "silent" and e["status"] in ("approved", "done", "failed", "skipped")]
     fyi = [e for e in entries if e["status"] == "info"]
     lines = []
@@ -598,10 +970,14 @@ def render_project(entries):
             lines.append(f"- {'**urgent** · ' if e['urgency'] == 'urgent' else ''}{e['summary']} · {' + '.join(e['sources'])} · {e['link']}")
             lines.append(f"  `{e['action']['type']}`{ref}{' ' + params['event'] if 'event' in params else ''} · `{e['id']}`")
             lines += [f"  > {line}" for line in (e["action"].get("draft") or "").splitlines()] + [""]
+    words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped (dry run)"}
+    outcome = lambda e: f"{words[e['status']]}{': ' + e['note'] if e.get('note') else ''}"
+    if approved:
+        lines += [f"### Approved ({len(approved)})", ""]
+        lines += [f"- {e['summary']} · {e['link']}\n  `{e['action']['type']}` — {outcome(e)}" for e in approved] + [""]
     if silent:
         lines += [f"### Done silently ({len(silent)})", ""]
-        words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped (dry run)"}
-        lines += [f"- {e['summary']} — {words[e['status']]}{': ' + e['note'] if e.get('note') else ''}" for e in silent] + [""]
+        lines += [f"- {e['summary']} — {outcome(e)}" for e in silent] + [""]
     if fyi:
         lines += [f"### FYI ({len(fyi)})", "", "<details>", f"<summary>{len(fyi)} item(s)</summary>", ""]
         lines += [f"- {'**urgent** · ' if e['urgency'] == 'urgent' else ''}{e['summary']} · {e['link']}" for e in fyi]
@@ -615,19 +991,26 @@ def entry(name, profile, group):
     facts = {k: v for i in group for k, v in (i.get("facts") or {}).items()}
     pr = PULL.search(lead["subject"]) or PULL.search(lead["link"])
     ref = {"repo": pr[1], "number": int(pr[2])} if pr else None
-    action, summary, urgency = {"type": "none", "params": {}}, lead["summary"], "low"
+    action, summary, urgency, silent = {"type": "none", "params": {}}, lead["summary"], "low", False
     kind = lead["kind"]
     if kind == "review_request" and ref:
         action, urgency = {"type": "gh_review", "params": {**ref, "event": "COMMENT"}}, "normal"
     elif kind == "pr_status" and facts.get("mine") and ref:
         broken = facts.get("mergeable") == "conflicting" or facts.get("checks") == "failing" or facts.get("review") == "changes_requested"
         ready = facts.get("review") == "approved" and facts.get("checks") in ("passing", "none") and facts.get("mergeable") == "mergeable"
-        if broken:
+        conflict_only = facts.get("mergeable") == "conflicting" and facts.get("checks") != "failing" and facts.get("review") != "changes_requested"
+        if conflict_only:  # mechanical: brought up to date silently, the way open-pr does it
+            action, urgency, silent = {"type": "gh_fix_pr", "params": {**ref, "fix": "merge_base"}, "draft": MERGE_BASE}, "normal", True
+        elif broken:
             action, urgency = {"type": "gh_fix_pr", "params": ref}, "normal"
         elif ready:
             summary += " — approved and green; merging is yours"  # merge is a never action: say so, never queue it
     elif kind == "pr_comment" and ref:
-        action, urgency = {"type": "gh_fix_pr" if lead["actor"]["role"] == "bot" else "gh_thread_reply", "params": ref}, "normal"
+        # Fixed and pushed without asking: a bot's finding, or a nit from someone with a say in the repo. Anyone else's
+        # "nit" could ask for any code at all, so it waits for me like any other comment.
+        trivial = lead["actor"]["role"] == "bot" or (NIT.match(lead["context"]) and facts.get("collaborator"))
+        action = {"type": "gh_fix_pr" if trivial else "gh_thread_reply", "params": {**ref, "comment": canonical(lead["subject"])}}
+        urgency, silent = "normal", bool(trivial)
     elif kind in ("mention", "ticket_change"):
         urgency = "normal"
     rules = profile.get("urgency", {})
@@ -636,7 +1019,7 @@ def entry(name, profile, group):
     autonomy, status = "draft", "pending"
     if action["type"] == "none":
         autonomy, status = "silent", "info"
-    elif action["type"] in profile["autonomy"]["silent"]:
+    elif silent or action["type"] in profile["autonomy"]["silent"]:
         autonomy, status = "silent", "approved"
     ids = [i["id"] for i in group]
     return {
@@ -653,6 +1036,11 @@ def entry(name, profile, group):
         "action": action,
         "status": status,
     }
+
+
+def failure(phase, error):
+    stderr = getattr(error, "stderr", None) or ""
+    return f"{phase} failed: {(stderr.strip().splitlines() or [str(error)])[-1]}"
 
 
 class Usage(Exception):
@@ -690,7 +1078,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: process <run|emit|watermark|triage|brief|profile|profiles|validate> ...")
+        app.out("usage: process <run|emit|watermark|triage|execute|brief|profile|profiles|validate> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command.replace("-", "_"), None)
