@@ -1159,6 +1159,21 @@ class NextWorkRankingTest(NextWorkTestCase):
         self.assertTrue(all(r["reason"].strip() for r in result["recommendations"]))
         self.assertEqual(self.process("validate", "next_work", str(self.profile_dir() / "next.json")), "")
 
+    def test_fixes_waiting_on_me_on_my_own_prs_come_before_any_ticket(self):
+        self.emit(
+            my_pr(8, mergeable="mergeable", checks="failing", review="review_required"),
+            item(native_id="comment/9001", kind="pr_comment", subject="https://github.com/acme/widgets/pull/8#issuecomment-9001", summary="Ana asks why offset pagination", facts={"collaborator": True}),
+            item(native_id="comment/9002", kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#discussion_r9002", actor={"name": "lint-bot", "role": "bot"}, summary="Unused import on #7"),
+        )
+        self.triage()
+
+        _, result = self.next_work(ticket("WID-5", state="in_progress", assignee="me", priority=1))
+
+        self.assertEqual(self.picks(result), ["acme/widgets#8", "WID-5"])  # the bot's fix on #7 is the executor's, not mine
+        [fix] = [r for r in result["recommendations"] if r["tier"] == "pr_fix"]
+        self.assertEqual(fix["link"], "https://github.com/acme/widgets/pull/8")
+        self.assertIn("2 fixes waiting", fix["reason"])
+
     def test_in_staging_tickets_never_take_a_slot(self):
         _, result = self.next_work(ticket("WID-1", state="in_staging", assignee="me", priority=1), ticket("WID-2"))
 

@@ -569,7 +569,8 @@ class Process:
             ("in_progress", [t for t in free if t["state"] == "in_progress" and t["assignee"] == "me"]),
             ("todo", [t for t in free if t["state"] == "todo" and t["assignee"] != "other"]),
         ]
-        picks = [recommend(tier, t, now) for tier, group in tiers for t in sorted(group, key=ticket_order)][:NEXT_SLOTS]
+        picks = self.pr_fixes(name) + [recommend(tier, t, now) for tier, group in tiers for t in sorted(group, key=ticket_order)]
+        picks = picks[:NEXT_SLOTS]
         result = {"profile": name, "at": iso(now), "recommendations": picks, "afk": []}
         problems = validate(result, "next_work")
         if problems:
@@ -579,6 +580,24 @@ class Process:
             path.unlink()
         for n, r in enumerate(picks, 1):
             self.out(f"{n}. {r['ref']}  {r['title']}  — {r['reason']}  {r['link']}")
+
+    def pr_fixes(self, name):
+        """One recommendation per PR of mine with fixes waiting on my approval, most urgent first. Silent fixes are the
+        executor's, not mine."""
+        prs = {}
+        for e in sorted(self.queue(), key=lambda e: (URGENCY.index(e["urgency"]), e["created"])):
+            if e["project"] == name and e["status"] == "pending" and e["action"]["type"] in ("gh_fix_pr", "gh_thread_reply"):
+                prs.setdefault((e["action"]["params"]["repo"], e["action"]["params"]["number"]), []).append(e)
+        return [
+            {
+                "tier": "pr_fix",
+                "ref": f"{repo}#{number}",
+                "title": fixes[0]["summary"],
+                "link": f"https://github.com/{repo}/pull/{number}",
+                "reason": f"My own PR: {len(fixes)} fix{'es' if len(fixes) > 1 else ''} waiting on me, first {fixes[0]['summary']}",
+            }
+            for (repo, number), fixes in prs.items()
+        ]
 
     # -- executor side --
 
