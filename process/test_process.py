@@ -22,7 +22,9 @@ class FakeRun:
         if not matches:
             return ""
         response = self.responses[max(matches, key=len)]
-        return response(cmd) if callable(response) else response
+        if not callable(response):
+            return response
+        return response(cmd, input=input) if input is not None else response(cmd)
 
 
 # 2026-10-20T13:00:00Z, 08:00 in Chicago.
@@ -123,7 +125,7 @@ class ProcessTestCase(unittest.TestCase):
     def state(self):
         return self.tmp / "state" / "process"
 
-    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Read", "Bash(process execute:*)"), text=None):
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Bash(process execute plan:*)", "Bash(process execute result:*)"), text=None):
         path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -627,7 +629,7 @@ class ExecuteTest(ExecuteTestCase):
         self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
 
     def test_the_executor_runs_headless_with_its_send_tools_but_never_a_merge(self):
-        self.write_profile(execute_tools=["Read", "Bash(process execute:*)", "mcp__github__pull_request_review_write"])
+        self.write_profile(execute_tools=["Bash(process execute plan:*)", "mcp__github__add_issue_comment"])
         self.emit(item())
         [review] = self.triage()
         self.decide(review)
@@ -636,12 +638,14 @@ class ExecuteTest(ExecuteTestCase):
 
         [cmd] = self.executor_calls()
         opt = lambda name: cmd[cmd.index(name) + 1].split(",")
-        self.assertIn("mcp__github__pull_request_review_write", opt("--allowedTools"))
-        self.assertNotIn("mcp__github__pull_request_review_write", opt("--disallowedTools"))
+        self.assertIn("mcp__github__add_issue_comment", opt("--allowedTools"))
+        self.assertNotIn("mcp__github__add_issue_comment", opt("--disallowedTools"))
+        self.assertIn("mcp__github__pull_request_review_write", opt("--disallowedTools"))
         self.assertIn("mcp__github__merge_pull_request", opt("--disallowedTools"))
         self.assertIn("Bash(git push:*)", opt("--disallowedTools"))
         work = self.profile_dir() / "work"
         self.assertIn(f"Edit(/{work}/**)", opt("--allowedTools"))  # a fix edits files in its scratch worktree only
+        self.assertIn(f"Read(/{work}/**)", opt("--allowedTools"))
         self.assertEqual(cmd[cmd.index("--add-dir") + 1:cmd.index("--add-dir") + 3], [str(self.profile_dir() / "inbox"), str(work)])
         self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
         self.assertEqual(cmd[cmd.index("--model") + 1], "opus")
@@ -814,6 +818,75 @@ class ExecutorStepsTest(ExecuteTestCase):
         self.assertIn("not approved", out)
         self.assertEqual(self.jsonl(self.state / "results.jsonl"), [])
         self.assertEqual(self.entry(self.waiting["id"])["status"], "pending")
+
+
+class SendTest(ExecuteTestCase):
+    """Reviews and replies go out through `process execute`, which posts exactly the approved text and pins the event."""
+
+    def setUp(self):
+        super().setUp()
+        self.posted = []
+
+        def api(cmd, input=None):
+            self.posted.append((cmd, json.loads(input)))
+            return json.dumps({"html_url": "https://github.com/acme/widgets/pull/101#pullrequestreview-77"})
+
+        self.run_fake.responses[("gh", "api", "-X", "POST")] = api
+        self.emit(item(), item(kind="pr_comment", native_id="comment/5", subject="https://github.com/acme/widgets/pull/8#discussion_r5", summary="Ana on #8"), item(kind="pr_comment", native_id="comment/6", subject="https://github.com/acme/widgets/pull/8#issuecomment-6", summary="Ben on #8"))
+        self.review, self.inline, self.top = self.triage()
+
+    def test_review_posts_the_approved_draft_with_its_pinned_event_and_records_the_result(self):
+        self.decide(self.review, draft="Does the export stream?")
+        self.process("execute")
+
+        self.process("execute", "review", "acme", self.review["id"])
+
+        [(cmd, body)] = self.posted
+        self.assertEqual(cmd[:5], ["gh", "api", "-X", "POST", "repos/acme/widgets/pulls/101/reviews"])
+        self.assertEqual(body, {"event": "COMMENT", "body": "Does the export stream?"})
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual((result["outcome"], result["link"]), ("success", "https://github.com/acme/widgets/pull/101#pullrequestreview-77"))
+
+    def test_an_approving_event_is_never_posted_even_if_the_queue_was_edited(self):
+        self.decide(self.review)
+        self.process("execute")
+        with (self.state / "queue.jsonl").open("a") as f:
+            f.write(json.dumps({**self.entry(self.review["id"]), "action": {**self.review["action"], "params": {**self.review["action"]["params"], "event": "APPROVE"}}}) + "\n")
+
+        self.assertIn("never APPROVE", self.process("execute", "review", "acme", self.review["id"], expect=1))
+        self.assertEqual(self.posted, [])
+
+    def test_reply_posts_the_text_above_the_fix_section_to_the_comments_thread(self):
+        self.decide(self.inline, draft="Good catch, switching to cursors.\n\n## Fix\n\n1. Use a cursor.")
+        self.decide(self.top, draft="Thanks, done.")
+        self.process("execute")
+
+        self.process("execute", "reply", "acme", self.inline["id"])
+        self.process("execute", "reply", "acme", self.top["id"])
+
+        (inline, inline_body), (top, top_body) = self.posted
+        self.assertEqual(inline[4], "repos/acme/widgets/pulls/8/comments/5/replies")
+        self.assertEqual(inline_body, {"body": "Good catch, switching to cursors."})
+        self.assertEqual(top[4], "repos/acme/widgets/issues/8/comments")
+        self.assertEqual(top_body, {"body": "Thanks, done."})
+        self.assertEqual([r["outcome"] for r in self.jsonl(self.state / "results.jsonl")], ["success", "success"])
+
+    def test_a_failed_send_is_recorded_as_a_failure(self):
+        self.decide(self.review)
+        self.process("execute")
+        self.run_fake.responses[("gh", "api", "-X", "POST")] = lambda cmd, input=None: (_ for _ in ()).throw(process.subprocess.CalledProcessError(1, cmd, stderr="HTTP 403: Resource not accessible\n"))
+
+        self.process("execute", "review", "acme", self.review["id"], expect=1)
+
+        [result] = self.jsonl(self.state / "results.jsonl")
+        self.assertEqual((result["outcome"], result["error"]), ("failure", "HTTP 403: Resource not accessible"))
+
+    def test_send_steps_are_only_for_approved_entries_of_their_type(self):
+        self.assertIn("not an approved gh_review", self.process("execute", "review", "acme", self.review["id"], expect=1))
+        self.decide(self.review)
+        self.process("execute")
+        self.assertIn("not an approved gh_thread_reply", self.process("execute", "reply", "acme", self.review["id"], expect=1))
+        self.assertEqual(self.posted, [])
 
 
 class FixPrTest(ExecuteTestCase):
@@ -1068,7 +1141,7 @@ class RunTest(ProcessTestCase):
         self.assertIn("> ⚠ execute left 1 approved entr(ies) without a result", (self.state / "brief.md").read_text())
 
     def test_a_dry_run_executes_as_a_dry_run_with_no_service_tools(self):
-        self.write_profile("acme", execute_tools=["Read", "Bash(process execute:*)", "mcp__github__pull_request_review_write"])
+        self.write_profile("acme", execute_tools=["Bash(process execute plan:*)", "mcp__github__add_issue_comment"])
 
         prompts = self.silent_fix_run("--fixtures", "/fx")
 
@@ -1189,15 +1262,19 @@ class ProfileTest(ProcessTestCase):
 
     # Tools that send what I approved: the executor's, and only the executor's.
     EXECUTOR_TOOLS = [
-        "mcp__github__pull_request_review_write",
         "mcp__github__add_issue_comment",
         "mcp__github__add_reply_to_pull_request_comment",
         "mcp__slack__slack_send_message",
-        "Bash(process execute:*)",
+        "Bash(process execute review:*)",
+        "Bash(process execute reply:*)",
+        "Bash(process execute push:*)",
     ]
     # Never actions, or tools broad enough to reach one. No phase may hold them, the executor included.
     NEVER_TOOLS = [
         "mcp__github__merge_pull_request",
+        "mcp__github__pull_request_review_write",  # its event can be APPROVE: reviews go through `process execute review`
+        "Bash(process execute:*)",  # a bare `process execute` would start a second executor on the same entries
+        "Read",  # the executor pushes code, so it reads only its worktree: nothing else can end up in a commit
         "Bash(gh pr merge:*)",
         "Bash(gh pr review:*)",
         "Bash(gh api:*)",
@@ -1217,14 +1294,14 @@ class ProfileTest(ProcessTestCase):
     ]
 
     def test_the_executor_may_hold_send_tools(self):
-        self.write_profile(execute_tools=["Read", *self.EXECUTOR_TOOLS])
+        self.write_profile(execute_tools=self.EXECUTOR_TOOLS)
 
         self.assertIn("acme  active", self.process("profiles"))
 
     def test_no_phase_may_hold_a_never_tool_not_even_the_executor(self):
         for tool in self.NEVER_TOOLS:
             with self.subTest(tool=tool):
-                self.write_profile(execute_tools=["Read", tool])
+                self.write_profile(execute_tools=["Bash(process execute plan:*)", tool])
                 self.assertIn(f"phases.execute grants {tool!r}", self.process("profiles", expect=1))
 
     def test_a_profile_missing_its_how_to_sweep_section_is_refused(self):
@@ -1242,7 +1319,7 @@ class ProfileTest(ProcessTestCase):
                 for phase in phases.values():
                     self.assertFalse(set(phase["allowed_tools"]) & set(self.SEND_TOOLS + self.EXECUTOR_TOOLS))
                     self.assertEqual([t for t in phase["allowed_tools"] if process.forbidden_tool(t)], [])
-                self.assertIn("mcp__github__pull_request_review_write", executor)
+                self.assertIn("Bash(process execute review:*)", executor)
                 self.assertFalse(set(executor) & set(self.NEVER_TOOLS))
                 self.assertEqual([t for t in executor if process.never_tool(t)], [])
 

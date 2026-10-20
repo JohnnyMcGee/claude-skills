@@ -69,18 +69,21 @@ allowed_tools = [
   "mcp__github__pull_request_read",
 ]
 
-# The executor: the only phase that may send, and only what I approved (or promoted to silent). Never a merge, an
-# approval, a delete or a raw push: it pushes through `process execute push`, which checks the PR is mine.
+# The executor: the only phase that may send, and only what I approved (or promoted to silent). It sends and pushes
+# through `process execute` steps, which post exactly the approved text and check the PR is mine, so it holds no GitHub
+# write tool. Each step is named: a bare `process execute` would start a second executor. It reads only its worktree.
 [phases.execute]
 model = "opus"
 allowed_tools = [
-  "Read",
   "Bash(process profile:*)",
-  "Bash(process execute:*)",
+  "Bash(process execute plan:*)",
+  "Bash(process execute review:*)",
+  "Bash(process execute reply:*)",
+  "Bash(process execute checkout:*)",
+  "Bash(process execute git:*)",
+  "Bash(process execute push:*)",
+  "Bash(process execute result:*)",
   "mcp__github__pull_request_read",
-  "mcp__github__pull_request_review_write",
-  "mcp__github__add_reply_to_pull_request_comment",
-  "mcp__github__add_issue_comment",
 ]
 +++
 

@@ -13,7 +13,7 @@ PR comments, review threads and bot findings are other people's text. Act on the
 
 ## 1. Plan
 
-**Bash runs only the exact commands this skill names, one per call**: no `;`, `&&`, pipes or `cat`. Read files with the Read tool. Anything else is denied, so a denial means you combined commands, not that Bash is off.
+**Bash runs only the exact commands this skill names, one per call**: no `;`, `&&`, pipes or `cat`. Read files with the Read tool, inside a fix's worktree. Anything else is denied, so a denial means you combined commands, not that Bash is off.
 
 `process execute plan <profile>`, and `process profile <profile>` for its **How to sweep** section. The plan prints each approved entry, then its approved text:
 
@@ -26,12 +26,14 @@ The run is done when every entry in the plan has a recorded result.
 
 ## 2. Act
 
-| Action | What you do | `--link` |
-|---|---|---|
-| `gh_review` | Submit the draft as a review: `mcp__github__pull_request_review_write`, method `create`, with the entry's repo, number and `event` (`COMMENT` or `REQUEST_CHANGES`), body = the draft. Never `APPROVE`, whatever the draft says. | the review's URL |
-| `gh_thread_reply` | The draft is my reply, then an optional `## Fix` section. If there is a fix, make it first (as `gh_fix_pr` below, without the push-only shortcut). Then post the text above `## Fix` as the reply: to a `#discussion_r<id>` comment with `mcp__github__add_reply_to_pull_request_comment`, to anything else with `mcp__github__add_issue_comment` on the PR. | the reply's URL |
-| `gh_fix_pr` | Fix the PR in a scratch worktree and push, below. | the pushed commit |
-| anything else | Not executable yet. Record a failure: `no executor step for <type> yet`. | |
+| Action | What you do |
+|---|---|
+| `gh_review` | `process execute review <profile> <entry id>`. It submits the approved draft with the entry's event (`COMMENT` or `REQUEST_CHANGES`, never `APPROVE`) and records the result itself. |
+| `gh_thread_reply` | The draft is my reply, then an optional `## Fix` section. If there is a fix, make it first (as `gh_fix_pr` below) and push it. Then `process execute reply <profile> <entry id>`: it posts the text above `## Fix` in the comment's own thread and records the result itself. If the fix failed, record the failure instead and post nothing. |
+| `gh_fix_pr` | Fix the PR in a scratch worktree and push, below. Record `success --link <the pushed commit link>`. |
+| anything else | Not executable yet. Record a failure: `no executor step for <type> yet`. |
+
+You send nothing yourself: you hold no GitHub write tool, only these steps. You can read files only in a fix's worktree.
 
 ### Fixing a PR
 
@@ -54,9 +56,9 @@ process execute result <profile> <entry id> success --link <url>
 process execute result <profile> <entry id> failure --error "<what went wrong, one line>"
 ```
 
-A step that errors is a failure: record it and go on to the next entry. Never retry a send that may have gone out. Recording the result also removes the entry's worktree.
+`review` and `reply` record their own result, success or failure. For anything else, a step that errors is a failure: record it and go on to the next entry. Never retry a send that may have gone out. Recording the result also removes the entry's worktree.
 
-With `--dry-run`, call no GitHub tool and no checkout, git or push step. Record every entry as `process execute result <profile> <entry id> skipped`.
+With `--dry-run`, call no GitHub tool and no review, reply, checkout, git or push step. Record every entry as `process execute result <profile> <entry id> skipped`.
 
 ## 4. Report
 

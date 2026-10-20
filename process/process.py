@@ -125,7 +125,11 @@ def forbidden_tool(tool):
 
 # Never actions, or what reaches one: merging, approving, deleting, deploying, and pushing (the executor pushes only
 # through `process execute push`, which checks the branch is my PR's). No phase may hold these, the executor included.
-NEVER_WORDS = re.compile(r"merge|approve|delete|deploy|release|push|create_or_update_file|transfer|fork|secret")
+EXECUTE_STEPS = {"plan", "review", "reply", "checkout", "git", "push", "result"}
+# A review tool is one too: its event can be APPROVE, so reviews go through `process execute review`, which pins it.
+NEVER_WORDS = re.compile(r"merge|approve|review_write|delete|deploy|release|push|create_or_update_file|transfer|fork|secret")
+# The executor pushes code, so it reads only its worktree (granted per run): nothing else can end up in a commit.
+EXECUTOR_UNSCOPED = {"Read", "Glob", "Grep"}
 
 
 def never_tool(tool):
@@ -133,9 +137,11 @@ def never_tool(tool):
     bash = re.fullmatch(r"Bash\((.*)\)", tool)
     if bash:
         words = bash[1].removesuffix(":*").removesuffix("*").split()
-        too_broad = len(words) < 2 or words[0] in LAUNCHERS or words[0] in ("gh", "git") and (len(words) < 3 or words[1] == "api")
+        too_broad = len(words) < 2 or words[0] in LAUNCHERS or (words[0] in ("gh", "git") and (len(words) < 3 or words[1] == "api"))
+        if words[:2] == ["process", "execute"]:  # its steps are the guarded way to send and push; bare, a second executor
+            return len(words) < 3 or words[2] not in EXECUTE_STEPS
         return too_broad or words[:3] == ["gh", "pr", "review"] or bool(NEVER_WORDS.search(" ".join(words)))
-    if tool in UNSCOPED or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
+    if tool in UNSCOPED | EXECUTOR_UNSCOPED or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
         return True
     return bool(NEVER_WORDS.search(tool.lower()))
 
@@ -367,7 +373,7 @@ class Process:
         if phase == "execute":
             dirs.append(self.profile_state(profile["name"]) / "work")  # a fix edits files in its scratch worktree only
             dirs[-1].mkdir(exist_ok=True)
-        tools += [f"Edit(/{d}/**)" for d in dirs]
+        tools += [f"Edit(/{d}/**)" for d in dirs] + ([f"Read(/{d}/**)" for d in dirs] if phase == "execute" else [])
         workdir = self.workdir(profile)
         cmd = ["claude", "-p", prompt, "--model", config["model"], "--permission-mode", "dontAsk"]
         denied = NEVER_DENIED if phase == "execute" else DENIED_TOOLS
@@ -545,8 +551,16 @@ class Process:
     def cmd_execute(self, *args):
         """Apply proc's decisions to the queue, then run the executor headless for each profile (or --project) that
         has approved actions waiting. proc runs this when I quit it; `process run` runs it after triage. The executor
-        skill drives the steps: `process execute plan|result <profile> ...`."""
-        steps = {"plan": self.execute_plan, "result": self.execute_result, "checkout": self.execute_checkout, "git": self.execute_git, "push": self.execute_push}
+        skill drives the steps: `process execute plan|review|reply|checkout|git|push|result <profile> ...`."""
+        steps = {
+            "plan": self.execute_plan,
+            "result": self.execute_result,
+            "review": self.execute_review,
+            "reply": self.execute_reply,
+            "checkout": self.execute_checkout,
+            "git": self.execute_git,
+            "push": self.execute_push,
+        }
         if args and args[0] in steps:
             return call(steps[args[0]], args[1:], f"execute {args[0]}")
         opts = flags(args, "--project")
@@ -681,20 +695,61 @@ class Process:
         dry = (self.state_root() / "dry-run").exists()
         if dry != (outcome == "skipped"):
             raise SystemExit("process: a dry run records skipped" if dry else "process: only a dry run records skipped")
-        result = {"entry_id": entry_id, "outcome": outcome, **{k[2:]: v for k, v in opts.items() if isinstance(v, str)}, "at": iso(self.clock())}
+        self.record(name, found[0], outcome, **{k[2:]: v for k, v in opts.items() if isinstance(v, str)})
+
+    def record(self, name, e, outcome, **details):
+        result = {"entry_id": e["id"], "outcome": outcome, **details, "at": iso(self.clock())}
         problems = validate(result, "result")
         if problems:
             raise SystemExit("process: result not recorded:\n" + "\n".join(f"  {p}" for p in problems))
         status = {"success": "done", "failure": "failed", "skipped": "skipped"}[outcome]
         note = result.get("link") or result.get("error")
-        e = {**found[0], "status": status, **({"note": note} if note else {})}
+        e = {**e, "status": status, **({"note": note} if note else {})}
         self.append_jsonl(self.state_root() / "results.jsonl", [result])
         self.append_jsonl(self.state_root() / "queue.jsonl", [e])
         self.handle(name, [e], status)
-        worktree = self.profile_state(name) / "work" / entry_id
+        worktree = self.profile_state(name) / "work" / e["id"]
         if worktree.exists():
             self.run(["git", "-C", str(self.workdir(self.profile(name))), "worktree", "remove", "--force", str(worktree)])
-        self.out(f"{entry_id}: {status}")
+        self.out(f"{e['id']}: {status}{': ' + note if note else ''}")
+
+    # Reviews and replies are sent here, not by a GitHub tool in the executor's allowlist: the text is exactly what I
+    # approved, the event is pinned, and a review tool could otherwise approve.
+
+    def send_entry(self, name, entry_id, action_type):
+        found = [e for e in self.approved(name) if e["id"] == entry_id and e["action"]["type"] == action_type]
+        if not found:
+            raise SystemExit(f"process: {entry_id} is not an approved {action_type} for {name}")
+        if (self.state_root() / "dry-run").exists():
+            raise SystemExit("process: a dry run touches no PR; record the entry as skipped")
+        return found[0]
+
+    def send(self, name, e, endpoint, body):
+        """POST one review or comment, then record the result: its URL, or the error."""
+        try:
+            response = self.run(["gh", "api", "-X", "POST", endpoint, "--input", "-"], input=json.dumps(body), cwd=self.workdir(self.profile(name)))
+        except (subprocess.CalledProcessError, OSError) as error:
+            problem = failure("send", error)
+            self.record(name, e, "failure", error=problem.removeprefix("send failed: "))
+            raise SystemExit(f"process: {problem}")
+        self.record(name, e, "success", link=json.loads(response)["html_url"])
+
+    def execute_review(self, name, entry_id):
+        """Submit an approved gh_review: its approved draft, as a COMMENT or REQUEST_CHANGES review."""
+        e = self.send_entry(name, entry_id, "gh_review")
+        params = e["action"]["params"]
+        if params.get("event") not in ("COMMENT", "REQUEST_CHANGES"):
+            raise SystemExit(f"process: {entry_id} asks for a {params.get('event')!r} review; the executor will never APPROVE")
+        self.send(name, e, f"repos/{params['repo']}/pulls/{params['number']}/reviews", {"event": params["event"], "body": e["action"]["draft"]})
+
+    def execute_reply(self, name, entry_id):
+        """Post an approved gh_thread_reply: the draft above its `## Fix` section, in the comment's own thread."""
+        e = self.send_entry(name, entry_id, "gh_thread_reply")
+        params = e["action"]["params"]
+        body = re.split(r"^## Fix\s*$", e["action"]["draft"], maxsplit=1, flags=re.M)[0].strip()
+        inline = re.search(r"#discussion_r(\d+)$", params.get("comment", ""))
+        endpoint = f"repos/{params['repo']}/pulls/{params['number']}/comments/{inline[1]}/replies" if inline else f"repos/{params['repo']}/issues/{params['number']}/comments"
+        self.send(name, e, endpoint, {"body": body})
 
     # The executor fixes my PRs in a scratch worktree per entry, never in my own checkout, and pushes only here.
 
