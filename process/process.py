@@ -432,7 +432,8 @@ class Process:
         path = opts.get("--file") and self.inbox_file(profile, opts["--file"])
         text = path.read_text() if path else self.stdin.read()
         group = self.share_group(profile, source)
-        known = {}
+        # Known to any profile the feed serves: a reworded summary can attribute the same item elsewhere next time.
+        known = {i["id"] for n in [*group, UNSORTED] for i in self.read_jsonl(self.state_root() / "profiles" / n / "items.jsonl")}
         fresh, problems, answered = [], [], 0
         for n, candidate in enumerate(self.parse_jsonl(text, "item"), 1):
             candidate.pop("id", None)
@@ -443,14 +444,13 @@ class Process:
             problems += [f"item {n}: {e}" for e in errors]
             if errors:
                 continue
-            if len(group) > 1:
-                record["profile"] = next((n for n, p in group.items() if claims(p, record)), UNSORTED)
-            if record["profile"] not in known:
-                known[record["profile"]] = {i["id"] for i in self.read_jsonl(self.profile_state(record["profile"]) / "items.jsonl")}
+            if len(group) > 1:  # unclaimed noise stays with the sweeping profile, whose triage archives it
+                noise = (record.get("facts") or {}).get("noise")
+                record["profile"] = next((n for n, p in group.items() if claims(p, record)), profile if noise else UNSORTED)
             if (record.get("facts") or {}).get("answered"):  # I already replied or reacted: not an ask any more
                 answered += 1
-            elif record["id"] not in known[record["profile"]]:
-                known[record["profile"]].add(record["id"])
+            elif record["id"] not in known:
+                known.add(record["id"])
                 fresh.append(record)
         if problems:
             raise SystemExit("process: nothing stored, invalid items:\n" + "\n".join(problems))

@@ -321,6 +321,24 @@ class EmitTest(ProcessTestCase):
         for name in ("acme", "side"):
             self.assertEqual(self.process("watermark", name, "slack").strip(), "2026-10-20T13:00:00Z")
 
+    def test_an_item_already_stored_for_any_profile_sharing_the_feed_is_not_stored_again(self):
+        self.write_profile("acme", sources=ALL_SOURCES, match={"keywords": ["widgets"]})
+        self.write_profile("side", sources=ALL_SOURCES, repo="acme/gadgets", team="GAD")
+        self.emit(email(summary="Cal asked about the widgets security review"), source="gmail")
+
+        out = self.emit(email(summary="Cal asked about the security review"), source="gmail")  # reworded: acme no longer claims it
+
+        self.assertIn("stored 0 new item(s)", out)
+        self.assertFalse((self.profile_dir("unsorted") / "items.jsonl").exists())
+
+    def test_noise_no_profile_claims_goes_to_the_sweeping_profile_to_be_archived(self):
+        self.write_profile("acme", sources=ALL_SOURCES)
+        self.write_profile("side", sources=ALL_SOURCES, repo="acme/gadgets", team="GAD")
+
+        self.emit(email(actor={"name": "news@vendor.example", "role": "bot"}, summary="Vendor newsletter", context="tips", facts={"noise": True}), profile="side", source="gmail")
+
+        self.assertEqual([i["profile"] for i in self.jsonl(self.profile_dir("side") / "items.jsonl")], ["side"])
+
     def test_a_source_no_other_active_profile_shares_takes_every_item(self):
         self.write_profile("acme", sources=ALL_SOURCES)
         self.write_profile("side", sources=ALL_SOURCES, workspace="gadgets", account="me@gadgets.example", match={"keywords": ["lunch"]})

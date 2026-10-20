@@ -1,19 +1,19 @@
 {
   "me": {"email": "me@acme.example"},
   "events": [
-    {"id": "event-1", "summary": "Export design review", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-1", "updated": "now", "start": "2026-10-28T19:00:00Z", "end": "2026-10-28T19:30:00Z", "organizer": "dee@acme.example", "description": "Walk through the CSV export design.", "attendees": [
+    {"id": "event-1", "summary": "Export design review", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-1", "updated": "2026-10-19T15:00:00Z", "start": "2026-10-28T19:00:00Z", "end": "2026-10-28T19:30:00Z", "organizer": "dee@acme.example", "description": "Walk through the CSV export design.", "attendees": [
       {"email": "me@acme.example", "responseStatus": "needsAction"}, {"email": "dee@acme.example", "responseStatus": "accepted"}, {"email": "ana@acme.example", "responseStatus": "accepted"}
     ]},
-    {"id": "event-2", "summary": "1:1 with Ana", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-2", "updated": "now", "start": "2026-10-29T15:00:00Z", "end": "2026-10-29T15:30:00Z", "organizer": "me@acme.example", "description": "", "attendees": [
+    {"id": "event-2", "summary": "1:1 with Ana", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-2", "updated": "2026-10-19T15:00:00Z", "start": "2026-10-29T15:00:00Z", "end": "2026-10-29T15:30:00Z", "organizer": "me@acme.example", "description": "", "attendees": [
       {"email": "me@acme.example", "responseStatus": "accepted"}, {"email": "ana@acme.example", "responseStatus": "accepted"}
     ]},
-    {"id": "event-3", "summary": "Vendor sync: payments API", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-3", "updated": "now", "start": "2026-10-29T15:00:00Z", "end": "2026-10-29T16:00:00Z", "organizer": "ben@acme.example", "description": "Quarterly sync with the payments vendor.", "attendees": [
+    {"id": "event-3", "summary": "Vendor sync: payments API", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-3", "updated": "2026-10-19T15:00:00Z", "start": "2026-10-29T15:00:00Z", "end": "2026-10-29T16:00:00Z", "organizer": "ben@acme.example", "description": "Quarterly sync with the payments vendor.", "attendees": [
       {"email": "me@acme.example", "responseStatus": "needsAction"}, {"email": "ben@acme.example", "responseStatus": "accepted"}, {"email": "rep@payments.example", "responseStatus": "accepted"}
     ]},
-    {"id": "event-4", "summary": "Team trivia", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-4", "updated": "now", "start": "2026-10-29T15:15:00Z", "end": "2026-10-29T16:00:00Z", "organizer": "cal@acme.example", "description": "Optional.", "attendees": [
+    {"id": "event-4", "summary": "Team trivia", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-4", "updated": "2026-10-19T15:00:00Z", "start": "2026-10-29T15:15:00Z", "end": "2026-10-29T16:00:00Z", "organizer": "cal@acme.example", "description": "Optional.", "attendees": [
       {"email": "me@acme.example", "responseStatus": "needsAction"}, {"email": "cal@acme.example", "responseStatus": "accepted"}
     ]},
-    {"id": "event-5", "summary": "Q1 planning", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-5", "updated": "now", "start": "2026-10-30T16:00:00Z", "end": "2026-10-30T17:00:00Z", "organizer": "boss@acme.example", "description": "Plan Q1 for the widgets team.", "attendees": [
+    {"id": "event-5", "summary": "Q1 planning", "htmlLink": "https://calendar.google.com/calendar/event?eid=event-5", "updated": "2026-10-19T15:00:00Z", "start": "2026-10-30T16:00:00Z", "end": "2026-10-30T17:00:00Z", "organizer": "boss@acme.example", "description": "Plan Q1 for the widgets team.", "attendees": [
       {"email": "me@acme.example", "responseStatus": "needsAction"}, {"email": "boss@acme.example", "responseStatus": "accepted"}
     ]}
   ]

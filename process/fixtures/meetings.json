@@ -7,9 +7,9 @@
     {"id": "meet-4", "summary": "Design crit", "start": "now", "end": "now", "my_response": "declined", "attachments": [{"title": "Design crit - Notes by Gemini", "fileId": "doc-4"}]}
   ],
   "files": {
-    "doc-1": {"mimeType": "application/vnd.google-apps.document", "url": "https://docs.google.com/document/d/doc-1", "modifiedTime": "now", "text": "Widgets standup\n\nSummary\nThe team discussed the CSV export and the slow reports page.\n\nSuggested next steps\n- Me Dev will benchmark the export query against the new index before Friday.\n- Ana will update the CSV export docs.\n- Me Dev will profile the reports page query.\n"},
+    "doc-1": {"mimeType": "application/vnd.google-apps.document", "url": "https://docs.google.com/document/d/doc-1", "modifiedTime": "2026-10-19T16:30:00Z", "text": "Widgets standup\n\nSummary\nThe team discussed the CSV export and the slow reports page.\n\nSuggested next steps\n- Me Dev will benchmark the export query against the new index before Friday.\n- Ana will update the CSV export docs.\n- Me Dev will profile the reports page query.\n"},
     "shortcut-2": {"mimeType": "application/vnd.google-apps.shortcut", "shortcutDetails": {"targetId": "doc-2"}},
-    "doc-2": {"mimeType": "application/vnd.google-apps.document", "url": "https://docs.google.com/document/d/doc-2", "modifiedTime": "now", "text": "Sprint planning\n\nSuggested next steps\n- The team will rotate the staging API keys; Me Dev volunteered.\n- Cal will schedule the retro.\n"},
-    "doc-4": {"mimeType": "application/vnd.google-apps.document", "url": "https://docs.google.com/document/d/doc-4", "modifiedTime": "now", "text": "Design crit\n\nSuggested next steps\n- Me Dev will review the new icons.\n"}
+    "doc-2": {"mimeType": "application/vnd.google-apps.document", "url": "https://docs.google.com/document/d/doc-2", "modifiedTime": "2026-10-19T16:30:00Z", "text": "Sprint planning\n\nSuggested next steps\n- The team will rotate the staging API keys; Me Dev volunteered.\n- Cal will schedule the retro.\n"},
+    "doc-4": {"mimeType": "application/vnd.google-apps.document", "url": "https://docs.google.com/document/d/doc-4", "modifiedTime": "2026-10-19T16:30:00Z", "text": "Design crit\n\nSuggested next steps\n- Me Dev will review the new icons.\n"}
   }
 }

@@ -31,7 +31,8 @@ noise_label = "Noise"
 
 [match]
 # How items from a shared Slack workspace or Google account are attributed to this project, besides the repo, the
-# Linear team's ticket prefix and the watchlist. Items no profile claims land in the brief's Unsorted section.
+# Linear team's ticket prefix and the watchlist. Items no profile claims land in the brief's Unsorted section, except
+# Gmail noise, which stays with the profile that swept it so its triage archives it.
 keywords = ["widgets"]
 channels = ["#widgets"]
 senders = ["@acme.example"]
