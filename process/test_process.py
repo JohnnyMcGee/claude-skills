@@ -899,6 +899,15 @@ class DryRunExecuteTest(ExecuteTestCase):
         self.assertEqual(real.read_text(), before)
         self.assertEqual(self.entry(self.review["id"])["status"], "skipped")
 
+    def test_a_dry_run_never_checks_out_or_pushes_a_pr(self):
+        self.emit(item(kind="pr_comment", native_id="comment/9", subject="https://github.com/acme/widgets/pull/8#discussion_r9", actor={"name": "lint-bot[bot]", "role": "bot"}))
+        [fix] = [e for e in self.triage() if e["action"]["type"] == "gh_fix_pr"]
+
+        for step in ("checkout", "push"):
+            with self.subTest(step=step):
+                self.assertIn("a dry run touches no PR", self.process("execute", step, "acme", fix["id"], expect=1))
+        self.assertEqual(self.run_fake.calls, [])
+
     def test_a_real_executor_never_records_skipped(self):
         (self.state / "dry-run").unlink()
         self.decide(self.review)

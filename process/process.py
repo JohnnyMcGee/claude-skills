@@ -689,6 +689,8 @@ class Process:
         found = [e for e in self.approved(name) if e["id"] == entry_id and e["action"]["type"] in ("gh_fix_pr", "gh_thread_reply")]
         if not found:
             raise SystemExit(f"process: {entry_id} is not an approved fix for {name}")
+        if (self.state_root() / "dry-run").exists():
+            raise SystemExit("process: a dry run touches no PR; record the entry as skipped")
         return self.profile(name), found[0], self.profile_state(name) / "work" / entry_id
 
     def my_open_pr(self, profile, e):
