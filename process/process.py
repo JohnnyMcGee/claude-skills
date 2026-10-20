@@ -180,6 +180,8 @@ DENIED_TOOLS = [
     "mcp__claude_ai_Gmail__forward",
     "mcp__claude_ai_Gmail__trash_thread",
     "mcp__claude_ai_Gmail__trash_message",
+    "mcp__claude_ai_Gmail__mark_thread_spam",
+    "mcp__claude_ai_Gmail__mark_message_spam",
     "mcp__claude_ai_Google_Calendar__respond_to_event",
     "mcp__claude_ai_Google_Calendar__update_event",
     "mcp__claude_ai_Google_Calendar__delete_event",

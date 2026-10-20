@@ -1056,6 +1056,8 @@ class ExecuteTest(ExecuteTestCase):
         self.assertIn("mcp__github__pull_request_review_write", opt("--disallowedTools"))
         self.assertIn("mcp__github__merge_pull_request", opt("--disallowedTools"))
         self.assertIn("Bash(git push:*)", opt("--disallowedTools"))
+        self.assertIn("mcp__claude_ai_Gmail__trash_thread", opt("--disallowedTools"))
+        self.assertIn("mcp__claude_ai_Gmail__mark_thread_spam", opt("--disallowedTools"))
         work = self.profile_dir() / "work"
         self.assertIn(f"Edit(/{work}/**)", opt("--allowedTools"))  # a fix edits files in its scratch worktree only
         self.assertIn(f"Read(/{work}/**)", opt("--allowedTools"))
@@ -1529,6 +1531,7 @@ class RunTest(ProcessTestCase):
             self.assertEqual(self.opt(cmd, "--allowedTools").split(","), profile["phases"][phase]["allowed_tools"] + [f"Edit(/{inbox}/**)"])
             self.assertEqual(self.opt(cmd, "--add-dir"), str(inbox))  # the one place a phase may write files
             self.assertIn("mcp__github__merge_pull_request", self.opt(cmd, "--disallowedTools").split(","))
+            self.assertIn("mcp__claude_ai_Gmail__mark_message_spam", self.opt(cmd, "--disallowedTools").split(","))
             self.assertEqual(self.opt(cmd, "--permission-mode"), "dontAsk")  # anything not allowlisted is denied
             self.assertEqual(cwd, str(self.tmp / "work" / "acme"))
         self.assertTrue((self.state / "brief.md").exists())
