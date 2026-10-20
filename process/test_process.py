@@ -256,6 +256,76 @@ class TriageTest(TriageTestCase):
         self.assertNotEqual(queue[1]["item_ids"], first["item_ids"])
 
 
+class TriageRulesTest(TriageTestCase):
+    def test_asks_from_urgent_people_or_with_urgent_labels_are_urgent(self):
+        self.emit(item(actor={"name": "boss", "role": "person"}), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", labels=["deploy-blocking"]), item(native_id="pr/103", subject="https://github.com/acme/widgets/pull/103"))
+
+        self.assertEqual([e["urgency"] for e in self.triage()], ["urgent", "urgent", "normal"])
+
+    def test_an_action_type_promoted_to_silent_skips_approval(self):
+        self.write_profile(silent=["gh_thread_reply"])
+        self.emit(item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-9"))
+
+        [reply] = self.triage()
+
+        self.assertEqual((reply["autonomy"], reply["status"]), ("silent", "approved"))
+
+    def test_my_own_comments_are_handled_without_an_entry(self):
+        mine = item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-2", actor={"name": "me", "role": "me"})
+        self.emit(mine)
+
+        self.assertEqual(self.triage(), [])
+        self.emit(mine)
+        self.process("triage", "plan", "acme")
+        self.assertEqual(self.plan["entries"], [])
+
+
+class LinearInboxTest(TriageTestCase):
+    def notification(self, n, days_old):
+        stamp = process.iso(NOW - days_old * 86400)
+        return linear(
+            native_id=f"notif-{n}",
+            version=stamp,
+            kind="mention",
+            subject=f"https://linear.app/acme/issue/WID-{n}#comment-{n}",
+            timestamp=stamp,
+            summary=f"Mentioned on WID-{n}",
+            facts={"notification_id": f"notif-{n}"},
+        )
+
+    def mark_read(self, queue):
+        return [e for e in queue if e["action"]["type"] == "linear_mark_read"]
+
+    def test_the_first_run_clears_notifications_older_than_7_days_and_marks_the_rest_read_as_processed(self):
+        self.emit(self.notification(1, days_old=30), self.notification(2, days_old=8), self.notification(3, days_old=1), source="linear")
+
+        queue = self.triage()
+
+        cleared, processed = self.mark_read(queue)
+        self.assertEqual(cleared["action"]["params"]["notification_ids"], ["notif-1", "notif-2"])
+        self.assertIn("older than 7 days", cleared["summary"])
+        self.assertEqual(processed["action"]["params"]["notification_ids"], ["notif-3"])
+        self.assertEqual({(e["status"], e["autonomy"]) for e in (cleared, processed)}, {("done", "silent")})
+        self.assertEqual([e["summary"] for e in queue if e["kind"] == "mention"], ["Mentioned on WID-3"])
+
+    def test_later_runs_mark_only_the_items_they_processed_however_old(self):
+        self.emit(self.notification(1, days_old=1), source="linear")
+        self.triage()
+
+        self.emit(self.notification(4, days_old=9), source="linear")
+        queue = self.triage()
+
+        self.assertEqual([e["action"]["params"]["notification_ids"] for e in self.mark_read(queue)], [["notif-1"], ["notif-4"]])
+        self.assertIn("Mentioned on WID-4", [e["summary"] for e in queue])
+
+    def test_a_failed_mark_read_is_recorded_as_failed(self):
+        self.emit(self.notification(1, days_old=1), source="linear")
+
+        [failed] = self.mark_read(self.triage(outcome="failed"))
+
+        self.assertEqual(failed["status"], "failed")
+
+
 class NeverActionTest(TriageTestCase):
     def test_my_approved_green_pr_is_an_fyi_never_a_merge(self):
         self.emit(my_pr(mergeable="mergeable", checks="passing", review="approved"))
