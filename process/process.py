@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import time
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -93,6 +94,54 @@ def validate(value, kind):
     return schema_errors(value, {"$ref": f"#/$defs/{kind}"})
 
 
+# --- profiles ---------------------------------------------------------------------------------------------------
+
+# Words that name a send, review, RSVP or merge. A tool whose name holds one never belongs in a sweep or triage
+# allowlist, unless it only reads (get_/list_/search_/read_ prefixes, a _read suffix).
+SEND_WORDS = re.compile(r"send|reply|post|comment|review|rsvp|respond|event|merge|approve|submit|forward|publish|schedule|share|invite")
+READ_ONLY = re.compile(r"__(get|list|search|read|fetch)_|_read$")
+
+
+def forbidden_tool(tool):
+    """True when an allowlist entry could let a phase act in my name: a send tool, or a wildcard that covers one."""
+    bash = re.fullmatch(r"Bash\((.*)\)", tool)
+    if bash:
+        words = bash[1].removesuffix(":*").removesuffix("*").split()
+        too_broad = len(words) < 2 or words[:2] == ["gh", "api"] or words[0] in ("curl", "wget")
+        return too_broad or bool(SEND_WORDS.search(" ".join(words)))
+    if tool == "Bash" or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
+        return True
+    return not READ_ONLY.search(tool) and bool(SEND_WORDS.search(tool.lower()))
+
+
+def load_profile(path):
+    """Parse a profile: TOML front matter between +++ lines, then the how-to-sweep prose. Raises on any problem."""
+    match = re.match(r"\+\+\+\n(.*?)\n\+\+\+\n(.*)", path.read_text(), re.S)
+    if not match:
+        raise SystemExit(f"process: {path}: no +++ TOML front matter")
+    try:
+        profile = tomllib.loads(match[1])
+    except tomllib.TOMLDecodeError as error:
+        raise SystemExit(f"process: {path}: {error}")
+    problems = validate(profile, "profile")
+    if profile.get("name") != path.stem:
+        problems.append(f"name {profile.get('name')!r} does not match the file name {path.stem!r}")
+    for heading in ("## How to sweep", "## Changelog"):
+        if heading not in match[2]:
+            problems.append(f"the body has no {heading!r} section")
+    phases = profile.get("phases", {})
+    for source in profile.get("sources", []):
+        if source not in profile:
+            problems.append(f"source {source!r} has no [{source}] table")
+        if f"sweep-{source}" not in phases:
+            problems.append(f"source {source!r} has no [phases.sweep-{source}]")
+    for name, phase in phases.items():
+        problems += [f"phases.{name} grants {t!r}, which can send, review, RSVP or merge" for t in phase.get("allowed_tools", []) if forbidden_tool(t)]
+    if problems:
+        raise SystemExit(f"process: profile {path}:\n" + "\n".join(f"  {p}" for p in problems))
+    return {**profile, "body": match[2]}
+
+
 # --- the app ----------------------------------------------------------------------------------------------------
 
 
@@ -110,6 +159,31 @@ class Process:
     def state_root(self):
         base = self.env.get("XDG_STATE_HOME") or os.path.join(self.env["HOME"], ".local", "state")
         return Path(base) / "process"
+
+    def profiles_dir(self):
+        base = self.env.get("XDG_CONFIG_HOME") or os.path.join(self.env["HOME"], ".config")
+        return Path(base) / "process" / "profiles"
+
+    def profiles(self):
+        """Every profile, validated. One bad profile stops the run: a phase must never start under a bad allowlist."""
+        paths = sorted(self.profiles_dir().glob("*.md"))
+        if not paths:
+            raise SystemExit(f"process: no profiles in {self.profiles_dir()}")
+        loaded, problems = {}, []
+        for path in paths:
+            try:
+                loaded[path.stem] = load_profile(path)
+            except SystemExit as error:
+                problems.append(str(error.code))
+        if problems:
+            raise SystemExit("\n".join(problems))
+        return loaded
+
+    def profile(self, name):
+        profiles = self.profiles()
+        if name not in profiles:
+            raise SystemExit(f"process: no profile {name!r} in {self.profiles_dir()}")
+        return profiles[name]
 
     def profile_state(self, name):
         path = self.state_root() / "profiles" / name
@@ -140,6 +214,11 @@ class Process:
                 except json.JSONDecodeError as error:
                     raise SystemExit(f"process: {what} line {n} is not JSON: {error}")
         return records
+
+    def cmd_profiles(self):
+        """List every profile, refusing if any is invalid or grants a send tool to a sweep or triage phase."""
+        for name, profile in self.profiles().items():
+            self.out(f"{name}  {'active' if profile['active'] else 'inactive'}  {', '.join(profile['sources'])}")
 
     # -- sweeper side --
 

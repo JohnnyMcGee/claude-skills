@@ -46,6 +46,53 @@ def item(**over):
     return {**base, **over}
 
 
+SHIPPED_PROFILES = sorted((Path(__file__).parent / "profiles").glob("*.md"))
+
+PROFILE = """+++
+name = "{name}"
+active = {active}
+workdir = "{workdir}"
+timezone = "America/Chicago"
+sources = ["github", "linear"]
+
+[github]
+repo = "acme/widgets"
+
+[linear]
+team = "WID"
+
+[urgency]
+people = ["boss"]
+labels = ["deploy-blocking"]
+
+[autonomy]
+silent = {silent}
+
+[phases.sweep-github]
+model = "sonnet"
+allowed_tools = ["Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__github__pull_request_read"]
+
+[phases.sweep-linear]
+model = "sonnet"
+allowed_tools = ["Read", "Bash(process emit:*)", "mcp__linear-server__get_notifications"]
+
+[phases.triage]
+model = "opus"
+allowed_tools = {triage_tools}
++++
+
+# {name}
+
+## How to sweep
+
+Nothing special.
+
+## Changelog
+
+- 2026-10-20 — Created.
+"""
+
+
 class ProcessTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -71,6 +118,21 @@ class ProcessTestCase(unittest.TestCase):
     @property
     def state(self):
         return self.tmp / "state" / "process"
+
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), text=None):
+        path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            text
+            or PROFILE.format(
+                name=name,
+                active=str(active).lower(),
+                workdir=self.tmp / "work" / name,
+                silent=json.dumps(list(silent)),
+                triage_tools=json.dumps(list(triage_tools)),
+            )
+        )
+        return path
 
     def profile_dir(self, name="acme"):
         return self.state / "profiles" / name
@@ -110,6 +172,70 @@ class EmitTest(ProcessTestCase):
         stored = self.jsonl(self.profile_dir() / "items.jsonl")
         self.assertEqual(len(stored), 2)
         self.assertNotEqual(stored[0]["id"], stored[1]["id"])
+
+
+class ProfileTest(ProcessTestCase):
+    # Tools that send, review, RSVP or merge on my behalf. None may ever be in a sweep or triage allowlist.
+    SEND_TOOLS = [
+        "mcp__slack__slack_send_message",
+        "mcp__slack__slack_schedule_message",
+        "mcp__claude_ai_Gmail__send_message",
+        "mcp__claude_ai_Gmail__reply",
+        "mcp__claude_ai_Gmail__forward",
+        "mcp__claude_ai_Google_Calendar__respond_to_event",
+        "mcp__github__pull_request_review_write",
+        "mcp__github__add_issue_comment",
+        "mcp__github__add_reply_to_pull_request_comment",
+        "mcp__github__merge_pull_request",
+        "mcp__linear-server__save_comment",
+        "Bash(gh pr merge:*)",
+        "Bash(gh pr review:*)",
+        "Bash(gh pr comment:*)",
+        "Bash(gh api:*)",
+        "Bash",
+        "Bash(gh:*)",
+        "mcp__slack",
+        "mcp__github__*",
+    ]
+
+    def test_profiles_lists_each_profile_with_its_sources(self):
+        self.write_profile("acme")
+        self.write_profile("side", active=False)
+
+        out = self.process("profiles")
+
+        self.assertIn("acme  active  github, linear", out)
+        self.assertIn("side  inactive  github, linear", out)
+
+    def test_a_profile_granting_any_send_review_rsvp_or_merge_tool_is_refused(self):
+        for tool in self.SEND_TOOLS:
+            with self.subTest(tool=tool):
+                self.write_profile(triage_tools=["Read", tool])
+                out = self.process("profiles", expect=1)
+                self.assertIn(f"phases.triage grants {tool!r}", out)
+
+    def test_a_profile_missing_its_how_to_sweep_section_is_refused(self):
+        self.write_profile(text=self.write_profile().read_text().replace("## How to sweep", "## Notes"))
+
+        self.assertIn("## How to sweep", self.process("profiles", expect=1))
+
+    def test_every_shipped_profile_is_valid_and_its_sweep_and_triage_allowlists_hold_no_send_tool(self):
+        self.assertTrue(SHIPPED_PROFILES, "no profiles shipped")
+        for path in SHIPPED_PROFILES:
+            with self.subTest(profile=path.name):
+                profile = process.load_profile(path)  # raises SystemExit with every problem
+                for phase in profile["phases"].values():
+                    self.assertFalse(set(phase["allowed_tools"]) & set(self.SEND_TOOLS))
+                    self.assertEqual([t for t in phase["allowed_tools"] if process.forbidden_tool(t)], [])
+
+    def test_the_example_profile_declares_its_repo_team_account_models_and_how_to_sweep(self):
+        acme = process.load_profile(Path(__file__).parent / "profiles" / "acme.md")
+
+        self.assertEqual(acme["github"]["repo"], "acme/widgets")
+        self.assertEqual(acme["linear"]["team"], "WID")
+        self.assertEqual(acme["google"]["account"], "me@acme.example")
+        self.assertEqual({p["model"] for p in acme["phases"].values()}, {"sonnet", "opus"})
+        self.assertIn("## Changelog", acme["body"])
 
 
 if __name__ == "__main__":
