@@ -39,7 +39,7 @@ senders = ["@acme.example"]
 
 [urgency]
 # The only things that interrupt me (proc notify). Everything else waits for the brief.
-# A DM or a mention from these people, by the name each source shows (Slack and Linear name, GitHub login).
+# A DM or a mention from these people, by the name each source shows (Slack and Linear name, GitHub login), any case.
 people = ["Mo", "mo-acme"]
 # A mention of me in these Slack channels (glob patterns allowed). Other messages there are not urgent.
 channels = ["#incidents", "#incident-*"]

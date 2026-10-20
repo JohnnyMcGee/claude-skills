@@ -480,6 +480,11 @@ class UrgencyTest(TriageTestCase):
 
         self.assertEqual(self.urgent(), ["Boss DMed you about the launch", "Boss mentioned you on WID-9"])
 
+    def test_my_manager_is_matched_whatever_the_case_a_source_shows_their_name_in(self):
+        self.emit(slack(native_id="D1/1", kind="dm", actor={"name": "Boss", "role": "person"}, summary="Boss DMed you about the launch", facts={"channel": "DM", "ask": "question"}), source="slack")
+
+        self.assertEqual(self.urgent(), ["Boss DMed you about the launch"])
+
     def test_my_managers_pr_comment_or_ticket_change_is_not_urgent(self):
         self.emit(item(native_id="comment/1", kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-1", actor={"name": "boss", "role": "person"}, summary="Boss commented on #7"))
         self.emit(linear(native_id="issue/WID-20", kind="ticket_change", subject="https://linear.app/acme/issue/WID-20", actor={"name": "boss", "role": "person"}, summary="Boss moved WID-20's due date up", facts={}), source="linear")

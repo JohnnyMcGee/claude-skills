@@ -1156,7 +1156,7 @@ def urgent(rules, i):
     mention in one of its channels (incident-*), or a review request whose PR carries one of its labels."""
     channel = (i.get("facts") or {}).get("channel", "").lower()
     return (
-        i["kind"] in ("dm", "mention") and i["actor"]["name"] in rules.get("people", [])
+        i["kind"] in ("dm", "mention") and i["actor"]["name"].lower() in {p.lower() for p in rules.get("people", [])}
         or i["kind"] == "mention" and any(fnmatch.fnmatchcase(channel, c.lower()) for c in rules.get("channels", []))
         or i["kind"] == "review_request" and bool(set(i.get("labels", [])) & set(rules.get("labels", [])))
     )
