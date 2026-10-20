@@ -271,8 +271,8 @@ class Process:
         return records
 
     def cmd_run(self, *args):
-        """Sweep every source, then triage, for each active profile (or --project), each phase headless under its
-        profile's model and allowlist; then render the brief. --fixtures points sweepers at fixture data and makes
+        """Sweep every source, triage, then execute what triage approved silently, for each active profile (or
+        --project), each phase headless under its profile's model and allowlist; then render the brief. --fixtures points sweepers at fixture data and makes
         triage a dry run."""
         opts = flags(args, "--delta", "--project", "--fixtures")
         dry = bool(opts.get("--fixtures"))
@@ -300,14 +300,21 @@ class Process:
                         self.headless(profile, phase, prompt, dry)
                         problem = self.phase_problem(name, phase, before)
                     except (subprocess.CalledProcessError, OSError) as error:  # OSError: no workdir, no claude
-                        stderr = getattr(error, "stderr", None) or ""
-                        problem = f"{phase} failed: {(stderr.strip().splitlines() or [str(error)])[-1]}"
-                    if problem:
-                        run["problems"].setdefault(name, []).append(problem)
-                        self.write_json(self.state_root() / "run.json", run)
+                        problem = failure(phase, error)
+                    self.report(run, name, problem)
+                try:  # what triage approved silently (bot fixes, merges of the base) happens now, not when I open proc
+                    problem = self.execute(profile, dry)
+                except (subprocess.CalledProcessError, OSError) as error:
+                    problem = failure("execute", error)
+                self.report(run, name, problem)
             self.cmd_brief(*(["--delta"] if opts.get("--delta") else []), *(["--project", opts["--project"]] if opts.get("--project") else []))
         finally:
             (self.state_root() / "run.json").unlink()
+
+    def report(self, run, name, problem):
+        if problem:
+            run["problems"].setdefault(name, []).append(problem)
+            self.write_json(self.state_root() / "run.json", run)
 
     def inbox(self, name):
         """The one directory a phase may write: sweepers' item files and triage's drafts, each consumed on use."""
@@ -540,13 +547,24 @@ class Process:
         if opts.get("--project") and opts["--project"] not in profiles:
             raise SystemExit(f"process: no profile {opts['--project']!r} in {self.profiles_dir()}")
         self.apply_decisions(profiles)
-        names = [opts["--project"]] if opts.get("--project") else list(profiles)
-        for name in names:
-            if self.approved(name) and "execute" not in profiles[name]["phases"]:
-                self.out(f"process: {name} has no [phases.execute]; {len(self.approved(name))} approved entr(ies) wait")
-            elif self.approved(name):
-                self.out(f"{name}: execute")
-                self.headless(profiles[name], "execute", f"/execute {name}")
+        dry = (self.state_root() / "dry-run").exists()
+        for name in [opts["--project"]] if opts.get("--project") else list(profiles):
+            problem = self.execute(profiles[name], dry)
+            if problem:
+                self.out(f"process: {name}: {problem}")
+
+    def execute(self, profile, dry):
+        """Run the executor phase for one profile when it has approved entries; return what went wrong, if anything.
+        A dry run (a dry-run state directory) gets --dry-run and no service tools."""
+        name, waiting = profile["name"], len(self.approved(profile["name"]))
+        if not waiting:
+            return None
+        if "execute" not in profile["phases"]:
+            return f"{name} has no [phases.execute]; {waiting} approved entr(ies) wait"
+        self.out(f"{name}: execute")
+        self.headless(profile, "execute", f"/execute {name}" + (" --dry-run" if dry else ""), dry)
+        if self.approved(name):
+            return f"execute left {len(self.approved(name))} approved entr(ies) without a result"
 
     def approved(self, name):
         """Entries waiting on the executor: approved by me, or promoted to silent, with an action that carries text."""
@@ -820,6 +838,11 @@ def entry(name, profile, group):
         "action": action,
         "status": status,
     }
+
+
+def failure(phase, error):
+    stderr = getattr(error, "stderr", None) or ""
+    return f"{phase} failed: {(stderr.strip().splitlines() or [str(error)])[-1]}"
 
 
 class Usage(Exception):

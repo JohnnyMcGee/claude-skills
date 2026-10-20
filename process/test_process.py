@@ -855,6 +855,42 @@ class RunTest(ProcessTestCase):
         self.assertIn("> ⚠ triage failed: [Errno 2] No such file or directory", (self.state / "brief.md").read_text())
         self.assertFalse((self.state / "run.json").exists())
 
+    def silent_fix_run(self, *flags):
+        """A run whose GitHub sweeper finds a bot comment and whose triage approves its fix silently."""
+        main = lambda *argv, stdin="": process.main(list(argv), run=self.run_fake, env=self.env, stdin=io.StringIO(stdin), stdout=io.StringIO(), clock=lambda: self.now)
+        bot = item(kind="pr_comment", native_id="comment/9", subject="https://github.com/acme/widgets/pull/8#discussion_r9", actor={"name": "lint-bot[bot]", "role": "bot"})
+
+        def triage(cmd):
+            main("triage", "plan", "acme")
+            plan = json.loads((self.profile_dir() / "plan.json").read_text())
+            main("triage", "draft", "acme", plan["entries"][0]["id"], stdin="Drop the unused import.")
+            main("triage", "commit", "acme")
+
+        sweep = lambda cmd: main("emit", "acme", "github", stdin=json.dumps(bot) + "\n")
+        self.run_fake.responses[("claude", "-p", "/sweep-github acme")] = sweep
+        self.run_fake.responses[("claude", "-p", "/sweep-github acme --fixtures /fx")] = sweep
+        self.run_fake.responses[("claude", "-p", "/triage acme")] = triage
+        self.run_fake.responses[("claude", "-p", "/triage acme --dry-run")] = triage
+        self.process("run", *flags)
+        return [c[2] for c, _ in self.claude_calls()]
+
+    def test_run_executes_what_triage_approved_silently_right_after_triage(self):
+        self.write_profile("acme")
+
+        prompts = self.silent_fix_run()
+
+        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", "/triage acme", "/execute acme"])
+        self.assertIn("> ⚠ execute left 1 approved entr(ies) without a result", (self.state / "brief.md").read_text())
+
+    def test_a_dry_run_executes_as_a_dry_run_with_no_service_tools(self):
+        self.write_profile("acme", execute_tools=["Read", "Bash(process execute:*)", "mcp__github__pull_request_review_write"])
+
+        prompts = self.silent_fix_run("--fixtures", "/fx")
+
+        self.assertEqual(prompts[-1], "/execute acme --dry-run")
+        cmd = self.claude_calls()[-1][0]
+        self.assertEqual([t for t in self.opt(cmd, "--allowedTools").split(",") if t.startswith("mcp__")], [])
+
     def test_a_phase_that_exits_cleanly_but_does_nothing_is_flagged_in_the_brief(self):
         self.write_profile("acme")
 
