@@ -453,6 +453,46 @@ class NeverActionTest(TriageTestCase):
         self.assertIn("no draft", self.process("triage", "commit", "acme", expect=1))
 
 
+class GitHubActionsTest(TriageTestCase):
+    def comment(self, n, body, actor=("ana", "person")):
+        return item(kind="pr_comment", native_id=f"comment/{n}", subject=f"https://github.com/acme/widgets/pull/8#discussion_r{n}", context=body, actor={"name": actor[0], "role": actor[1]}, summary=f"Comment {n} on #8")
+
+    def test_bot_and_nit_comments_on_my_pr_are_fixed_without_asking(self):
+        self.emit(self.comment(1, "orders.py:42 — unused import `itertools`.", actor=("lint-bot[bot]", "bot")), self.comment(2, "nit: trailing whitespace on line 9"), self.comment(3, "Nit — rename `x` to `count`"))
+
+        for fix in self.triage():
+            self.assertEqual((fix["action"]["type"], fix["autonomy"], fix["status"]), ("gh_fix_pr", "silent", "approved"))
+            self.assertEqual(fix["action"]["params"], {"repo": "acme/widgets", "number": 8, "comment": fix["subject"]})
+
+    def test_a_human_design_comment_gets_a_drafted_reply_and_fix_for_my_approval(self):
+        self.emit(self.comment(4, "Why offset pagination? Cursor pagination would survive inserts between pages."))
+
+        [reply] = self.triage()
+
+        self.assertEqual((reply["action"]["type"], reply["autonomy"], reply["status"]), ("gh_thread_reply", "draft", "pending"))
+        self.assertEqual(reply["action"]["params"]["comment"], "https://github.com/acme/widgets/pull/8#discussion_r4")
+
+    def test_a_conflict_on_my_otherwise_healthy_pr_is_merged_up_silently_with_no_draft_needed(self):
+        self.emit(my_pr(8, mergeable="conflicting", checks="passing", review="review_required"))
+
+        out = self.process("triage", "plan", "acme")
+        self.assertNotIn("[draft]", out)
+        self.process("triage", "commit", "acme")
+
+        [fix] = self.queue()
+        self.assertEqual((fix["action"]["type"], fix["autonomy"], fix["status"]), ("gh_fix_pr", "silent", "approved"))
+        self.assertEqual(fix["action"]["params"], {"repo": "acme/widgets", "number": 8, "fix": "merge_base"})
+        self.assertIn("Merge the base branch", fix["action"]["draft"])
+
+    def test_a_conflict_with_failing_checks_still_needs_my_approval(self):
+        self.emit(my_pr(8, mergeable="conflicting", checks="failing", review="review_required"))
+
+        [fix] = self.triage()
+
+        self.assertEqual((fix["action"]["type"], fix["autonomy"]), ("gh_fix_pr", "draft"))
+        self.assertNotIn("fix", fix["action"]["params"])
+
+
 class BriefTest(TriageTestCase):
     def section(self, brief, project, heading):
         """The lines under one project's ### heading, up to the next heading."""

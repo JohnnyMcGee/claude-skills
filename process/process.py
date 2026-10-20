@@ -457,7 +457,7 @@ class Process:
         self.write_json(pdir / "plan.json", plan)
         by_id = {i["id"]: i for i in items}
         for e in entries:
-            todo = "draft" if needs_draft(e) else "do, then report" if e["action"]["type"] == "linear_mark_read" else e["status"]
+            todo = "draft" if needs_draft(e) and not e["action"].get("draft") else "do, then report" if e["action"]["type"] == "linear_mark_read" else e["status"]
             self.out(f"{e['id']}  [{todo}]  {e['action']['type']} {json.dumps(e['action']['params'])}  {e['summary']}  {e['link']}")
             if todo == "draft":
                 for item_id in e["item_ids"]:
@@ -688,6 +688,12 @@ class Process:
 
 
 BANKRUPTCY_AGE = 7 * 24 * 3600
+# A reviewer's nit, by the usual convention: the comment opens with "nit" (nit:, Nit —, [nit], nitpick).
+NIT = re.compile(r"\s*\[?nit(pick)?\b", re.I)
+MERGE_BASE = (
+    "Merge the base branch into the PR branch (never rebase) and resolve the conflicts. Push only if every conflict is "
+    "mechanical: both sides kept, nothing about behaviour decided. Otherwise abort and report the conflicting files."
+)
 PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 
 
@@ -771,19 +777,24 @@ def entry(name, profile, group):
     facts = {k: v for i in group for k, v in (i.get("facts") or {}).items()}
     pr = PULL.search(lead["subject"]) or PULL.search(lead["link"])
     ref = {"repo": pr[1], "number": int(pr[2])} if pr else None
-    action, summary, urgency = {"type": "none", "params": {}}, lead["summary"], "low"
+    action, summary, urgency, silent = {"type": "none", "params": {}}, lead["summary"], "low", False
     kind = lead["kind"]
     if kind == "review_request" and ref:
         action, urgency = {"type": "gh_review", "params": {**ref, "event": "COMMENT"}}, "normal"
     elif kind == "pr_status" and facts.get("mine") and ref:
         broken = facts.get("mergeable") == "conflicting" or facts.get("checks") == "failing" or facts.get("review") == "changes_requested"
         ready = facts.get("review") == "approved" and facts.get("checks") in ("passing", "none") and facts.get("mergeable") == "mergeable"
-        if broken:
+        conflict_only = facts.get("mergeable") == "conflicting" and facts.get("checks") != "failing" and facts.get("review") != "changes_requested"
+        if conflict_only:  # mechanical: brought up to date silently, the way open-pr does it
+            action, urgency, silent = {"type": "gh_fix_pr", "params": {**ref, "fix": "merge_base"}, "draft": MERGE_BASE}, "normal", True
+        elif broken:
             action, urgency = {"type": "gh_fix_pr", "params": ref}, "normal"
         elif ready:
             summary += " — approved and green; merging is yours"  # merge is a never action: say so, never queue it
     elif kind == "pr_comment" and ref:
-        action, urgency = {"type": "gh_fix_pr" if lead["actor"]["role"] == "bot" else "gh_thread_reply", "params": ref}, "normal"
+        trivial = lead["actor"]["role"] == "bot" or NIT.match(lead["context"])  # fixed and pushed without asking
+        action = {"type": "gh_fix_pr" if trivial else "gh_thread_reply", "params": {**ref, "comment": canonical(lead["subject"])}}
+        urgency, silent = "normal", bool(trivial)
     elif kind in ("mention", "ticket_change"):
         urgency = "normal"
     rules = profile.get("urgency", {})
@@ -792,7 +803,7 @@ def entry(name, profile, group):
     autonomy, status = "draft", "pending"
     if action["type"] == "none":
         autonomy, status = "silent", "info"
-    elif action["type"] in profile["autonomy"]["silent"]:
+    elif silent or action["type"] in profile["autonomy"]["silent"]:
         autonomy, status = "silent", "approved"
     ids = [i["id"] for i in group]
     return {
