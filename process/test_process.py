@@ -674,6 +674,30 @@ class ExecuteTest(ExecuteTestCase):
         self.emit(item(version="v2"))
         self.assertEqual([e["status"] for e in self.triage()], ["skipped", "pending"])
 
+    def test_a_malformed_decision_is_reported_and_the_others_still_apply(self):
+        self.emit(item())
+        [review] = self.triage()
+        with (self.state / "decisions.jsonl").open("a") as f:
+            f.write('{"entry_id": "q-0123456789ab", "verdict": "merge", "at": "2026-10-20T13:00:00Z"}\n{"entry_id": "q-01\n')
+        self.decide(review)
+
+        out = self.process("execute")
+
+        self.assertIn("decision 1 ignored", out)
+        self.assertIn("decision 2 ignored: not JSON", out)
+        self.assertEqual(self.entry(review["id"])["status"], "approved")
+
+    def test_an_executor_that_cannot_start_is_reported_without_a_traceback(self):
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review)
+        self.run_fake.responses[("claude", "-p", "/execute acme")] = lambda cmd: (_ for _ in ()).throw(FileNotFoundError(2, "No such file or directory", "/nowhere"))
+
+        out = self.process("execute", expect=1)
+
+        self.assertIn("process: acme: execute failed: [Errno 2] No such file or directory", out)
+        self.assertEqual(self.entry(review["id"])["status"], "approved")  # still waits for the next run
+
     def test_a_decision_on_an_entry_no_longer_pending_changes_nothing(self):
         self.emit(item())
         [old] = self.triage()

@@ -555,10 +555,15 @@ class Process:
             raise SystemExit(f"process: no profile {opts['--project']!r} in {self.profiles_dir()}")
         self.apply_decisions(profiles)
         dry = (self.state_root() / "dry-run").exists()
+        failed = False
         for name in [opts["--project"]] if opts.get("--project") else list(profiles):
-            problem = self.execute(profiles[name], dry)
+            try:
+                problem = self.execute(profiles[name], dry)
+            except (subprocess.CalledProcessError, OSError) as error:  # one profile's executor must not stop the rest
+                problem, failed = failure("execute", error), True
             if problem:
                 self.out(f"process: {name}: {problem}")
+        return 1 if failed else 0
 
     def execute(self, profile, dry):
         """Run the executor phase for one profile when it has approved entries; return what went wrong, if anything.
@@ -581,7 +586,15 @@ class Process:
         """Turn each decision on a still-pending entry into its new state. A decision on anything else is stale (the
         entry was superseded or already decided) and changes nothing, so applying twice is a no-op."""
         queue = {e["id"]: e for e in self.queue()}
-        for n, decision in enumerate(self.read_jsonl(self.state_root() / "decisions.jsonl"), 1):
+        path = self.state_root() / "decisions.jsonl"
+        for n, line in enumerate(path.read_text().splitlines() if path.exists() else [], 1):
+            if not line.strip():
+                continue
+            try:  # proc appends; a line it never finished must not block every decision after it
+                decision = json.loads(line)
+            except json.JSONDecodeError:
+                self.out(f"process: decision {n} ignored: not JSON")
+                continue
             problems = validate(decision, "decision")
             if problems:
                 self.out(f"process: decision {n} ignored: {problems[0]}")
