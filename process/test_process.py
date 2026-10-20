@@ -379,16 +379,20 @@ class TriageTestCase(ProcessTestCase):
         """The queue's current state: the last line for each entry id."""
         return list({e["id"]: e for e in self.jsonl(self.state / "queue.jsonl")}.values())
 
-    def triage(self, profile="acme", outcome="done"):
+    def triage(self, profile="acme", outcome="done", note=None):
         """Run triage the way the triage skill does: plan, draft every draft entry, report each silent action, commit."""
         self.process("triage", "plan", profile)
         for entry in self.plan(profile)["entries"]:
-            if entry["action"]["type"] not in ("none", "linear_mark_read"):
+            if entry["action"]["type"] not in ("none",) + TRIAGE_ACTIONS:
                 self.process("triage", "draft", profile, entry["id"], stdin=f"Draft for {entry['summary']}")
-            if entry["action"]["type"] == "linear_mark_read":
-                self.process("triage", "silent", profile, entry["id"], outcome)
+            if entry["action"]["type"] in TRIAGE_ACTIONS:
+                self.process("triage", "silent", profile, entry["id"], outcome, *([note] if note else []))
         self.process("triage", "commit", profile)
         return self.queue()
+
+
+# The silent actions triage performs itself, then reports.
+TRIAGE_ACTIONS = ("linear_mark_read", "linear_create_issue", "gmail_archive")
 
 
 class TriageTest(TriageTestCase):
@@ -482,6 +486,63 @@ class TriageRulesTest(TriageTestCase):
         self.emit(mine)
         self.process("triage", "plan", "acme")
         self.assertEqual(self.plan()["entries"], [])
+
+
+class SlackTriageTest(TriageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def test_a_slack_question_gets_a_drafted_reply_in_its_thread(self):
+        self.emit(slack(), source="slack")
+
+        [reply] = self.triage()
+
+        self.assertEqual(reply["action"]["type"], "slack_reply")
+        self.assertEqual(reply["action"]["params"], {"channel": "C100", "thread_ts": "1792500000.000100"})
+        self.assertEqual((reply["autonomy"], reply["status"], reply["urgency"]), ("draft", "pending", "normal"))
+        self.assertTrue(reply["action"]["draft"])
+
+    def test_an_immediate_slack_ask_becomes_a_ticket_assigned_to_me_silently_linking_back(self):
+        ask = slack(summary="Dee asked you to add an index on orders.created_at", facts={"channel": "#deploys", "ask": "task"})
+        self.emit(ask, source="slack")
+
+        self.assertIn("[do, then report]", self.process("triage", "plan", "acme"))
+        [ticket] = self.triage(note="https://linear.app/acme/issue/WID-30")
+
+        self.assertEqual(ticket["action"]["type"], "linear_create_issue")
+        self.assertEqual(ticket["action"]["params"], {"team": "WID", "assignee": "me", "link": ask["link"]})
+        self.assertEqual((ticket["autonomy"], ticket["status"], ticket["note"]), ("silent", "done", "https://linear.app/acme/issue/WID-30"))
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+
+    def test_an_ask_already_ticketed_is_not_ticketed_again_when_its_message_changes(self):
+        ask = slack(summary="Dee asked you to add an index on orders.created_at", facts={"channel": "#deploys", "ask": "task"})
+        self.emit(ask, source="slack")
+        self.triage(note="https://linear.app/acme/issue/WID-30")
+
+        self.emit({**ask, "version": "1792500100.000100"}, source="slack")  # Dee edited the message
+        queue = self.triage()
+
+        self.assertEqual([e["action"]["type"] for e in queue], ["linear_create_issue", "none"])
+        self.assertIn("already ticketed: https://linear.app/acme/issue/WID-30", queue[1]["summary"])
+
+    def test_an_ask_triage_found_already_tracked_is_listed_under_done_silently_as_skipped(self):
+        self.emit(slack(summary="Dee asked you to add an index on orders.created_at", facts={"channel": "#deploys", "ask": "task"}), source="slack")
+        self.triage(outcome="skipped", note="already tracked: https://linear.app/acme/issue/WID-21")
+
+        self.process("brief")
+
+        self.assertIn(
+            "- Dee asked you to add an index on orders.created_at — skipped: already tracked: https://linear.app/acme/issue/WID-21",
+            (self.state / "brief.md").read_text(),
+        )
+
+    def test_a_slack_message_that_asks_nothing_is_an_fyi(self):
+        self.emit(slack(kind="channel_message", summary="Deploy 412 finished", facts={"channel": "#deploys"}), source="slack")
+
+        [fyi] = self.triage()
+
+        self.assertEqual((fyi["status"], fyi["action"]["type"], fyi["urgency"]), ("info", "none", "low"))
 
 
 class LinearInboxTest(TriageTestCase):

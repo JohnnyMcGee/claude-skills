@@ -85,7 +85,33 @@
         "draft": {"description": "The outward-facing text (review body, reply, fix plan) for the human to approve or edit.", "type": "string"}
       },
       "anyOf": [
-        {"properties": {"type": {"enum": ["none", "slack_reply", "email_reply", "rsvp", "linear_promote", "linear_create_issue", "afk_launch"]}}},
+        {"properties": {"type": {"enum": ["none", "email_reply", "rsvp", "linear_promote", "afk_launch"]}}},
+        {
+          "properties": {
+            "type": {"const": "slack_reply"},
+            "params": {
+              "type": "object",
+              "required": ["channel", "thread_ts"],
+              "properties": {"channel": {"type": "string", "minLength": 1}, "thread_ts": {"type": "string", "minLength": 1}}
+            }
+          }
+        },
+        {
+          "properties": {
+            "type": {"const": "linear_create_issue"},
+            "params": {
+              "description": "A ticket triage creates silently, assigned to me, linking back to the message or notes it came from.",
+              "type": "object",
+              "required": ["team", "assignee", "link"],
+              "properties": {
+                "team": {"type": "string", "minLength": 1},
+                "assignee": {"const": "me"},
+                "state": {"type": "string", "minLength": 1},
+                "link": {"type": "string", "pattern": "^https?://"}
+              }
+            }
+          }
+        },
         {
           "properties": {
             "type": {"const": "gh_review"},

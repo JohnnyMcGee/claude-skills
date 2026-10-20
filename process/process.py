@@ -481,6 +481,10 @@ class Process:
         dropped = [i for i in items if i["actor"]["role"] == "me" and i["kind"] != "pr_status"]
         live = [i for i in items if i not in stale and i not in dropped]
         entries = [entry(name, profile, group) for group in asks(live)]
+        ticketed = {e["subject"]: e.get("note", "") for e in self.queue() if e["project"] == name and e["action"]["type"] == "linear_create_issue" and e["status"] == "done"}
+        for e in entries:
+            if e["action"]["type"] == "linear_create_issue" and e["subject"] in ticketed:  # a changed ask I already made a ticket for
+                e.update(action={"type": "none", "params": {}}, autonomy="silent", status="info", summary=f"{e['summary']} — already ticketed: {ticketed[e['subject']]}")
         if stale:
             entries.append(mark_read(name, stale, f"Cleared {len(stale)} Linear notification(s) older than 7 days (first run)"))
         read = [i for i in live + dropped if notification(i)]  # my own get marked read too
@@ -490,7 +494,7 @@ class Process:
         self.write_json(pdir / "plan.json", plan)
         by_id = {i["id"]: i for i in items}
         for e in entries:
-            todo = "draft" if needs_draft(e) else "do, then report" if e["action"]["type"] == "linear_mark_read" else e["status"]
+            todo = "draft" if needs_draft(e) else "do, then report" if e["action"]["type"] in TRIAGE_ACTIONS else e["status"]
             self.out(f"{e['id']}  [{todo}]  {e['action']['type']} {json.dumps(e['action']['params'])}  {e['summary']}  {e['link']}")
             if todo == "draft":
                 for item_id in e["item_ids"]:
@@ -521,7 +525,7 @@ class Process:
         if outcome not in ("done", "failed", "skipped"):
             raise SystemExit("process: a silent outcome is done, failed or skipped")
         plan, e = self.plan_entry(name, entry_id)
-        if e["action"]["type"] != "linear_mark_read":
+        if e["action"]["type"] not in TRIAGE_ACTIONS:
             raise SystemExit(f"process: {entry_id} is {e['action']['type']}, not a silent action triage performs")
         e["status"] = outcome
         if note:
@@ -564,7 +568,7 @@ class Process:
             problems += [f"{e['id']}: {p}" for p in validate(e, "queue_entry")]
             if needs_draft(e) and not e["action"].get("draft"):
                 problems.append(f"{e['id']}: no draft (process triage draft {name} {e['id']})")
-            if e["action"]["type"] == "linear_mark_read" and e["status"] == "approved":
+            if e["action"]["type"] in TRIAGE_ACTIONS and e["status"] == "approved":
                 problems.append(f"{e['id']}: no outcome (process triage silent {name} {e['id']} done|failed|skipped)")
         if problems:
             raise SystemExit("process: nothing committed:\n" + "\n".join(f"  {p}" for p in problems))
@@ -622,17 +626,21 @@ PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 
 
 def asks(items):
-    """Group items into asks: the same kind about the same subject, whichever source saw it. github sorts first, so its
-    item leads the entry."""
+    """Group items into asks: the same kind about the same subject, whichever source saw it. A github item leads its
+    entry."""
     groups = {}
-    for i in sorted(items, key=lambda i: (i["source"], i["timestamp"])):
+    for i in sorted(items, key=lambda i: (i["source"] != "github", i["source"], i["timestamp"])):
         groups.setdefault((i["kind"], canonical(i["subject"])), []).append(i)
     return list(groups.values())
 
 
+# Silent actions triage performs itself under its allowlist, then reports. They carry no text for me to approve.
+TRIAGE_ACTIONS = ("linear_mark_read", "linear_create_issue", "gmail_archive")
+
+
 def needs_draft(e):
     """Every action that carries text needs a draft, even one promoted to silent: the executor sends that text."""
-    return e["action"]["type"] not in ("none", "linear_mark_read")
+    return e["action"]["type"] not in ("none",) + TRIAGE_ACTIONS
 
 
 def canonical(url):
@@ -687,7 +695,7 @@ def render_project(entries):
             lines += [f"  > {line}" for line in (e["action"].get("draft") or "").splitlines()] + [""]
     if silent:
         lines += [f"### Done silently ({len(silent)})", ""]
-        words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped (dry run)"}
+        words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped"}
         lines += [f"- {e['summary']} — {words[e['status']]}{': ' + e['note'] if e.get('note') else ''}" for e in silent] + [""]
     if fyi:
         lines += [f"### FYI ({len(fyi)})", "", "<details>", f"<summary>{len(fyi)} item(s)</summary>", ""]
@@ -715,7 +723,12 @@ def entry(name, profile, group):
             summary += " — approved and green; merging is yours"  # merge is a never action: say so, never queue it
     elif kind == "pr_comment" and ref:
         action, urgency = {"type": "gh_fix_pr" if lead["actor"]["role"] == "bot" else "gh_thread_reply", "params": ref}, "normal"
-    elif kind in ("mention", "ticket_change"):
+    elif lead["source"] == "slack" and facts.get("ask") == "task" and "linear" in profile:  # an immediate ask: a ticket for me, linking back
+        action, urgency = {"type": "linear_create_issue", "params": {"team": profile["linear"]["team"], "assignee": "me", "link": lead["link"]}}, "normal"
+    elif lead["source"] == "slack" and facts.get("ask"):
+        channel, _, thread = lead["native_id"].partition("/")
+        action, urgency = {"type": "slack_reply", "params": {"channel": channel, "thread_ts": thread}}, "normal"
+    elif kind in ("mention", "ticket_change", "dm", "thread_question"):
         urgency = "normal"
     rules = profile.get("urgency", {})
     if {i["actor"]["name"] for i in group} & set(rules.get("people", [])) or {l for i in group for l in i.get("labels", [])} & set(rules.get("labels", [])):
@@ -723,7 +736,7 @@ def entry(name, profile, group):
     autonomy, status = "draft", "pending"
     if action["type"] == "none":
         autonomy, status = "silent", "info"
-    elif action["type"] in profile["autonomy"]["silent"]:
+    elif action["type"] in profile["autonomy"]["silent"] or action["type"] in TRIAGE_ACTIONS:
         autonomy, status = "silent", "approved"
     ids = [i["id"] for i in group]
     return {
