@@ -481,6 +481,14 @@ class RunTest(ProcessTestCase):
         self.assertIn("· delta", brief)
         self.assertNotIn("## acme", brief)
 
+    def test_a_dry_run_refuses_to_write_into_the_real_state_directory(self):
+        self.write_profile("acme")
+        del self.env["XDG_STATE_HOME"]
+
+        self.assertIn("scratch XDG_STATE_HOME", self.process("run", "--fixtures", "/fx", expect=1))
+        self.assertEqual(self.claude_calls(), [])
+        self.assertFalse((self.tmp / ".local" / "state" / "process").exists())
+
     def test_run_refuses_to_start_any_phase_when_a_profile_grants_a_send_tool(self):
         self.write_profile("acme")
         self.write_profile("side", triage_tools=["mcp__slack__slack_send_message"])

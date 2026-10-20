@@ -244,6 +244,9 @@ class Process:
         profile's model and allowlist; then render the brief. --fixtures points sweepers at fixture data and makes
         triage a dry run."""
         opts = flags(args, "--delta", "--project", "--fixtures")
+        real = Path(self.env["HOME"]) / ".local" / "state" / "process"
+        if opts.get("--fixtures") and self.state_root().resolve() == real.resolve():
+            raise SystemExit("process: a --fixtures dry run needs a scratch XDG_STATE_HOME, not the real queue in " + str(real))
         profiles = self.profiles()  # refuses before any phase starts if one grants a send tool
         if opts.get("--project") and opts["--project"] not in profiles:
             raise SystemExit(f"process: no profile {opts['--project']!r} in {self.profiles_dir()}")
