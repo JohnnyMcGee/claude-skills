@@ -565,9 +565,12 @@ class Process:
             raise SystemExit("process: nothing ranked, invalid tickets:\n" + "\n".join(problems))
         now = self.clock()
         free = [t for t in tickets if not t["blocked"]]
+        todo = [t for t in free if t["state"] == "todo" and t["assignee"] != "other"]
+        unblocked = [t for t in todo if t.get("unblocked_at", "") >= iso(now - UNBLOCKED_AGE)]
         tiers = [
             ("in_progress", [t for t in free if t["state"] == "in_progress" and t["assignee"] == "me"]),
-            ("todo", [t for t in free if t["state"] == "todo" and t["assignee"] != "other"]),
+            ("unblocked", unblocked),
+            ("todo", [t for t in todo if t not in unblocked]),
         ]
         picks = self.pr_fixes(name) + [recommend(tier, t, now) for tier, group in tiers for t in sorted(group, key=ticket_order)]
         picks = picks[:NEXT_SLOTS]
@@ -1088,7 +1091,9 @@ def entry(name, profile, group):
 
 NEXT_SLOTS = 3
 PRIORITY = {1: "urgent", 2: "high", 3: "medium", 4: "low"}
-TIER_LEADS = {"in_progress": "Already in progress", "todo": "Next in Todo"}
+# A Todo ticket stays newly unblocked this long after its last blocker cleared, then it is just another Todo ticket.
+UNBLOCKED_AGE = 3 * 24 * 3600
+TIER_LEADS = {"in_progress": "Already in progress", "unblocked": "Unblocked {unblocked}", "todo": "Next in Todo"}
 
 
 def ticket_order(t):
@@ -1101,7 +1106,7 @@ def recommend(tier, t, now):
     facts = [f"{PRIORITY[t['priority']]} priority"] if t["priority"] else []
     facts += [f"project due {t['target_date']}"] if t.get("target_date") else []
     facts.append(f"opened {max(0, int((now - created) // 86400))} days ago")
-    return {"tier": tier, "ref": t["identifier"], "title": t["title"], "link": t["url"], "reason": f"{TIER_LEADS[tier]}: {', '.join(facts)}"}
+    return {"tier": tier, "ref": t["identifier"], "title": t["title"], "link": t["url"], "reason": f"{TIER_LEADS[tier].format(unblocked=t.get('unblocked_at', '')[:10])}: {', '.join(facts)}"}
 
 
 def failure(phase, error):

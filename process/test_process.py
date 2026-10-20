@@ -1174,6 +1174,17 @@ class NextWorkRankingTest(NextWorkTestCase):
         self.assertEqual(fix["link"], "https://github.com/acme/widgets/pull/8")
         self.assertIn("2 fixes waiting", fix["reason"])
 
+    def test_a_newly_unblocked_ticket_comes_before_the_rest_of_todo_and_a_blocked_one_never_ranks(self):
+        _, result = self.next_work(
+            ticket("WID-1", priority=1),
+            ticket("WID-2", priority=4, unblocked_at="2026-10-19T09:00:00Z"),
+            ticket("WID-3", priority=4, unblocked_at="2026-10-01T09:00:00Z"),  # long ago: just another Todo ticket
+            ticket("WID-4", priority=1, blocked=True),
+        )
+
+        self.assertEqual(self.picks(result), ["WID-2", "WID-1", "WID-3"])
+        self.assertIn("Unblocked 2026-10-19", result["recommendations"][0]["reason"])
+
     def test_in_staging_tickets_never_take_a_slot(self):
         _, result = self.next_work(ticket("WID-1", state="in_staging", assignee="me", priority=1), ticket("WID-2"))
 
