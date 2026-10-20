@@ -704,8 +704,9 @@ class Process:
         return lock
 
     def execute(self, profile, dry):
-        """Run the executor phase for one profile when it has approved entries; return what went wrong, if anything.
-        A dry run (a dry-run state directory) gets --dry-run and no service tools."""
+        """Start the profile's approved AFK launches, then run the executor phase when it has other approved entries;
+        return what went wrong, if anything. A dry run (a dry-run state directory) gets --dry-run and no service tools."""
+        self.launch_afk(profile, dry)
         name, waiting = profile["name"], len(self.approved(profile["name"]))
         if not waiting:
             return None
@@ -716,9 +717,64 @@ class Process:
         if self.approved(name):
             return f"execute left {len(self.approved(name))} approved entr(ies) without a result"
 
-    def approved(self, name):
-        """Entries waiting on the executor: approved by me, or promoted to silent, with an action that carries text."""
-        return [e for e in self.queue() if e["project"] == name and e["status"] == "approved" and needs_draft(e)]
+    def approved(self, name, action_type=None):
+        """Entries waiting on the executor phase: approved by me, or promoted to silent, with an action that carries
+        text. AFK launches are not the phase's: `execute` starts them itself, and only they are listed for afk_launch."""
+        return [
+            e for e in self.queue()
+            if e["project"] == name and e["status"] == "approved" and needs_draft(e) and (e["action"]["type"] == "afk_launch") == (action_type == "afk_launch")
+        ]
+
+    # An approved AFK launch needs no headless phase: its draft becomes a ticket in a local afk spec in the profile's
+    # workdir, and afk starts the worker, in a tmux session of the spec's own that runs afk's watcher.
+
+    def launch_afk(self, profile, dry):
+        """Start a worker for each approved afk_launch, oldest first, and record how each went."""
+        name = profile["name"]
+        for e in self.approved(name, "afk_launch"):
+            if dry:
+                self.record(name, e, "skipped")
+                continue
+            try:
+                project, spec = self.afk_project(profile)
+                number = self.afk_ticket(spec, e)
+                self.run(["env", f"AFK_PROJECT={project}", "afk", "start", number], cwd=self.workdir(profile))
+            except (subprocess.CalledProcessError, OSError) as error:
+                self.record(name, e, "failure", error=failure("afk", error).removeprefix("afk failed: "))
+                continue
+            self.record(name, e, "success", link=e["action"]["params"]["url"])
+
+    def afk_project(self, profile):
+        """The profile's afk project and its spec directory, bound to a tmux session of the same name on first use."""
+        project, workdir = f"process-{profile['name']}", self.workdir(profile)
+        spec = workdir / ".scratch" / project  # afk's local spec layout: <repo>/.scratch/<project>/issues/
+        if not workdir.is_dir():
+            raise FileNotFoundError(f"no workdir {workdir}")
+        (spec / "issues").mkdir(parents=True, exist_ok=True)
+        try:
+            self.run(["tmux", "has-session", "-t", f"={project}"])
+        except subprocess.CalledProcessError:
+            pane = self.run(["tmux", "new-session", "-d", "-s", project, "-c", str(workdir), "-P", "-F", "#{pane_id}"]).strip()
+            self.run(["env", f"TMUX_PANE={pane}", "afk", "init", str(spec)], cwd=workdir)  # binds the pane's session
+            self.run(["tmux", "send-keys", "-t", pane, "afk watch", "Enter"])  # drives the workers through their phases
+        return project, spec
+
+    def afk_ticket(self, spec, e):
+        """Write the entry's approved draft as the spec's next ticket, once: a retry finds the file it wrote before."""
+        issues = sorted((spec / "issues").glob("*.md"))
+        for path in issues:
+            if re.search(rf"^\*\*Queue entry:\*\* {e['id']}$", path.read_text(), re.M):
+                return path.name.split("-", 1)[0]
+        number = str(max([int(p.name.split("-", 1)[0]) for p in issues if p.name.split("-", 1)[0].isdigit()], default=0) + 1).zfill(2)
+        params = e["action"]["params"]
+        title = " ".join(f"{params['ticket']} {params['title']}".split())
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:50].rstrip("-")
+        # afk reads a ticket's fields from their first match, so these come before the draft, which quotes Linear.
+        (spec / "issues" / f"{number}-{slug}.md").write_text(
+            f"# {number} — {title}\n\n**Status:** ready-for-agent\n\n**Blocked by:** None — can start immediately\n\n"
+            f"**Linear:** {params['url']}\n\n**Queue entry:** {e['id']}\n\n{e['action']['draft'].strip()}\n\n{AFK_PR.format(ticket=params['ticket'])}\n"
+        )
+        return number
 
     def apply_decisions(self, profiles):
         """Turn each decision on a still-pending entry into its new state. A decision on anything else is stale (the
@@ -1004,6 +1060,12 @@ MERGE_BASE = (
     "Merge the base branch into the PR branch (never rebase) and resolve the conflicts. Push only if every conflict is "
     "mechanical: both sides kept, nothing about behaviour decided. Otherwise abort and report the conflicting files."
 )
+# How an AFK worker's PR differs from afk's default: it is a draft, so it reads as unreviewed.
+AFK_PR = """## Pull request
+
+Open the PR as a draft. In the pr phase, push the branch and run `gh pr create --draft`, with a Conventional Commits
+title and {ticket} in the body so Linear links it, before `/open-pr`: it finds the open draft and clears its gates.
+Leave it a draft. Marking it ready for review is mine."""
 PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 
 

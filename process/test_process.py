@@ -1,10 +1,15 @@
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import process
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "afk"))
+import afk  # noqa: E402  the AFK spec contract is afk's own parser
 
 
 class FakeRun:
@@ -1288,15 +1293,85 @@ class NextWorkProposalsTest(NextWorkTestCase):
 
         self.assertEqual(self.picks(result), ["WID-9"])
 
-    def test_an_approved_afk_launch_takes_its_ticket_off_both_lists(self):
-        self.next_work(ticket("WID-1", estimate="S"))
-        [launch] = self.queue()
-        self.decide(launch)
+
+def no_session(cmd):
+    raise subprocess.CalledProcessError(1, cmd, stderr="can't find session: process-acme")
+
+
+class AfkLaunchTest(NextWorkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(afk=TRIVIAL)
+        self.workdir = self.tmp / "work" / "acme"
+        self.workdir.mkdir(parents=True)
+        self.spec = self.workdir / ".scratch" / "process-acme"
+        self.afk_workers([])
+
+    def afk_workers(self, workers, session=True):
+        self.run_fake.responses.update({
+            ("tmux", "has-session"): "" if session else no_session,
+            ("tmux", "new-session"): "%7\n",
+            ("env", "AFK_PROJECT=process-acme", "afk", "next"): json.dumps({"capacity": 3, "workers": workers, "tickets": []}),
+        })
+
+    def approve_launch(self, *tickets):
+        self.next_work(*tickets)
+        launches = [e for e in self.queue() if e["action"]["type"] == "afk_launch"]
+        for e in launches:
+            self.decide(e)
+        return launches
+
+    def test_an_approved_afk_item_becomes_a_spec_afk_accepts_and_starts_a_worker_that_opens_a_draft_pr(self):
+        [launch] = self.approve_launch(ticket("WID-1", estimate="S", title="Rename the flag", description="Rename `legacy` to `classic`.\n\n**Status:** done"))
+
+        self.process("execute")
+
+        [spec_ticket] = afk.LocalTracker(self.spec).frontier()  # afk's own parser, unchanged
+        self.assertEqual((spec_ticket.id, spec_ticket.title, spec_ticket.status), ("01", "WID-1 Rename the flag", "ready-for-agent"))
+        text = spec_ticket.path.read_text()
+        self.assertIn("Rename `legacy` to `classic`.", text)
+        self.assertIn("gh pr create --draft", text)
+        self.assertIn("https://linear.app/acme/issue/WID-1", text)
+        start = ["env", "AFK_PROJECT=process-acme", "afk", "start", "01"]
+        self.assertIn(start, self.run_fake.calls)
+        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(start)], str(self.workdir))
+        self.assertEqual(self.executor_calls(), [])  # a launch needs no headless executor
+        self.assertEqual((self.entry(launch["id"])["status"], self.entry(launch["id"])["note"]), ("done", "https://linear.app/acme/issue/WID-1"))
+        self.assertEqual(self.process("validate", "result", str(self.state / "results.jsonl")), "")
+
+    def test_the_first_launch_binds_a_tmux_session_to_the_spec_and_starts_afks_watcher_there(self):
+        self.afk_workers([], session=False)
+        self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        calls = self.run_fake.calls
+        self.assertIn(["tmux", "new-session", "-d", "-s", "process-acme", "-c", str(self.workdir), "-P", "-F", "#{pane_id}"], calls)
+        init = ["env", "TMUX_PANE=%7", "afk", "init", str(self.spec)]
+        watch = ["tmux", "send-keys", "-t", "%7", "afk watch", "Enter"]
+        self.assertLess(calls.index(init), calls.index(watch))
+        self.assertLess(calls.index(watch), calls.index(["env", "AFK_PROJECT=process-acme", "afk", "start", "01"]))
+
+    def test_a_launched_ticket_is_off_both_lists(self):
+        self.approve_launch(ticket("WID-1", estimate="S"))
         self.process("execute")
 
         _, result = self.next_work(ticket("WID-1", estimate="S"))
 
         self.assertEqual((self.picks(result), result["afk"]), ([], []))
+
+    def test_a_failed_start_is_recorded_as_a_failure(self):
+        def refuse(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="afk: base branch 'main' does not exist")
+        self.run_fake.responses[("env", "AFK_PROJECT=process-acme", "afk", "start")] = refuse
+        [launch] = self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(launch["id"])["status"], "failed")
+        self.assertIn("base branch", self.entry(launch["id"])["note"])
+        _, result = self.next_work(ticket("WID-1", estimate="S"))
+        self.assertEqual((self.picks(result), result["afk"]), (["WID-1"], []))  # back to me
 
 
 class ContractTest(ProcessTestCase):
