@@ -504,6 +504,15 @@ class UrgencyTest(TriageTestCase):
 
         self.assertEqual(self.urgent(), ["Ben requested your review on #102"])
 
+    def test_the_same_ask_in_slack_and_linear_is_one_urgent_entry_when_either_item_matches(self):
+        permalink = "https://acme.slack.com/archives/C300/p1792500000000900"
+        self.emit(slack(native_id="C300/1792500000.000900", subject=permalink, link=permalink, actor={"name": "boss", "role": "person"}, summary="Boss asked you in #widgets for the export ETA", facts={"channel": "#widgets", "ask": "question"}), source="slack")
+        self.emit(linear(native_id="notif-10", kind="mention", subject=permalink, actor={"name": "Slack", "role": "bot"}, summary="Slack thread synced to WID-15 mentions you", facts={"notification_id": "notif-10"}), source="linear")
+
+        [ask] = [e for e in self.triage() if e["kind"] == "mention"]
+
+        self.assertEqual((ask["sources"], ask["urgency"]), (["linear", "slack"], "urgent"))
+
     def test_a_dm_from_a_peer_is_not_urgent(self):
         self.emit(slack(native_id="D1/1", kind="dm", summary="Dee DMed you about the index", facts={"channel": "DM", "ask": "question"}), source="slack")
 
