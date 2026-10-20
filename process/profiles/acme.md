@@ -68,6 +68,20 @@ allowed_tools = [
   "mcp__linear-server__list_comments",
   "mcp__github__pull_request_read",
 ]
+
+# The executor: the only phase that may send, and only what I approved (or promoted to silent). Never a merge, an
+# approval, a delete or a raw push: it pushes through `process execute push`, which checks the PR is mine.
+[phases.execute]
+model = "opus"
+allowed_tools = [
+  "Read",
+  "Bash(process profile:*)",
+  "Bash(process execute:*)",
+  "mcp__github__pull_request_read",
+  "mcp__github__pull_request_review_write",
+  "mcp__github__add_reply_to_pull_request_comment",
+  "mcp__github__add_issue_comment",
+]
 +++
 
 # Acme widgets

@@ -123,6 +123,23 @@ def forbidden_tool(tool):
     return not READ_ONLY.search(tool) and bool(SEND_WORDS.search(tool.lower()))
 
 
+# Never actions, or what reaches one: merging, approving, deleting, deploying, and pushing (the executor pushes only
+# through `process execute push`, which checks the branch is my PR's). No phase may hold these, the executor included.
+NEVER_WORDS = re.compile(r"merge|approve|delete|deploy|release|push|create_or_update_file|transfer|fork|secret")
+
+
+def never_tool(tool):
+    """True when an executor allowlist entry could take a never action, or is broad enough to reach one."""
+    bash = re.fullmatch(r"Bash\((.*)\)", tool)
+    if bash:
+        words = bash[1].removesuffix(":*").removesuffix("*").split()
+        too_broad = len(words) < 2 or words[0] in LAUNCHERS or words[0] in ("gh", "git") and (len(words) < 3 or words[1] == "api")
+        return too_broad or words[:3] == ["gh", "pr", "review"] or bool(NEVER_WORDS.search(" ".join(words)))
+    if tool in UNSCOPED or "*" in tool or (tool.startswith("mcp__") and tool.count("__") < 2):
+        return True
+    return bool(NEVER_WORDS.search(tool.lower()))
+
+
 # Denied to every sweep and triage phase, as a backstop for allow rules in the user's own settings.
 DENIED_TOOLS = [
     "Bash(gh pr merge:*)",
@@ -143,6 +160,10 @@ DENIED_TOOLS = [
     "mcp__claude_ai_Google_Calendar__respond_to_event",
     "mcp__linear-server__save_comment",
 ]
+
+
+# Denied to the executor: the never actions among DENIED_TOOLS. It keeps the send tools its allowlist grants.
+NEVER_DENIED = [t for t in DENIED_TOOLS if never_tool(t)] + ["mcp__github__push_files", "mcp__github__create_or_update_file"]
 
 
 def load_profile(path):
@@ -167,7 +188,10 @@ def load_profile(path):
         if f"sweep-{source}" not in phases:
             problems.append(f"source {source!r} has no [phases.sweep-{source}]")
     for name, phase in phases.items():
-        problems += [f"phases.{name} grants {t!r}, which can send, review, RSVP or merge" for t in phase.get("allowed_tools", []) if forbidden_tool(t)]
+        if name == "execute":
+            problems += [f"phases.execute grants {t!r}, which can merge, approve, delete or push" for t in phase.get("allowed_tools", []) if never_tool(t)]
+        else:
+            problems += [f"phases.{name} grants {t!r}, which can send, review, RSVP or merge" for t in phase.get("allowed_tools", []) if forbidden_tool(t)]
     if problems:
         raise SystemExit(f"process: profile {path}:\n" + "\n".join(f"  {p}" for p in problems))
     return {**profile, "body": match[2]}
@@ -327,14 +351,16 @@ class Process:
 
     def headless(self, profile, phase, prompt, dry=False):
         """One phase as headless Claude in dontAsk mode: only its allowlist is approved, everything else is denied, and
-        known send tools are denied by name too. A dry run gets no service (MCP) tools at all."""
+        known send tools (for the executor, known never actions) are denied by name too. A dry run gets no service (MCP)
+        tools at all."""
         config = profile["phases"][phase]
         tools = [t for t in config["allowed_tools"] if not (dry and t.startswith("mcp__"))]
         inbox = self.inbox(profile["name"])
         tools.append(f"Edit(/{inbox}/**)")  # dontAsk refuses heredocs, so items and drafts travel as inbox files
         workdir = Path(profile["workdir"].replace("~", self.env["HOME"], 1) if profile["workdir"].startswith("~") else profile["workdir"])
         cmd = ["claude", "-p", prompt, "--model", config["model"], "--permission-mode", "dontAsk"]
-        cmd += ["--add-dir", str(inbox), "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(DENIED_TOOLS)]
+        denied = NEVER_DENIED if phase == "execute" else DENIED_TOOLS
+        cmd += ["--add-dir", str(inbox), "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(denied)]
         return self.run(cmd, cwd=workdir)
 
     def cmd_profile(self, name):
@@ -516,7 +542,9 @@ class Process:
         self.apply_decisions(profiles)
         names = [opts["--project"]] if opts.get("--project") else list(profiles)
         for name in names:
-            if self.approved(name):
+            if self.approved(name) and "execute" not in profiles[name]["phases"]:
+                self.out(f"process: {name} has no [phases.execute]; {len(self.approved(name))} approved entr(ies) wait")
+            elif self.approved(name):
                 self.out(f"{name}: execute")
                 self.headless(profiles[name], "execute", f"/execute {name}")
 

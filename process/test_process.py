@@ -552,6 +552,35 @@ class ExecuteTest(ExecuteTestCase):
         self.assertEqual(call[:3], ["claude", "-p", "/execute acme"])
         self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
 
+    def test_the_executor_runs_headless_with_its_send_tools_but_never_a_merge(self):
+        self.write_profile(execute_tools=["Read", "Bash(process execute:*)", "mcp__github__pull_request_review_write"])
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review)
+
+        self.process("execute")
+
+        [cmd] = self.executor_calls()
+        opt = lambda name: cmd[cmd.index(name) + 1].split(",")
+        self.assertIn("mcp__github__pull_request_review_write", opt("--allowedTools"))
+        self.assertNotIn("mcp__github__pull_request_review_write", opt("--disallowedTools"))
+        self.assertIn("mcp__github__merge_pull_request", opt("--disallowedTools"))
+        self.assertIn("Bash(git push:*)", opt("--disallowedTools"))
+        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
+        self.assertEqual(cmd[cmd.index("--model") + 1], "opus")
+
+    def test_a_profile_without_an_executor_keeps_its_approved_entries_waiting(self):
+        path = self.write_profile()
+        path.write_text(path.read_text().split("[phases.execute]")[0].rstrip() + "\n+++" + path.read_text().split("+++", 2)[2])
+        self.emit(item())
+        [review] = self.triage()
+        self.decide(review)
+
+        self.assertIn("acme has no [phases.execute]", self.process("execute"))
+
+        self.assertEqual(self.executor_calls(), [])
+        self.assertEqual(self.entry(review["id"])["status"], "approved")
+
     def test_a_skipped_entry_is_handled_and_its_items_stay_handled_until_they_change(self):
         self.emit(item())
         [review] = self.triage()
@@ -897,19 +926,64 @@ class ProfileTest(ProcessTestCase):
                 out = self.process("profiles", expect=1)
                 self.assertIn(f"phases.triage grants {tool!r}", out)
 
+    # Tools that send what I approved: the executor's, and only the executor's.
+    EXECUTOR_TOOLS = [
+        "mcp__github__pull_request_review_write",
+        "mcp__github__add_issue_comment",
+        "mcp__github__add_reply_to_pull_request_comment",
+        "mcp__slack__slack_send_message",
+        "Bash(process execute:*)",
+    ]
+    # Never actions, or tools broad enough to reach one. No phase may hold them, the executor included.
+    NEVER_TOOLS = [
+        "mcp__github__merge_pull_request",
+        "Bash(gh pr merge:*)",
+        "Bash(gh pr review:*)",
+        "Bash(gh api:*)",
+        "Bash(git push:*)",
+        "mcp__github__push_files",
+        "mcp__github__create_or_update_file",
+        "mcp__github__delete_repository",
+        "Bash",
+        "Bash(gh:*)",
+        "Bash(git:*)",
+        "Bash(sh -c:*)",
+        "mcp__github__*",
+        "mcp__slack",
+        "Edit",
+        "Write",
+        "WebFetch",
+    ]
+
+    def test_the_executor_may_hold_send_tools(self):
+        self.write_profile(execute_tools=["Read", *self.EXECUTOR_TOOLS])
+
+        self.assertIn("acme  active", self.process("profiles"))
+
+    def test_no_phase_may_hold_a_never_tool_not_even_the_executor(self):
+        for tool in self.NEVER_TOOLS:
+            with self.subTest(tool=tool):
+                self.write_profile(execute_tools=["Read", tool])
+                self.assertIn(f"phases.execute grants {tool!r}", self.process("profiles", expect=1))
+
     def test_a_profile_missing_its_how_to_sweep_section_is_refused(self):
         self.write_profile(text=self.write_profile().read_text().replace("## How to sweep", "## Notes"))
 
         self.assertIn("## How to sweep", self.process("profiles", expect=1))
 
-    def test_every_shipped_profile_is_valid_and_its_sweep_and_triage_allowlists_hold_no_send_tool(self):
+    def test_every_shipped_profile_is_valid_and_only_its_executor_holds_send_tools(self):
         self.assertTrue(SHIPPED_PROFILES, "no profiles shipped")
         for path in SHIPPED_PROFILES:
             with self.subTest(profile=path.name):
                 profile = process.load_profile(path)  # raises SystemExit with every problem
-                for phase in profile["phases"].values():
-                    self.assertFalse(set(phase["allowed_tools"]) & set(self.SEND_TOOLS))
+                phases = dict(profile["phases"])
+                executor = phases.pop("execute")["allowed_tools"]
+                for phase in phases.values():
+                    self.assertFalse(set(phase["allowed_tools"]) & set(self.SEND_TOOLS + self.EXECUTOR_TOOLS))
                     self.assertEqual([t for t in phase["allowed_tools"] if process.forbidden_tool(t)], [])
+                self.assertIn("mcp__github__pull_request_review_write", executor)
+                self.assertFalse(set(executor) & set(self.NEVER_TOOLS))
+                self.assertEqual([t for t in executor if process.never_tool(t)], [])
 
     def test_the_example_profile_declares_its_repo_team_account_models_and_how_to_sweep(self):
         acme = process.load_profile(Path(__file__).parent / "profiles" / "acme.md")
