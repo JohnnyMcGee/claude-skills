@@ -648,7 +648,7 @@ class Process:
                 "ref": f"{repo}#{number}",
                 "title": fixes[0]["summary"],
                 "link": f"https://github.com/{repo}/pull/{number}",
-                "reason": f"My own PR: {len(fixes)} fix{'es' if len(fixes) > 1 else ''} waiting on me, first {fixes[0]['summary']}",
+                "reason": f"My own PR: {len(fixes)} fix{'es' if len(fixes) > 1 else ''} waiting on me",
             }
             for (repo, number), fixes in prs.items()
         ]
@@ -1035,6 +1035,8 @@ class Process:
             entries = [e for e in shown if e["project"] == name and e["status"] != "superseded"]
             lines += [f"## {name}", ""] + [f"> ⚠ {p}" for p in run.get("problems", {}).get(name, [])]
             lines += render_project(entries, acted) or ["Nothing new.", ""]
+            if mode == "full":  # next-work runs with the full brief
+                lines += render_next(self.read_json(self.state_root() / "profiles" / name / "next.json", None), queue)
         brief = "\n".join(lines).rstrip() + "\n"
         self.state_root().mkdir(parents=True, exist_ok=True)
         (self.state_root() / "brief.md").write_text(brief)
@@ -1160,6 +1162,18 @@ def render_project(entries, acted=()):
         lines += [f"- {'**urgent** · ' if e['urgency'] == 'urgent' else ''}{e['summary']} · {e['link']}" for e in fyi]
         lines += ["", "</details>", ""]
     return lines
+
+
+def render_next(result, queue):
+    """The Next work section: my up to 3 recommendations, each with its reason, then the AFK list and where each stands."""
+    if not result or not (result["recommendations"] or result["afk"]):
+        return []
+    status = {e["id"]: e["status"] for e in queue}
+    lines = ["### Next work", ""]
+    lines += [f"{n}. {r['ref']} {r['title']} — {r['reason']} · {r['link']}" for n, r in enumerate(result["recommendations"], 1)]
+    lines += [""] if result["recommendations"] else []
+    lines += [f"- AFK: {r['ref']} {r['title']} — {r['reason']} · {status.get(r['entry_id'], 'pending')}" for r in result["afk"]]
+    return lines + ([""] if result["afk"] else [])
 
 
 def entry(name, profile, group):

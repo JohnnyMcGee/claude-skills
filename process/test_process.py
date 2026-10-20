@@ -1210,6 +1210,19 @@ class NextWorkRankingTest(NextWorkTestCase):
         self.assertEqual(self.picks(result), ["WID-1", "WID-2", "WID-3"])
         self.assertEqual(self.queue(), [])
 
+    def test_the_full_brief_shows_my_next_work_with_reasons_and_the_afk_list(self):
+        self.write_profile(afk=TRIVIAL)
+        self.next_work(ticket("WID-5", state="in_progress", assignee="me", title="Paginate orders"), ticket("WID-1", estimate="S", title="Rename the flag"))
+
+        self.process("brief")
+
+        brief = (self.state / "brief.md").read_text()
+        section = brief.split("### Next work", 1)[1]
+        self.assertIn("1. WID-5 Paginate orders — Already in progress: medium priority, opened 19 days ago · https://linear.app/acme/issue/WID-5", section)
+        self.assertIn("AFK: WID-1 Rename the flag — Trivial: estimate S · pending", section)
+        self.process("brief", "--delta")
+        self.assertNotIn("### Next work", (self.state / "brief.md").read_text())  # it runs with the full brief
+
     def test_in_staging_tickets_never_take_a_slot(self):
         _, result = self.next_work(ticket("WID-1", state="in_staging", assignee="me", priority=1), ticket("WID-2"))
 
@@ -1282,6 +1295,18 @@ class NextWorkProposalsTest(NextWorkTestCase):
 
         self.assertEqual((self.picks(result), result["afk"]), (["WID-1"], []))
         self.assertEqual([e["status"] for e in self.queue()], ["skipped"])
+
+    def test_an_approved_promotion_is_carried_out_by_the_executor_phase(self):
+        self.next_work(ticket("WID-8", state="backlog"))
+        [promote] = self.queue()
+        self.decide(promote)
+
+        self.process("execute")
+
+        self.assertEqual(self.executor_calls()[0][2], "/execute acme")
+        plan = self.process("execute", "plan", "acme")
+        self.assertIn(f'{promote["id"]}  linear_promote {{"ticket": "WID-8"', plan)
+        self.assertIn("| Move WID-8 from Backlog to Todo.", plan)
 
     def test_a_skipped_promotion_is_not_proposed_again(self):
         self.next_work(ticket("WID-8", state="backlog"))
