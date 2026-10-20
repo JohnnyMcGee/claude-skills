@@ -56,10 +56,10 @@ timezone = "America/Chicago"
 sources = {sources}
 
 [github]
-repo = "acme/widgets"
+repo = "{repo}"
 
 [linear]
-team = "WID"
+team = "{team}"
 {extra}
 [urgency]
 people = ["boss"]
@@ -197,7 +197,7 @@ class ProcessTestCase(unittest.TestCase):
     def state(self):
         return self.tmp / "state" / "process"
 
-    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None):
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None, repo="acme/widgets", team="WID"):
         path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         extra = ""
@@ -215,6 +215,8 @@ class ProcessTestCase(unittest.TestCase):
                 active=str(active).lower(),
                 workdir=self.tmp / "work" / name,
                 sources=json.dumps(list(sources)),
+                repo=repo,
+                team=team,
                 extra=extra,
                 phases=phases,
                 silent=json.dumps(list(silent)),
@@ -296,6 +298,37 @@ class EmitTest(ProcessTestCase):
         self.assertIn("1 already answered", out)
         self.assertEqual(self.jsonl(self.profile_dir() / "items.jsonl"), [])
         self.assertEqual(self.process("watermark", "acme", "slack").strip(), "2026-10-20T13:00:00Z")
+
+    def test_a_shared_source_is_attributed_to_projects_by_match_rules_and_the_rest_is_unsorted(self):
+        self.write_profile("acme", sources=ALL_SOURCES, watchlist=["#deploys"])
+        self.write_profile("side", sources=ALL_SOURCES, watchlist=["#gadgets"], repo="acme/gadgets", team="GAD", match={"keywords": ["gizmo"], "senders": ["@gadgets.example"]})
+        self.write_profile("old", active=False, sources=ALL_SOURCES, match={"keywords": ["lunch"]})
+
+        out = self.emit(
+            slack(native_id="C1/1", facts={"channel": "#deploys"}),  # acme's watchlist
+            slack(native_id="C2/2", summary="Eve asked about the gizmo rollout", facts={"channel": "#general"}),  # side's keyword
+            slack(native_id="C3/3", summary="Fay asked whether GAD-12 ships today", facts={"channel": "#general"}),  # side's team
+            slack(native_id="C4/4", summary="Gus asked who is up for lunch", context="lunch?", facts={"channel": "#random"}),
+            source="slack",
+            watermark="2026-10-20T13:00:00Z",
+        )
+
+        attributed = {name: [i["native_id"] for i in self.jsonl(self.profile_dir(name) / "items.jsonl")] for name in ("acme", "side", "unsorted")}
+        self.assertEqual(attributed, {"acme": ["C1/1"], "side": ["C2/2", "C3/3"], "unsorted": ["C4/4"]})
+        self.assertEqual(self.jsonl(self.profile_dir("side") / "items.jsonl")[0]["profile"], "side")
+        self.assertIn("stored 4 new item(s)", out)
+        for name in ("acme", "side"):
+            self.assertEqual(self.process("watermark", name, "slack").strip(), "2026-10-20T13:00:00Z")
+
+    def test_a_source_no_other_active_profile_shares_takes_every_item(self):
+        self.write_profile("acme", sources=ALL_SOURCES)
+        self.write_profile("side", sources=ALL_SOURCES, workspace="gadgets", account="me@gadgets.example", match={"keywords": ["lunch"]})
+
+        self.emit(slack(summary="Gus asked who is up for lunch", facts={"channel": "#random"}), source="slack")
+        self.emit(email(summary="Lunch on Friday?", actor={"name": "gus@gadgets.example", "role": "person"}), source="gmail")
+
+        self.assertEqual([i["source"] for i in self.jsonl(self.profile_dir("acme") / "items.jsonl")], ["slack", "gmail"])
+        self.assertFalse((self.profile_dir("side") / "items.jsonl").exists())
 
     def test_re_emitting_an_unchanged_item_is_a_no_op_but_a_new_version_is_a_new_item(self):
         self.emit(item())
@@ -848,6 +881,11 @@ class ProfileTest(ProcessTestCase):
         self.write_profile(text=text.replace("[google]", "[elsewhere]").replace('account = "me@acme.example"\n', ""))
 
         self.assertIn("source 'gmail' has no [google] table", self.process("profiles", expect=1))
+
+    def test_unsorted_is_reserved_for_items_no_profile_claims(self):
+        self.write_profile("unsorted")
+
+        self.assertIn("'unsorted' is reserved", self.process("profiles", expect=1))
 
     def test_a_profile_missing_its_how_to_sweep_section_is_refused(self):
         self.write_profile(text=self.write_profile().read_text().replace("## How to sweep", "## Notes"))

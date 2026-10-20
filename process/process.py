@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -149,6 +150,34 @@ DENIED_TOOLS = [
 SOURCE_TABLE = {"gmail": "google", "calendar": "google", "meetings": "google"}
 
 
+# Where a shared source's items go when no profile's match rules claim them.
+UNSORTED = "unsorted"
+
+
+def share_key(profile, source):
+    """What makes two profiles' source the same feed, swept once for both; None for a source never shared."""
+    if source == "slack":
+        return ("slack", profile["slack"]["workspace"].lower())
+    if SOURCE_TABLE.get(source) == "google":
+        return (source, profile["google"]["account"].lower())
+    return None
+
+
+def claims(profile, item):
+    """True when a profile's match rules (plus its repo, Linear team and Slack watchlist) claim a shared-source item."""
+    rules = profile.get("match", {})
+    text = " ".join([item["summary"], item["subject"], item["link"], item["context"]]).lower()
+    channels = {c.lower() for c in rules.get("channels", []) + profile.get("slack", {}).get("watchlist", [])}
+    actor = item["actor"]["name"].lower()
+    team = profile.get("linear", {}).get("team")
+    return (
+        (item.get("facts") or {}).get("channel", "").lower() in channels
+        or any(actor == s.lower() or (s.startswith("@") and actor.endswith(s.lower())) for s in rules.get("senders", []))
+        or any(k.lower() in text for k in rules.get("keywords", []) + [profile.get("github", {}).get("repo", "\0")])
+        or bool(team and re.search(rf"\b{re.escape(team)}-\d+\b", text, re.I))
+    )
+
+
 def load_profile(path):
     """Parse a profile: TOML front matter between +++ lines, then the how-to-sweep prose. Raises on any problem."""
     match = re.match(r"\+\+\+\n(.*?)\n\+\+\+\n(.*)", path.read_text(), re.S)
@@ -159,6 +188,8 @@ def load_profile(path):
     except tomllib.TOMLDecodeError as error:
         raise SystemExit(f"process: {path}: {error}")
     problems = validate(profile, "profile")
+    if profile.get("name") == UNSORTED:
+        problems.append(f"the name {UNSORTED!r} is reserved for items no profile claims")
     if profile.get("name") != path.stem:
         problems.append(f"name {profile.get('name')!r} does not match the file name {path.stem!r}")
     for heading in ("## How to sweep", "## Changelog"):
@@ -354,13 +385,24 @@ class Process:
 
     # -- sweeper side --
 
+    def share_group(self, name, source):
+        """The profiles one sweep of this source serves: the sweeping profile plus every active one that shares its feed."""
+        if source in ("github", "linear"):
+            return {name: None}
+        profiles = self.profiles()
+        if source not in self.profile(name)["sources"]:
+            raise SystemExit(f"process: profile {name!r} does not sweep {source}")
+        key = share_key(profiles[name], source)
+        return {n: p for n, p in sorted(profiles.items()) if n == name or (p["active"] and source in p["sources"] and share_key(p, source) == key)}
+
     def cmd_emit(self, profile, source, *args):
-        """Store a sweeper's candidate items (JSONL on stdin, or --file) and advance its watermark."""
+        """Store a sweeper's candidate items (JSONL on stdin, or --file) and advance its watermark. A source shared with
+        other profiles is attributed item by item to the first profile whose match rules claim it, or to unsorted."""
         opts = flags(args, "--watermark", "--file")
         path = opts.get("--file") and self.inbox_file(profile, opts["--file"])
         text = path.read_text() if path else self.stdin.read()
-        pdir = self.profile_state(profile)
-        known = {i["id"] for i in self.read_jsonl(pdir / "items.jsonl")}
+        group = self.share_group(profile, source)
+        known = {}
         fresh, problems, answered = [], [], 0
         for n, candidate in enumerate(self.parse_jsonl(text, "item"), 1):
             candidate.pop("id", None)
@@ -369,20 +411,30 @@ class Process:
             if not errors and record["source"] != source:
                 errors = [f"$.source: {record['source']!r} emitted by the {source} sweeper"]
             problems += [f"item {n}: {e}" for e in errors]
+            if errors:
+                continue
+            if len(group) > 1:
+                record["profile"] = next((n for n, p in group.items() if claims(p, record)), UNSORTED)
+            if record["profile"] not in known:
+                known[record["profile"]] = {i["id"] for i in self.read_jsonl(self.profile_state(record["profile"]) / "items.jsonl")}
             if (record.get("facts") or {}).get("answered"):  # I already replied or reacted: not an ask any more
                 answered += 1
-            elif record["id"] not in known:
-                known.add(record["id"])
+            elif record["id"] not in known[record["profile"]]:
+                known[record["profile"]].add(record["id"])
                 fresh.append(record)
         if problems:
             raise SystemExit("process: nothing stored, invalid items:\n" + "\n".join(problems))
-        self.append_jsonl(pdir / "items.jsonl", fresh)
-        marks = self.read_json(pdir / "watermarks.json", {})
-        marks[source] = opts.get("--watermark") or iso(self.clock())
-        self.write_json(pdir / "watermarks.json", marks)
+        counts = Counter(r["profile"] for r in fresh)
+        for name in counts:
+            self.append_jsonl(self.profile_state(name) / "items.jsonl", [r for r in fresh if r["profile"] == name])
+        mark = opts.get("--watermark") or iso(self.clock())
+        for name in group:
+            pdir = self.profile_state(name)
+            self.write_json(pdir / "watermarks.json", {**self.read_json(pdir / "watermarks.json", {}), source: mark})
         if path:
             path.unlink()  # consumed, so a later sweep can never re-send it
-        self.out(f"stored {len(fresh)} new item(s) for {profile}/{source}; watermark {marks[source]}" + (f"; skipped {answered} already answered" if answered else ""))
+        split = f" ({', '.join(f'{n} {c}' for n, c in counts.items())})" if len(group) > 1 and counts else ""
+        self.out(f"stored {len(fresh)} new item(s) for {profile}/{source}{split}; watermark {mark}" + (f"; skipped {answered} already answered" if answered else ""))
 
     def cmd_watermark(self, profile, source):
         """Print the source's watermark for the profile; nothing when it has never been swept."""
