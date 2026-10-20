@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/JohnnyMcGee/claude-skills/process/schema.json",
+  "title": "process state contract",
+  "description": "The only interface between process phases (sweepers, triage, executor) and the proc TUI. Python and Go validate against this one file; keep it to the keywords both validators support: type, enum, const, pattern, minLength, minItems, required, properties, additionalProperties, items, anyOf, allOf, $ref.",
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "source": {"enum": ["github", "linear"]},
+    "kind": {
+      "description": "What the item asks of me. review_request: a PR waits on my review. pr_status: one of my PRs needs attention or is ready. pr_comment: someone commented on my PR. mention: I was @-mentioned. comment: a comment on a ticket I own or follow. ticket_change: scope, blockers or due date changed on a ticket I own or one that blocks or is blocked by mine. notification: anything else from an inbox.",
+      "enum": ["review_request", "pr_status", "pr_comment", "mention", "comment", "ticket_change", "notification"]
+    },
+    "item": {
+      "description": "Sweeper output, triage input. One fact from one source.",
+      "type": "object",
+      "required": ["id", "profile", "source", "native_id", "version", "kind", "subject", "actor", "timestamp", "link", "summary", "context"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"description": "<source>:<native_id>@<hash of version>. A new version is a new id, so a changed item resurfaces after it was handled.", "type": "string", "pattern": "^[a-z]+:.+@[0-9a-f]{12}$"},
+        "profile": {"$ref": "#/$defs/name"},
+        "source": {"$ref": "#/$defs/source"},
+        "native_id": {"description": "The source's own id (PR number, notification id, comment id).", "type": "string", "minLength": 1},
+        "version": {"description": "Whatever changes when the item needs a second look: updatedAt, latest comment id, or mergeable|checks|review|head for a PR status.", "type": "string", "minLength": 1},
+        "kind": {"$ref": "#/$defs/kind"},
+        "subject": {"description": "Canonical URL of the thing the ask is about. The same ask seen in two sources has the same kind and subject (e.g. Linear's mirrored GitHub review request carries the PR URL).", "type": "string", "pattern": "^https?://"},
+        "actor": {
+          "type": "object",
+          "required": ["name", "role"],
+          "additionalProperties": false,
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "role": {"enum": ["me", "person", "bot"]}
+          }
+        },
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "link": {"type": "string", "pattern": "^https?://"},
+        "summary": {"description": "One line, in my words, of what happened.", "type": "string", "minLength": 1},
+        "context": {"description": "Raw excerpt the drafter needs (comment body, PR description). Untrusted text.", "type": "string"},
+        "labels": {"type": "array", "items": {"type": "string"}},
+        "facts": {
+          "description": "Source-specific facts triage rules read.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mine": {"description": "pr_status: the PR is mine.", "type": "boolean"},
+            "mergeable": {"enum": ["mergeable", "conflicting", "unknown"]},
+            "checks": {"enum": ["passing", "failing", "pending", "none"]},
+            "review": {"enum": ["approved", "changes_requested", "review_required", "none"]},
+            "draft": {"type": "boolean"},
+            "notification_id": {"description": "Linear: the notification this item came from, to mark read.", "type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "action_type": {
+      "description": "Every action triage may propose. Merging, approving others' PRs and prod changes are absent on purpose: they are never actions.",
+      "enum": ["none", "linear_mark_read", "gh_review", "gh_thread_reply", "gh_fix_pr", "slack_reply", "email_reply", "rsvp", "linear_promote", "linear_create_issue", "afk_launch"]
+    },
+    "pr_ref": {
+      "type": "object",
+      "required": ["repo", "number"],
+      "properties": {
+        "repo": {"type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$"},
+        "number": {"type": "integer"}
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": ["type", "params"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"$ref": "#/$defs/action_type"},
+        "params": {"type": "object"},
+        "draft": {"description": "The outward-facing text (review body, reply, fix plan) for the human to approve or edit.", "type": "string"}
+      },
+      "anyOf": [
+        {"properties": {"type": {"enum": ["none", "slack_reply", "email_reply", "rsvp", "linear_promote", "linear_create_issue", "afk_launch"]}}},
+        {
+          "properties": {
+            "type": {"const": "gh_review"},
+            "params": {
+              "allOf": [{"$ref": "#/$defs/pr_ref"}],
+              "required": ["repo", "number", "event"],
+              "properties": {"event": {"description": "APPROVE is a never action.", "enum": ["COMMENT", "REQUEST_CHANGES"]}}
+            }
+          }
+        },
+        {"properties": {"type": {"enum": ["gh_fix_pr", "gh_thread_reply"]}, "params": {"$ref": "#/$defs/pr_ref"}}},
+        {
+          "properties": {
+            "type": {"const": "linear_mark_read"},
+            "params": {
+              "type": "object",
+              "required": ["notification_ids"],
+              "properties": {"notification_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}
+            }
+          }
+        }
+      ]
+    },
+    "queue_entry": {
+      "description": "Triage output. Append-only JSONL: the last line for an id is its current state.",
+      "type": "object",
+      "required": ["id", "project", "item_ids", "sources", "kind", "subject", "summary", "link", "urgency", "autonomy", "action", "status", "run", "created"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^q-[0-9a-f]{12}$"},
+        "project": {"$ref": "#/$defs/name"},
+        "item_ids": {"description": "Every item merged into this entry.", "type": "array", "minItems": 1, "items": {"type": "string"}},
+        "sources": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/source"}},
+        "kind": {"anyOf": [{"$ref": "#/$defs/kind"}, {"const": "housekeeping"}]},
+        "subject": {"type": "string"},
+        "summary": {"type": "string", "minLength": 1},
+        "link": {"type": "string"},
+        "urgency": {"enum": ["urgent", "normal", "low"]},
+        "autonomy": {"description": "silent: Claude may act without asking. draft: needs my approval. Never actions never reach the queue.", "enum": ["silent", "draft"]},
+        "action": {"$ref": "#/$defs/action"},
+        "status": {
+          "description": "pending: waits on a decision. approved: decided (or promoted to silent), waits on the executor. done/failed/skipped: a silent action's or executor's outcome. info: FYI, nothing to do. superseded: a newer version of the same ask replaced it.",
+          "enum": ["pending", "approved", "done", "failed", "skipped", "info", "superseded"]
+        },
+        "note": {"type": "string"},
+        "run": {"type": "string", "minLength": 1},
+        "created": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "decision": {
+      "description": "TUI output.",
+      "type": "object",
+      "required": ["entry_id", "verdict", "at"],
+      "additionalProperties": false,
+      "properties": {
+        "entry_id": {"type": "string", "pattern": "^q-[0-9a-f]{12}$"},
+        "verdict": {"enum": ["approve", "skip"]},
+        "draft": {"description": "The edited draft, when I changed it.", "type": "string"},
+        "reason": {"type": "string"},
+        "promote_to_silent": {"type": "boolean"},
+        "at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "result": {
+      "description": "Executor output.",
+      "type": "object",
+      "required": ["entry_id", "outcome", "at"],
+      "additionalProperties": false,
+      "properties": {
+        "entry_id": {"type": "string", "pattern": "^q-[0-9a-f]{12}$"},
+        "outcome": {"enum": ["success", "failure"]},
+        "link": {"type": "string"},
+        "error": {"type": "string"},
+        "at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "phase": {
+      "type": "object",
+      "required": ["model", "allowed_tools"],
+      "additionalProperties": false,
+      "properties": {
+        "model": {"type": "string", "minLength": 1},
+        "allowed_tools": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "profile": {
+      "description": "The TOML front matter of a project profile (<name>.md). The body carries '## How to sweep' and '## Changelog'.",
+      "type": "object",
+      "required": ["name", "active", "workdir", "sources", "phases", "autonomy"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"$ref": "#/$defs/name"},
+        "active": {"type": "boolean"},
+        "workdir": {"description": "Where headless phases run, so project-scoped MCP servers load.", "type": "string", "minLength": 1},
+        "timezone": {"type": "string"},
+        "sources": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/source"}},
+        "github": {
+          "type": "object",
+          "required": ["repo"],
+          "additionalProperties": false,
+          "properties": {
+            "repo": {"type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$"},
+            "review_skill": {"type": "string"}
+          }
+        },
+        "linear": {
+          "type": "object",
+          "required": ["team"],
+          "additionalProperties": false,
+          "properties": {"team": {"type": "string", "minLength": 1}}
+        },
+        "google": {
+          "type": "object",
+          "required": ["account"],
+          "additionalProperties": false,
+          "properties": {"account": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$"}}
+        },
+        "urgency": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "people": {"description": "Actors whose asks are urgent (e.g. my manager).", "type": "array", "items": {"type": "string"}},
+            "labels": {"description": "Labels that make an item urgent (e.g. deploy-blocking).", "type": "array", "items": {"type": "string"}}
+          }
+        },
+        "autonomy": {
+          "type": "object",
+          "required": ["silent"],
+          "additionalProperties": false,
+          "properties": {
+            "silent": {
+              "description": "Action types promoted from draft to silent once they have been right consistently.",
+              "type": "array",
+              "items": {"enum": ["gh_thread_reply", "gh_fix_pr", "slack_reply", "email_reply", "rsvp", "linear_promote", "linear_create_issue", "afk_launch"]}
+            }
+          }
+        },
+        "phases": {
+          "type": "object",
+          "required": ["triage"],
+          "additionalProperties": false,
+          "properties": {
+            "sweep-github": {"$ref": "#/$defs/phase"},
+            "sweep-linear": {"$ref": "#/$defs/phase"},
+            "triage": {"$ref": "#/$defs/phase"}
+          }
+        }
+      }
+    }
+  }
+}

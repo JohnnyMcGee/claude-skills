@@ -24,6 +24,12 @@ A turn-based coding loop: plan a feature as a checklist of atomic commits, then 
 
 Invoke with `/atomic-commits <issue id or description of the work>`.
 
+### brief
+
+The entry point of **process**, a pipeline that does the daily process chores (PR status and feedback, review requests, Linear inbox) and hands you one markdown brief. `/brief` runs `process run`, which takes every active project profile and runs each source's sweeper and then triage as headless `claude -p` phases. Each phase gets the profile's model and a tool allowlist that holds no send, review, RSVP or merge tool. The brief groups each project into **Needs approval** (drafts queued for you), **Done silently** (what Claude did without asking) and a collapsed **FYI**. It is written to `$XDG_STATE_HOME/process/brief.md`, and every brief of the day is also archived in `briefs/<date>.md`. Drafts wait in the queue: nothing sends them yet.
+
+Invoke with `/brief [--delta] [--project <name>] [--fixtures <dir>]`. `--delta` sweeps from each source's watermark and shows only what changed; `--fixtures process/fixtures` is a dry run with no network. Needs the `process` CLI on PATH and at least one profile (see below).
+
 ### dossier
 
 Builds a dossier: a prioritized, verified reading list that makes you an expert in a problem space before any planning starts. You describe the problem and the direction (or give a Linear issue id); it fixes the scope (general best practice, or that plus the internal system), fans out one research agent per area of interest, opens every link, and publishes a Claude Doc with a where-to-start path, a tiered source table per area, "easy to get wrong" gotchas, and the open questions the reading answers. It makes no decisions and never asks you to: the reading is what lets you plan.
@@ -36,16 +42,34 @@ Opens a pull request and drives it to a human-reviewable state: resolves merge c
 
 Invoke with `/open-pr [base branch]`, or let an agent reach it by name (AFK workers use it in their pr phase).
 
+### sweep-github
+
+The GitHub sweeper of process. For one profile it reads my open PRs (mergeability, checks, review state, new comments) and the PRs requesting my review, maps each ask to an **item**, and stores it with `process emit`, which advances the profile's GitHub watermark. Read-only.
+
+Run by `process run` as `/sweep-github <profile> [--delta] [--fixtures <dir>]`.
+
+### sweep-linear
+
+The Linear sweeper of process. For one profile it reads unread notifications, mentions, and changes to scope, blockers or due dates on tickets I own or that block or are blocked by mine, and stores them as items. Linear's mirrored GitHub review requests carry the PR URL, so triage merges them with the GitHub item. Read-only: triage is the one that marks notifications read.
+
+Run by `process run` as `/sweep-linear <profile> [--delta] [--fixtures <dir>]`.
+
+### triage
+
+The triage step of process. `process triage plan` applies every rule deterministically: it dedupes the same ask across sources, decides what needs me, sets autonomy and urgency, and never proposes a merge, an approving review or a prod action. The first run also clears Linear notifications older than 7 days. Claude then writes the drafts and marks processed Linear notifications read, and `process triage commit` validates everything against the shared schema before it writes the queue and the handled-item ledger. An item that changes after it was handled comes back as a new version.
+
+Run by `process run` as `/triage <profile> [--dry-run]`.
+
 ## Installation
 
 Copy the skill folders into your skills directory:
 
 ```bash
 # Personal (all projects)
-cp -r afk afk-setup atomic-commits dossier open-pr ~/.claude/skills/
+cp -r afk afk-setup atomic-commits brief dossier open-pr process sweep-github sweep-linear triage ~/.claude/skills/
 
 # Or per-project
-cp -r afk afk-setup atomic-commits dossier open-pr <project>/.claude/skills/
+cp -r afk afk-setup atomic-commits brief dossier open-pr process sweep-github sweep-linear triage <project>/.claude/skills/
 ```
 
 Each skill is a folder containing a `SKILL.md` (plus any supporting files) — see the [skills documentation](https://code.claude.com/docs/en/skills) for details.
@@ -61,3 +85,16 @@ afk   # prints usage
 ```
 
 Its tests run with `python3 -m unittest` from the `afk/` folder. [`afk/e2e-checklist.md`](afk/e2e-checklist.md) is a manual end-to-end run of the whole loop with real tmux and `claude`.
+
+### Setting up process
+
+`brief`, `sweep-github`, `sweep-linear` and `triage` drive the `process` CLI in the `process/` folder (Python 3.11+, stdlib only; `gh` and `claude` on PATH). It is not a skill itself, but it is copied alongside them. Put it on PATH, then give it a profile per project:
+
+```bash
+ln -sf ~/.claude/skills/process/process.py ~/.local/bin/process
+mkdir -p ~/.config/process/profiles
+cp ~/.claude/skills/process/profiles/acme.md ~/.config/process/profiles/<project>.md   # then edit it
+process profiles   # validates every profile and refuses one that grants a send tool
+```
+
+A profile is markdown with TOML front matter: the project's sources, repo, Linear team, Google account, urgency rules, autonomy overrides, and a model and tool allowlist per phase. Its body is a **How to sweep** section and a **Changelog**. `process/profiles/acme.md` is an example. Keep your real profiles in `~/.config/process/profiles/`, not in this repo. The contract between phases (item, queue entry, decision, result, profile) is `process/schema.json`. State lives in `$XDG_STATE_HOME/process/`. Tests run with `python3 -m unittest` from the `process/` folder.

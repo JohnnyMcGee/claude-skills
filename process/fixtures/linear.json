@@ -1,0 +1,12 @@
+{
+  "me": {"id": "user-me", "name": "Me Dev"},
+  "notifications": [
+    {"id": "notif-old-1", "type": "issueComment", "createdAt": "2026-01-05T15:00:00Z", "updatedAt": "2026-01-05T15:00:00Z", "readAt": null, "actor": {"name": "Cal"}, "issue": {"identifier": "WID-3", "title": "Old onboarding copy", "url": "https://linear.app/acme/issue/WID-3"}, "comment": {"id": "c-3", "body": "Closing the loop on this."}},
+    {"id": "notif-old-2", "type": "issueStatusChanged", "createdAt": "2026-01-09T15:00:00Z", "updatedAt": "2026-01-09T15:00:00Z", "readAt": null, "actor": {"name": "Cal"}, "issue": {"identifier": "WID-4", "title": "Retire v1 API", "url": "https://linear.app/acme/issue/WID-4"}},
+    {"id": "notif-3", "type": "issueNewComment", "createdAt": "now", "updatedAt": "now", "readAt": null, "actor": {"name": "GitHub"}, "issue": {"identifier": "WID-15", "title": "CSV export", "url": "https://linear.app/acme/issue/WID-15"}, "comment": {"id": "c-15", "body": "ana requested a review from me-dev on https://github.com/acme/widgets/pull/101"}},
+    {"id": "notif-4", "type": "issueMention", "createdAt": "now", "updatedAt": "now", "readAt": null, "actor": {"name": "Dee"}, "issue": {"identifier": "WID-12", "title": "Reports page is slow", "url": "https://linear.app/acme/issue/WID-12"}, "comment": {"id": "c-12", "body": "@me-dev can you confirm whether the export query uses the new index?"}}
+  ],
+  "issues": [
+    {"identifier": "WID-20", "title": "Paginate the order list", "url": "https://linear.app/acme/issue/WID-20", "assignee": "me", "state": "In Progress", "updatedAt": "now", "history": [{"field": "dueDate", "from": "2026-10-24", "to": "2026-10-22", "actor": "Dee"}]}
+  ]
+}

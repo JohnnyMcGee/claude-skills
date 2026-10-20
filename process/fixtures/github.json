@@ -1,0 +1,16 @@
+{
+  "me": {"login": "me-dev"},
+  "my_prs": [
+    {"number": 7, "title": "Cache widget thumbnails", "url": "https://github.com/acme/widgets/pull/7", "updatedAt": "now", "isDraft": false, "mergeable": "MERGEABLE", "reviewDecision": "APPROVED", "statusCheckRollup": [{"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}], "headRefOid": "a1b2c3d"},
+    {"number": 8, "title": "Paginate the order list", "url": "https://github.com/acme/widgets/pull/8", "updatedAt": "now", "isDraft": false, "mergeable": "CONFLICTING", "reviewDecision": "REVIEW_REQUIRED", "statusCheckRollup": [{"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}, {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"}], "headRefOid": "d4e5f6a"}
+  ],
+  "review_requested": [
+    {"number": 101, "title": "Add CSV export", "url": "https://github.com/acme/widgets/pull/101", "updatedAt": "now", "headRefOid": "b7c8d9e", "author": {"login": "ana"}, "labels": [], "body": "Adds a CSV export of orders behind the reports page."},
+    {"number": 102, "title": "Fix checkout rounding", "url": "https://github.com/acme/widgets/pull/102", "updatedAt": "now", "headRefOid": "f0a1b2c", "author": {"login": "ben"}, "labels": [{"name": "deploy-blocking"}], "body": "Totals were rounded per line instead of per order. Blocks today's deploy."}
+  ],
+  "comments": [
+    {"pr": 8, "id": 9001, "url": "https://github.com/acme/widgets/pull/8#issuecomment-9001", "author": {"login": "ana"}, "createdAt": "now", "updatedAt": "now", "body": "Why offset pagination? Cursor pagination would survive inserts between pages."},
+    {"pr": 8, "id": 9002, "url": "https://github.com/acme/widgets/pull/8#discussion_r9002", "author": {"login": "lint-bot[bot]"}, "createdAt": "now", "updatedAt": "now", "body": "orders.py:42 — unused import `itertools`."},
+    {"pr": 7, "id": 9003, "url": "https://github.com/acme/widgets/pull/7#issuecomment-9003", "author": {"login": "me-dev"}, "createdAt": "now", "updatedAt": "now", "body": "Thanks for the review!"}
+  ]
+}
