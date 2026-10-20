@@ -456,11 +456,18 @@ class NeverActionTest(TriageTestCase):
 
 
 class GitHubActionsTest(TriageTestCase):
-    def comment(self, n, body, actor=("ana", "person")):
-        return item(kind="pr_comment", native_id=f"comment/{n}", subject=f"https://github.com/acme/widgets/pull/8#discussion_r{n}", context=body, actor={"name": actor[0], "role": actor[1]}, summary=f"Comment {n} on #8")
+    def comment(self, n, body, actor=("ana", "person"), collaborator=None):
+        facts = {} if collaborator is None else {"facts": {"collaborator": collaborator}}
+        return item(kind="pr_comment", native_id=f"comment/{n}", subject=f"https://github.com/acme/widgets/pull/8#discussion_r{n}", context=body, actor={"name": actor[0], "role": actor[1]}, summary=f"Comment {n} on #8", **facts)
+
+    def test_a_nit_from_someone_outside_the_repo_still_needs_my_approval(self):
+        self.emit(self.comment(7, "nit: add this helper", collaborator=False), self.comment(8, "nit: add that helper"))
+
+        for reply in self.triage():
+            self.assertEqual((reply["action"]["type"], reply["autonomy"], reply["status"]), ("gh_thread_reply", "draft", "pending"))
 
     def test_bot_and_nit_comments_on_my_pr_are_fixed_without_asking(self):
-        self.emit(self.comment(1, "orders.py:42 — unused import `itertools`.", actor=("lint-bot[bot]", "bot")), self.comment(2, "nit: trailing whitespace on line 9"), self.comment(3, "Nit — rename `x` to `count`"))
+        self.emit(self.comment(1, "orders.py:42 — unused import `itertools`.", actor=("lint-bot[bot]", "bot")), self.comment(2, "nit: trailing whitespace on line 9", collaborator=True), self.comment(3, "Nit — rename `x` to `count`", collaborator=True))
 
         for fix in self.triage():
             self.assertEqual((fix["action"]["type"], fix["autonomy"], fix["status"]), ("gh_fix_pr", "silent", "approved"))

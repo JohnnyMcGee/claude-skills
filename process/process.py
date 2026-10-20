@@ -816,7 +816,7 @@ class Process:
         _, _, worktree = self.fix_entry(name, entry_id)
         if subcommand not in FIX_GIT:
             raise SystemExit(f"process: git {subcommand} is not a fix step; use one of {', '.join(sorted(FIX_GIT))}")
-        refused = [a for a in args if FIX_GIT_REFUSED.match(a)]
+        refused = [a for a in args if fix_git_refused(a)]
         if refused:
             raise SystemExit(f"process: git {refused[0]} is not allowed in a fix: it reads or writes files outside the worktree")
         try:
@@ -887,8 +887,17 @@ NIT = re.compile(r"\s*\[?nit(pick)?\b", re.I)
 # What a fix may do in its worktree: look, stage, commit, and merge the base branch in (never rebase, as open-pr).
 FIX_GIT = {"status", "diff", "log", "show", "add", "rm", "mv", "restore", "commit", "merge"}
 # Options that reach files outside the worktree (--output writes anywhere, -F/--file reads anywhere into a commit I then
-# push) or run external programs. Short -F and -t also match stuck forms like -Fpath.
-FIX_GIT_REFUSED = re.compile(r"(--output|--file|--template|--pathspec-from-file|--no-index|--ext-diff|--exec)(=|$)|-[a-zA-Z]*[Ft]")
+# push) or run external programs.
+FIX_GIT_REFUSED = {"output", "file", "template", "pathspec-from-file", "no-index", "ext-diff", "exec"}
+
+
+def fix_git_refused(arg):
+    """git takes any unambiguous prefix of a long option (--fil is --file), so refuse every prefix of a refused one.
+    Short -F and -t also match stuck forms like -Fpath."""
+    if arg.startswith("--"):
+        name = arg[2:].split("=", 1)[0]
+        return bool(name) and any(option.startswith(name) for option in FIX_GIT_REFUSED)
+    return bool(re.match(r"-[a-zA-Z]*[Ft]", arg))
 MERGE_BASE = (
     "Merge the base branch into the PR branch (never rebase) and resolve the conflicts. Push only if every conflict is "
     "mechanical: both sides kept, nothing about behaviour decided. Otherwise abort and report the conflicting files."
