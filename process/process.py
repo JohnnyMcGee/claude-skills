@@ -1150,6 +1150,14 @@ def protected_meeting(profile, items):
     )
 
 
+def urgent(rules, i):
+    """The profile's [urgency] rules, the only things that interrupt me: a DM or mention from one of its people."""
+    return (
+        i["kind"] in ("dm", "mention") and i["actor"]["name"] in rules.get("people", [])
+        or bool(set(i.get("labels", [])) & set(rules.get("labels", [])))
+    )
+
+
 def entry(name, profile, group):
     """Apply the needs-me rules to one deduped ask: what to do about it, who decides, how urgent."""
     lead = group[0]
@@ -1193,8 +1201,7 @@ def entry(name, profile, group):
         action, urgency = {"type": "slack_reply", "params": {"channel": channel, "thread_ts": thread}}, "normal"
     elif kind in ("mention", "ticket_change", "dm", "thread_question"):
         urgency = "normal"
-    rules = profile.get("urgency", {})
-    if {i["actor"]["name"] for i in group} & set(rules.get("people", [])) or {l for i in group for l in i.get("labels", [])} & set(rules.get("labels", [])):
+    if any(urgent(profile.get("urgency", {}), i) for i in group):
         urgency = "urgent"
     autonomy, status = "draft", "pending"
     if action["type"] == "none":

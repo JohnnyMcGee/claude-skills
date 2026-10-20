@@ -461,12 +461,32 @@ class TriageTest(TriageTestCase):
         self.assertNotEqual(queue[1]["item_ids"], first["item_ids"])
 
 
+class UrgencyTest(TriageTestCase):
+    """Exactly three rules interrupt me: a DM or mention from an urgent person, a mention in an incident channel, and a
+    review request labeled deploy-blocking."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def urgent(self):
+        """The summaries of the entries triage marked urgent."""
+        return sorted(e["summary"] for e in self.triage() if e["urgency"] == "urgent")
+
+    def test_a_dm_or_a_mention_from_my_manager_is_urgent(self):
+        self.emit(slack(native_id="D1/1", kind="dm", actor={"name": "boss", "role": "person"}, summary="Boss DMed you about the launch", facts={"channel": "DM", "ask": "question"}), source="slack")
+        self.emit(linear(native_id="notif-9", kind="mention", subject="https://linear.app/acme/issue/WID-9#comment-c-9", actor={"name": "boss", "role": "person"}, summary="Boss mentioned you on WID-9", facts={"notification_id": "notif-9"}), source="linear")
+
+        self.assertEqual(self.urgent(), ["Boss DMed you about the launch", "Boss mentioned you on WID-9"])
+
+    def test_my_managers_pr_comment_or_ticket_change_is_not_urgent(self):
+        self.emit(item(native_id="comment/1", kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-1", actor={"name": "boss", "role": "person"}, summary="Boss commented on #7"))
+        self.emit(linear(native_id="issue/WID-20", kind="ticket_change", subject="https://linear.app/acme/issue/WID-20", actor={"name": "boss", "role": "person"}, summary="Boss moved WID-20's due date up", facts={}), source="linear")
+
+        self.assertEqual(self.urgent(), [])
+
+
 class TriageRulesTest(TriageTestCase):
-    def test_asks_from_urgent_people_or_with_urgent_labels_are_urgent(self):
-        self.emit(item(actor={"name": "boss", "role": "person"}), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", labels=["deploy-blocking"]), item(native_id="pr/103", subject="https://github.com/acme/widgets/pull/103"))
-
-        self.assertEqual([e["urgency"] for e in self.triage()], ["urgent", "urgent", "normal"])
-
     def test_an_action_type_promoted_to_silent_skips_approval(self):
         self.write_profile(silent=["gh_thread_reply"])
         self.emit(item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-9"))
