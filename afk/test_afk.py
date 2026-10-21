@@ -2966,6 +2966,16 @@ class CloseTest(AfkTestCase):
         self.assertIn(str(self.scratch), entry)
         self.assertIn("1 ticket done", entry)
 
+    def test_a_close_that_fails_keeps_the_session_bound_so_it_can_be_retried(self):
+        self.ticket("03-ui", "Widget UI", status="done")
+        (self.state_home / "afk" / "closed.log").mkdir()  # so the log can't be appended to
+
+        with self.assertRaises(OSError):
+            self.close()
+
+        self.assertEqual(self.run_fake.find("tmux", "set-option", "-u"), [])
+        self.assertTrue((self.project_dir / "config.toml").exists())
+
     def test_close_refuses_a_project_with_open_tickets(self):
         code, out = self.close()
 

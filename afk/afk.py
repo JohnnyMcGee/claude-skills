@@ -548,11 +548,12 @@ class Afk:
         for clone in dict.fromkeys([config["repo"], *config.get("repos", {}).values()]):
             self.best_effort(["git", "-C", clone, "worktree", "prune"])  # forget the removed workers' worktrees
         self.notify(message)  # before the config it reads is gone
-        self.best_effort(["tmux", "set-option", "-u", "-t", config["session"], "@afk_project"])
         stamp = datetime.fromtimestamp(self.clock()).isoformat(timespec="seconds")
         with open(self.state_root() / "closed.log", "a") as log:
             log.write(f"{stamp}\t{project}\t{config['spec']}\t{counts}\n")
         shutil.rmtree(self.project_dir(project))
+        # Last, so a close that fails before here can be retried from the session it was run in.
+        self.best_effort(["tmux", "set-option", "-u", "-t", config["session"], "@afk_project"])
         self.out(message)
         self.closed = True
 
