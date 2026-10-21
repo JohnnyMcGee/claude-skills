@@ -375,6 +375,9 @@ class Afk:
                 except subprocess.CalledProcessError as error:
                     # The failed worker's status wasn't persisted, so the next tick retries it.
                     self.out(f"afk: `{shlex.join(error.cmd)}` failed: {(error.stderr or '').strip()}")
+                except Exception as error:
+                    # Whatever broke, the watcher is all that drives the workers, so it reports and keeps going.
+                    self.out(f"afk: tick failed: {type(error).__name__}: {error}")
                 self.stdout.flush()
                 time.sleep(float(interval))
         except KeyboardInterrupt:
@@ -416,7 +419,7 @@ class Afk:
                         status, effects = tick(path.parent.name, before, now, agent_running=False, **given)
                     for effect in effects:
                         self.perform(*effect)
-                except subprocess.CalledProcessError as error:
+                except (subprocess.CalledProcessError, OSError) as error:
                     failures.append(error)
                     shown.append(before)
                     continue
@@ -478,7 +481,11 @@ class Afk:
         """Why cleaning up this worker could lose the human's work, or None if it's safe.
 
         Unless it merged, its branch may hold commits that were never pushed, which deleting the branch would lose.
+        A worktree already gone, as after a cleanup that failed partway, holds nothing left to lose.
         """
+        worktree = self.worktree(status["ticket"])
+        if not worktree.exists():
+            return None
         if "shell_pane" not in status:
             return "its shell pane is unknown (it was started by an older afk)"
         command = self.pane_command(status["shell_pane"])
@@ -486,7 +493,7 @@ class Afk:
             return "its shell pane is gone"
         if command not in SHELLS:
             return f"its shell pane is running {command}"
-        worktree = str(self.worktree(status["ticket"]))
+        worktree = str(worktree)
         if self.run(["git", "-C", worktree, "status", "--porcelain"]).strip():
             return "its worktree has uncommitted changes"
         if ended != "merged" and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
@@ -498,6 +505,10 @@ class Afk:
 
         A merged ticket is completed. One whose PR was closed unmerged is released, back onto the frontier. A closed
         ticket is left as it is, as is one gone from the tracker.
+
+        Removing the worker's dir is the commit point, so each step before it tolerates having been done by a cleanup
+        that failed partway, and a branch git won't delete, say one checked out in another worktree, is left for the
+        human: cleanup_blocker has already checked it holds nothing unpushed.
         """
         project = self.current_project()
         repo = str(self.clone(read_json(self.workers_dir() / ticket_id / "status.json").get("repo")))
@@ -506,9 +517,17 @@ class Afk:
             tracker.complete(ticket)
         elif ticket and ended == "closed":
             tracker.release(ticket)
-        self.run(["tmux", "kill-window", "-t", pane])
-        self.run(["git", "-C", repo, "worktree", "remove", str(self.worktree(ticket_id))])
-        self.run(["git", "-C", repo, "branch", "-D", f"afk/{project}-{ticket_id}"])
+        self.best_effort(["tmux", "kill-window", "-t", pane])
+        worktree = self.worktree(ticket_id)
+        if worktree.exists():
+            self.run(["git", "-C", repo, "worktree", "remove", str(worktree)])
+        else:
+            self.best_effort(["git", "-C", repo, "worktree", "prune"])  # forget a worktree whose dir is gone
+        branch = f"afk/{project}-{ticket_id}"
+        try:
+            self.run(["git", "-C", repo, "branch", "-D", branch])
+        except subprocess.CalledProcessError as error:
+            self.notify(f"{ticket_id} cleaned up, leaving branch {branch}: {(error.stderr or '').strip()}")
         shutil.rmtree(self.workers_dir() / ticket_id)
 
     def worktree(self, ticket_id):
@@ -555,7 +574,8 @@ class Afk:
         """
         branch = f"afk/{self.current_project()}-{status['ticket']}"
         try:
-            pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url,labels,createdAt"], cwd=self.worktree(status["ticket"])))
+            # From the clone, not the worktree, which a cleanup that failed partway may already have removed.
+            pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url,labels,createdAt"], cwd=self.clone(status.get("repo"))))
         except subprocess.CalledProcessError as error:
             if "no pull requests found" not in (error.stderr or ""):
                 raise
