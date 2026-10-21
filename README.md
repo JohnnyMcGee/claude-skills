@@ -8,9 +8,9 @@ A small collection of [Claude Code skills](https://code.claude.com/docs/en/skill
 
 An orchestrator for AFK agent workers: you choose the work, agents build it in parallel, and you merge. One project per tmux session. Tickets come from a local `.scratch` spec or a GitHub spec issue's sub-issues. `/afk next` proposes a batch of unblocked tickets that won't collide with each other or with running workers (Gate 1), and offers to split any ticket that spans repos. Each ticket you approve gets its own worktree, branch, port slot and tmux window with an interactive `claude` worker. The repo's `docs/agents/afk.md` sets these up, and a deny list keeps the worker from force-pushing, pushing to base or merging.
 
-`afk watch` then drives each worker through implement → verify → prepr → pr → review. It shows a dashboard, colours windows by state, and notifies you when a worker has a question, is blocked, stalls, trips a runaway limit, or has a PR Ready. Merging is up to you. Once a PR merges, the watcher removes the worker's worktree, branch and window, but only if the shell pane is idle and the worktree is clean. It then prompts you for the next batch. A `hitl` ticket gets the same setup, but its worker runs in guide mode and helps you do the work yourself.
+`afk watch` then drives each worker through implement → verify → prepr → pr → review. It shows a dashboard, colours windows by state, and notifies you when a worker has a question, is blocked, stalls, trips a runaway limit, or has a PR Ready. Merging is up to you. Once a PR merges, the watcher removes the worker's worktree, branch and window, but only if the shell pane is idle and the worktree is clean. It then prompts you for the next batch, and once every ticket is done it closes the project, removing its state, and exits. A `hitl` ticket gets the same setup, but its worker runs in guide mode and helps you do the work yourself.
 
-Invoke with `/afk <init <spec> | next | frontier | start <ticket> | watch | status>`. The `afk` CLI must be on your PATH (see below).
+Invoke with `/afk <init <spec> | next | frontier | start <ticket> | watch | status | close [--force]>`. The `afk` CLI must be on your PATH (see below).
 
 ### afk-setup
 
