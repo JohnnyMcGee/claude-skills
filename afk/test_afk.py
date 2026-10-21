@@ -2993,6 +2993,31 @@ class CloseTest(AfkTestCase):
         self.assertIn("03", out)
         self.assertTrue((self.project_dir / "workers" / "03").exists())
 
+    def test_a_start_racing_a_close_cannot_start_a_worker_the_close_then_removes(self):
+        self.ticket("05-export", "Widget export")
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        codes = []
+
+        def start_05():
+            out = io.StringIO()
+            codes.append(afk.main(["start", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out))
+
+        other = threading.Thread(target=start_05)
+
+        def start_arrives_mid_close(cmd):
+            if cmd[3:5] == ["worktree", "prune"] and not other.is_alive() and not codes:
+                other.start()
+                other.join(timeout=0.2)  # without a lock it starts its worker now, after the close's checks
+            return git(cmd)
+
+        self.run_fake.responses[("git", "-C")] = start_arrives_mid_close
+        code, out = self.close("--force")
+        other.join()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(codes, [1])
+        self.assertFalse((self.project_dir / "config.toml").exists())
+
     def test_close_refuses_while_a_worktree_is_left_behind(self):
         self.ticket("03-ui", "Widget UI", status="done")
         (self.project_dir / "worktrees" / "03").mkdir(parents=True)

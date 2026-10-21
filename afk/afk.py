@@ -319,6 +319,8 @@ class Afk:
         workers = worker_dir.parent
         workers.mkdir(parents=True, exist_ok=True)
         with locked(workers):
+            if not (workers.parent / "config.toml").exists():
+                raise SystemExit("afk: the project was closed; run `afk init <spec>` to start it again")
             if worker_dir.exists():
                 raise SystemExit(f"afk: ticket {worker_dir.name} is already started; see `afk status`")
             max_workers = self.max_workers()
@@ -502,6 +504,12 @@ class Afk:
         """Close the project by hand: once it's finished, or with --force to abandon its open tickets."""
         if options not in ((), ("--force",)):
             raise SystemExit("afk: usage: afk close [--force]")
+        self.workers_dir().mkdir(parents=True, exist_ok=True)
+        # The lock claim_worker takes, so no worker can start between the checks and the state's removal.
+        with locked(self.workers_dir()):
+            self.close_unless_blocked(options)
+
+    def close_unless_blocked(self, options):
         workers = self.worker_dirs()
         if workers:
             raise SystemExit(f"afk: workers {', '.join(workers)} remain; close or merge their PRs and let `afk watch` "
