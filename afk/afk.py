@@ -37,6 +37,7 @@ class Afk:
         self.stdin = stdin
         self.stdout = stdout
         self.clock = clock
+        self.closed = False  # set once the project is closed, which ends `afk watch`
 
     def out(self, line):
         print(line, file=self.stdout)
@@ -379,6 +380,8 @@ class Afk:
                     # Whatever broke, the watcher is all that drives the workers, so it reports and keeps going.
                     self.out(f"afk: tick failed: {type(error).__name__}: {error}")
                 self.stdout.flush()
+                if self.closed:
+                    return 0
                 time.sleep(float(interval))
         except KeyboardInterrupt:
             return 0
@@ -431,9 +434,11 @@ class Afk:
                 shown.append(status)
         for line in dashboard(shown, now):
             self.out(line)
-        self.surface_unblocked(shown, now)
+        polled = self.surface_unblocked(shown, now)
         if failures:
             raise failures[0]
+        if polled and not self.worker_dirs():
+            self.close_if_finished()
 
     def surface_unblocked(self, statuses, now):
         """The Gate 1 judgment point: unblocked tickets and a free worker slot. The user decides with /afk next.
@@ -458,6 +463,79 @@ class Afk:
                 seen["notified"] = candidates
         if seen != before:
             write_json(path, seen)
+        return seen["polled_at"] == now
+
+    def close_if_finished(self):
+        """Close the project once every ticket is done, so the watcher stops. Called only when no worker is left,
+        each having passed cleanup_blocker, and at the tracker's poll cadence.
+
+        A blocked or claimed ticket isn't done, so an empty frontier alone never closes a project. Anything left
+        behind holds the project open, and the user is notified once per reason.
+        """
+        tickets = self.tracker().tickets()
+        if not tickets or not all(t.done for t in tickets):
+            return
+        reason = self.close_blocker()
+        if reason is None:
+            self.close_project(tickets)
+            return
+        path = self.project_dir(self.current_project()) / "frontier.json"
+        seen = read_json(path)
+        message = f"project finished but not closed: {reason}; fix it, then run `afk close`"
+        self.out(message)
+        if seen.get("close_blocked") != reason:
+            self.notify(message)
+            write_json(path, {**seen, "close_blocked": reason})
+
+    def cmd_close(self, *options):
+        """Close the project by hand: once it's finished, or with --force to abandon its open tickets."""
+        if options not in ((), ("--force",)):
+            raise SystemExit("afk: usage: afk close [--force]")
+        workers = self.worker_dirs()
+        if workers:
+            raise SystemExit(f"afk: workers {', '.join(workers)} remain; close or merge their PRs and let `afk watch` "
+                             "clean them up first")
+        tickets = self.tracker().tickets()
+        unfinished = [t.id for t in tickets if not t.done]
+        if unfinished and not options:
+            raise SystemExit(f"afk: tickets {', '.join(unfinished)} aren't done; pass --force to close the project anyway")
+        reason = self.close_blocker()
+        if reason:
+            raise SystemExit(f"afk: {reason}")
+        self.close_project(tickets)
+
+    def worker_dirs(self):
+        """The tickets with a worker dir left: removing it is a worker cleanup's commit point."""
+        workers = self.workers_dir()
+        return sorted(p.name for p in workers.iterdir() if p.is_dir()) if workers.exists() else []
+
+    def close_blocker(self):
+        """What closing the project would leave behind, or None. A worktree outlives its worker only when git didn't
+        finish removing it, and it may hold work."""
+        worktrees = self.project_dir(self.current_project()) / "worktrees"
+        left = sorted(str(p) for p in worktrees.iterdir()) if worktrees.exists() else []
+        return f"worktrees left in {', '.join(left)}; remove each with `git worktree remove`" if left else None
+
+    def close_project(self, tickets):
+        """Remove the project's state and unbind its session, keeping a line in the state root's closed.log.
+
+        The tmux session and its windows are the user's, so they stay.
+        """
+        project, config = self.current_project(), self.config()
+        done = sum(t.done for t in tickets)
+        open_ = len(tickets) - done
+        counts = f"{done} ticket{'s' * (done != 1)} done" + (f", {open_} open" if open_ else "")
+        message = f"project {project} {'closed' if open_ else 'finished'}: {counts}"
+        for clone in dict.fromkeys([config["repo"], *config.get("repos", {}).values()]):
+            self.best_effort(["git", "-C", clone, "worktree", "prune"])  # forget the removed workers' worktrees
+        self.notify(message)  # before the config it reads is gone
+        self.best_effort(["tmux", "set-option", "-u", "-t", config["session"], "@afk_project"])
+        stamp = datetime.fromtimestamp(self.clock()).isoformat(timespec="seconds")
+        with open(self.state_root() / "closed.log", "a") as log:
+            log.write(f"{stamp}\t{project}\t{config['spec']}\t{counts}\n")
+        shutil.rmtree(self.project_dir(project))
+        self.out(message)
+        self.closed = True
 
     def perform(self, kind, *args):
         if kind == "prompt":
@@ -1376,7 +1454,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|status|hook|check|trial> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|close|report|status|hook|check|trial> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)
