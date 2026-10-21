@@ -2,11 +2,13 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
 import tomllib
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,7 +18,7 @@ import afk
 class FakeRun:
     """Stands in for the run() seam: records every command and replays scripted stdout.
 
-    Responses are keyed by a command prefix; the longest matching prefix wins.
+    Responses are keyed by a command prefix; the longest matching prefix wins. Like subprocess, a missing cwd fails.
     """
 
     def __init__(self, responses=None):
@@ -29,6 +31,8 @@ class FakeRun:
         self.calls.append(list(cmd))
         self.inputs.append(input)
         self.cwds.append(cwd and str(cwd))
+        if cwd is not None and not Path(cwd).is_dir():
+            raise FileNotFoundError(2, "No such file or directory", cwd)
         matches = [p for p in self.responses if tuple(cmd[: len(p)]) == p]
         if not matches:
             return ""
@@ -37,6 +41,15 @@ class FakeRun:
 
     def find(self, *prefix):
         return [c for c in self.calls if tuple(c[: len(prefix)]) == prefix]
+
+
+def git(cmd):
+    """Plain git: `worktree add` and `worktree remove` create and delete the worktree's dir, as git does."""
+    if cmd[3:5] == ["worktree", "add"]:
+        Path(cmd[-2]).mkdir(parents=True)
+    elif cmd[3:5] == ["worktree", "remove"]:
+        shutil.rmtree(cmd[-1])
+    return ""
 
 
 def pr_view(state, url="https://github.com/acme/widgets/pull/42", ready=False, created=None):
@@ -61,7 +74,7 @@ class AfkTestCase(unittest.TestCase):
             {
                 ("tmux", "display-message"): "work\n",
                 ("tmux", "show-options"): "widgets\n",
-                ("git", "-C"): "",
+                ("git", "-C"): git,
                 ("tmux", "new-window"): "%5\n",
                 ("tmux", "display-message", "-p", "-t"): "claude\n",  # the pane's foreground command
                 ("gh", "pr", "view"): pr_view("OPEN"),  # the worker's branch has an open PR
@@ -1988,7 +2001,7 @@ class WatchTest(AfkTestCase):
 
         poll = self.pr_polls()[-1]
         self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-03", "--json", "state,url,labels,createdAt"])
-        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], str(self.project_dir / "worktrees" / "03"))
+        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], str(self.repo))  # not the worktree, which may be gone
         self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
         self.assertEqual(self.status()["pr"], "https://github.com/acme/widgets/pull/42")
 
@@ -2105,6 +2118,83 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
         self.assertEqual(self.afk("status").splitlines()[1:], [])
+
+    def test_a_merged_worker_whose_branch_is_checked_out_elsewhere_is_cleaned_up_leaving_the_branch(self):
+        self.reach_review()
+        self.merge()
+
+        def checked_out(cmd):
+            raise subprocess.CalledProcessError(
+                1, cmd, stderr="error: cannot delete branch 'afk/widgets-03' used by worktree at '/clone'")
+
+        self.run_fake.responses[("git", "-C", str(self.repo), "branch", "-D")] = checked_out
+
+        self.afk("tick")
+
+        self.assertEqual(self.afk("status").splitlines()[1:], [])
+        self.assertFalse((self.project_dir / "worktrees" / "03").exists())
+        [notification] = [n for n in self.desktop_notifications() if "leaving branch" in n]
+        self.assertIn("afk/widgets-03", notification)
+        self.assertIn("used by worktree at '/clone'", notification)
+
+    def test_a_worker_left_half_cleaned_up_finishes_cleaning_up(self):
+        # An earlier cleanup killed the window and removed the worktree, then failed before removing the worker.
+        self.reach_review()
+        self.merge()
+        shutil.rmtree(self.project_dir / "worktrees" / "03")
+
+        def gone(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr=f"can't find window: {cmd[-1]}")
+
+        self.run_fake.responses[("tmux", "kill-window")] = gone
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = gone
+
+        self.afk("tick")
+
+        self.assertEqual(self.afk("status").splitlines()[1:], [])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "prune"),
+                         [["git", "-C", str(self.repo), "worktree", "prune"]])
+        self.assertEqual(len(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D")), 1)
+
+    def test_a_worker_failing_with_an_os_error_fails_alone(self):
+        self.ticket("05-export", "Widget export")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.afk("start", "05")
+        self.reach_review()
+        self.report("question", "Which format?", ticket="05")
+        self.stop(ticket="05")
+        self.now += 60
+
+        def missing(cmd):
+            raise FileNotFoundError(2, "No such file or directory", "gh")
+
+        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-03")] = missing
+
+        with self.assertRaises(FileNotFoundError):
+            afk.main(["tick"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=io.StringIO(),
+                     clock=lambda: self.now)
+
+        self.assertTrue([n for n in self.desktop_notifications() if "Which format?" in n])
+
+    def test_the_watcher_reports_a_failed_tick_and_keeps_watching(self):
+        self.reach_review()
+        self.now += 60
+
+        def missing(cmd):
+            raise FileNotFoundError(2, "No such file or directory", "gh")
+
+        self.run_fake.responses[("gh", "pr", "view")] = missing
+        polls = len(self.pr_polls())
+        out = io.StringIO()
+
+        with mock.patch.object(afk.time, "sleep", side_effect=[None, KeyboardInterrupt]):
+            code = afk.main(["watch"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                            clock=lambda: self.now)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.pr_polls()) - polls, 2)  # the failed poll wasn't recorded, so it's retried
+        self.assertIn("No such file or directory", out.getvalue())
 
     def test_closed_pr_with_idle_shell_and_clean_worktree_is_cleaned_up_and_its_ticket_offered_again(self):
         self.reach_review()
@@ -2413,7 +2503,7 @@ class WatchTest(AfkTestCase):
 
         [poll] = self.pr_polls()
         self.assertEqual(poll, ["gh", "pr", "view", "afk/widgets-04", "--json", "state,url,labels,createdAt"])
-        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], worktree)
+        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(poll)], str(self.repo))
         self.assertEqual(self.status("04")["state"], "cleanup-pending")
         self.assertIn("04 merged; cleanup pending", self.desktop_notifications()[-1])
 
