@@ -2103,6 +2103,25 @@ class WatchTest(AfkTestCase):
 
         self.assertTrue((self.project_dir / "config.toml").exists())
 
+    def test_the_watcher_exits_cleanly_once_another_process_closes_the_project(self):
+        sleeps = []
+
+        def closed_elsewhere(seconds):
+            if sleeps:
+                raise KeyboardInterrupt  # it ticked on: stop it, so the test fails rather than hangs
+            sleeps.append(seconds)
+            shutil.rmtree(self.project_dir)
+            self.run_fake.responses[("tmux", "show-options")] = "\n"  # `afk close` unbound the session
+
+        out = io.StringIO()
+        with mock.patch.object(afk.time, "sleep", side_effect=closed_elsewhere):
+            code = afk.main(["watch"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                            clock=lambda: self.now)
+
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("afk: the project was closed", out.getvalue())
+        self.assertFalse(self.project_dir.exists())  # the watcher didn't recreate it
+
     def test_a_finished_project_with_a_worktree_left_behind_notifies_once_and_stays_open(self):
         self.reach_review()
         self.merge()

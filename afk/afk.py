@@ -368,8 +368,13 @@ class Afk:
 
     def cmd_watch(self, interval="2"):
         """Loop around tick for the orchestrator window's right pane. Needs no LLM, so waiting is free."""
+        ticked = False
         try:
             while True:
+                if ticked and not self.project_open():
+                    self.out("afk: the project was closed")  # by `afk close`, in another process
+                    return 0
+                ticked = True
                 self.stdout.write("\033[H\033[2J")  # redraw the dashboard in place
                 try:
                     self.cmd_tick()
@@ -385,6 +390,12 @@ class Afk:
                 time.sleep(float(interval))
         except KeyboardInterrupt:
             return 0
+
+    def project_open(self):
+        try:
+            return (self.project_dir(self.current_project()) / "config.toml").exists()
+        except SystemExit:
+            return False  # closing unbound the session
 
     def cmd_tick(self):
         # One tick at a time, so an overlapping tick (say `afk tick` beside `afk watch`) can't act on a stale snapshot.
