@@ -617,6 +617,12 @@ class Afk:
         for s in rows:
             self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<10}{s.get('message', '')}".rstrip())
 
+    def cmd_view(self):
+        """The current project's config.toml, headed by its path."""
+        path = self.project_dir(self.current_project()) / "config.toml"
+        self.out(f"# {path}")
+        self.out(path.read_text().rstrip())
+
     def worker_status_path(self):
         ticket = self.env.get("AFK_TICKET")
         if not ticket:
@@ -1376,7 +1382,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|status|hook|check|trial> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|status|view|hook|check|trial> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)

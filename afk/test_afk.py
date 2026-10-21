@@ -133,6 +133,19 @@ class InitTest(AfkTestCase):
         )
 
 
+class ViewTest(AfkTestCase):
+    def test_view_shows_the_current_project_config_and_its_path(self):
+        self.afk("init", str(self.scratch))
+        path = self.project_dir / "config.toml"
+        with path.open("a") as config:
+            config.write("\n[limits]\nmax_workers = 5\n")
+
+        out = self.afk("view")
+
+        self.assertEqual(out.splitlines()[0], f"# {path}")
+        self.assertEqual(tomllib.loads(out), tomllib.loads(path.read_text()))
+
+
 class GithubTestCase(AfkTestCase):
     """A project whose spec is GitHub issue acme/widgets#2 and whose tickets are its sub-issues, all via faked `gh`."""
 

@@ -2,7 +2,7 @@
 name: afk
 description: Orchestrate AFK agent workers for one project in this tmux session — find unblocked tickets, start workers in their own worktree and tmux window, and track their status.
 disable-model-invocation: true
-argument-hint: <init [<spec>] | frontier | start <ticket> [--type <type>] | watch | status | next>
+argument-hint: <init [<spec>] | frontier | start <ticket> [--type <type>] | watch | status | view | next>
 ---
 
 # AFK
@@ -20,11 +20,12 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 - **`afk start <ticket> [--type <type>] [--agent <agent>] [--model <model>] [--effort <effort>] [--repo <owner/name>]`** — each option corrects that field of `afk next`'s proposal, and the worker's status records what it launched with. `--repo` picks the clone from the project's `[repos]` table. Start fails once `max_workers` workers are active (workers in review and hitl workers don't count, and a hitl start is never refused); otherwise it claims the ticket (on GitHub, assigns it to you), creates a worktree and branch `afk/<project>-<ticket>` from the repo's base branch, copies its gitignored files in and runs its bootstrap commands, allocates a slot (`AFK_SLOT`, `AFK_PORT_BASE`), opens a tmux window `<ticket>-<abbrev>` split agent-left / shell-right, and launches an interactive `claude` worker in auto permission mode with per-session hooks and a deny list (no force-push, no push to base, no `gh pr merge`, no worktree removal). The ticket's task type picks the model, effort, skill and prompt template; a `hitl` ticket gets a guide-mode prompt instead of implement (see [HITL tickets](#hitl-tickets)). All of this comes from the ticket's repo's `docs/agents/afk.md`; see [repo-config.md](repo-config.md).
 - **`afk watch`** — the watcher: run it in the orchestrator window's right pane. Every couple of seconds it advances workers through their phases, redraws the dashboard (ticket, phase, state, time in phase, PR), marks each worker's tmux window with its state, and notifies (bell, tmux message, `notify-send`) when a worker needs the human. When tickets are unblocked and a worker slot is free, it shows "N tickets unblocked — run /afk next" and notifies once per newly unblocked ticket. It needs no LLM. `afk tick` runs one step of it.
 - **`afk status`** — every worker's ticket, phase, state and last message.
+- **`afk view`** — the current project's config (`config.toml`): its spec, tracker, repo, session, `[repos]`, `[limits]` and `[overrides]`.
 
 ## Handling the argument
 
 - `next`: follow [`/afk next`](#afk-next) below.
-- `init [<spec>]`, `frontier`, `start <ticket> …`, `status`: run `afk $ARGUMENTS` and show the output.
+- `init [<spec>]`, `frontier`, `start <ticket> …`, `status`, `view`: run `afk $ARGUMENTS` and show the output.
 - `watch`: it runs forever, so don't run it yourself. Tell the user to run `afk watch` in the orchestrator window's right pane.
 - No argument: run `afk status`, then `afk frontier`, and ask which ticket to start.
 

@@ -10,7 +10,7 @@ An orchestrator for AFK agent workers: you choose the work, agents build it in p
 
 `afk watch` then drives each worker through implement → verify → prepr → pr → review. It shows a dashboard, colours windows by state, and notifies you when a worker has a question, is blocked, stalls, trips a runaway limit, or has a PR Ready. Merging is up to you. Once a PR merges, the watcher removes the worker's worktree, branch and window, but only if the shell pane is idle and the worktree is clean. It then prompts you for the next batch. A `hitl` ticket gets the same setup, but its worker runs in guide mode and helps you do the work yourself.
 
-Invoke with `/afk <init <spec> | next | frontier | start <ticket> | watch | status>`. The `afk` CLI must be on your PATH (see below).
+Invoke with `/afk <init <spec> | next | frontier | start <ticket> | watch | status | view>`. The `afk` CLI must be on your PATH (see below).
 
 ### afk-setup
 
