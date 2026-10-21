@@ -70,6 +70,7 @@ team = "{team}"
 {extra}
 [urgency]
 people = ["boss"]
+channels = ["#incident-*"]
 labels = ["deploy-blocking"]
 
 [autonomy]
@@ -472,12 +473,69 @@ class TriageTest(TriageTestCase):
         self.assertNotEqual(queue[1]["item_ids"], first["item_ids"])
 
 
+class UrgencyTest(TriageTestCase):
+    """Exactly three rules interrupt me: a DM or mention from an urgent person, a mention in an incident channel, and a
+    review request labeled deploy-blocking."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def urgent(self):
+        """The summaries of the entries triage marked urgent."""
+        return sorted(e["summary"] for e in self.triage() if e["urgency"] == "urgent")
+
+    def test_a_dm_or_a_mention_from_my_manager_is_urgent(self):
+        self.emit(slack(native_id="D1/1", kind="dm", actor={"name": "boss", "role": "person"}, summary="Boss DMed you about the launch", facts={"channel": "DM", "ask": "question"}), source="slack")
+        self.emit(linear(native_id="notif-9", kind="mention", subject="https://linear.app/acme/issue/WID-9#comment-c-9", actor={"name": "boss", "role": "person"}, summary="Boss mentioned you on WID-9", facts={"notification_id": "notif-9"}), source="linear")
+
+        self.assertEqual(self.urgent(), ["Boss DMed you about the launch", "Boss mentioned you on WID-9"])
+
+    def test_my_manager_is_matched_whatever_the_case_a_source_shows_their_name_in(self):
+        self.emit(slack(native_id="D1/1", kind="dm", actor={"name": "Boss", "role": "person"}, summary="Boss DMed you about the launch", facts={"channel": "DM", "ask": "question"}), source="slack")
+
+        self.assertEqual(self.urgent(), ["Boss DMed you about the launch"])
+
+    def test_my_managers_pr_comment_or_ticket_change_is_not_urgent(self):
+        self.emit(item(native_id="comment/1", kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-1", actor={"name": "boss", "role": "person"}, summary="Boss commented on #7"))
+        self.emit(linear(native_id="issue/WID-20", kind="ticket_change", subject="https://linear.app/acme/issue/WID-20", actor={"name": "boss", "role": "person"}, summary="Boss moved WID-20's due date up", facts={}), source="linear")
+
+        self.assertEqual(self.urgent(), [])
+
+    def test_a_mention_in_an_incident_channel_is_urgent_but_an_incident_message_that_does_not_mention_me_is_not(self):
+        self.emit(
+            slack(native_id="C9/1", summary="Ops asked you in #incident-db to check the replica lag", facts={"channel": "#incident-db", "ask": "question"}),
+            slack(native_id="C9/2", kind="channel_message", summary="Ops posted an update in #incident-db", facts={"channel": "#incident-db"}),
+            slack(native_id="C1/3", summary="Dee asked you in #deploys about the index", facts={"channel": "#deploys", "ask": "question"}),
+            source="slack",
+        )
+
+        self.assertEqual(self.urgent(), ["Ops asked you in #incident-db to check the replica lag"])
+
+    def test_a_review_request_labeled_deploy_blocking_is_urgent_but_the_label_elsewhere_is_not(self):
+        self.emit(
+            item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", labels=["deploy-blocking"], summary="Ben requested your review on #102"),
+            item(native_id="comment/2", kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-2", labels=["deploy-blocking"], summary="Ana commented on #7"),
+        )
+
+        self.assertEqual(self.urgent(), ["Ben requested your review on #102"])
+
+    def test_the_same_ask_in_slack_and_linear_is_one_urgent_entry_when_either_item_matches(self):
+        permalink = "https://acme.slack.com/archives/C300/p1792500000000900"
+        self.emit(slack(native_id="C300/1792500000.000900", subject=permalink, link=permalink, actor={"name": "boss", "role": "person"}, summary="Boss asked you in #widgets for the export ETA", facts={"channel": "#widgets", "ask": "question"}), source="slack")
+        self.emit(linear(native_id="notif-10", kind="mention", subject=permalink, actor={"name": "Slack", "role": "bot"}, summary="Slack thread synced to WID-15 mentions you", facts={"notification_id": "notif-10"}), source="linear")
+
+        [ask] = [e for e in self.triage() if e["kind"] == "mention"]
+
+        self.assertEqual((ask["sources"], ask["urgency"]), (["linear", "slack"], "urgent"))
+
+    def test_a_dm_from_a_peer_is_not_urgent(self):
+        self.emit(slack(native_id="D1/1", kind="dm", summary="Dee DMed you about the index", facts={"channel": "DM", "ask": "question"}), source="slack")
+
+        self.assertEqual(self.urgent(), [])
+
+
 class TriageRulesTest(TriageTestCase):
-    def test_asks_from_urgent_people_or_with_urgent_labels_are_urgent(self):
-        self.emit(item(actor={"name": "boss", "role": "person"}), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", labels=["deploy-blocking"]), item(native_id="pr/103", subject="https://github.com/acme/widgets/pull/103"))
-
-        self.assertEqual([e["urgency"] for e in self.triage()], ["urgent", "urgent", "normal"])
-
     def test_an_action_type_promoted_to_silent_skips_approval(self):
         self.write_profile(silent=["gh_thread_reply"])
         self.emit(item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-9"))

@@ -25,7 +25,7 @@ watchlist = ["#incidents", "#deploys"]
 # Gmail, Calendar and Meetings read this account. Profiles naming the same account share one sweep of each.
 account = "me@acme.example"
 # Declining a meeting my manager organizes or attends is never proposed.
-manager = "boss@acme.example"
+manager = "mo@acme.example"
 # Noise mail is filed under this label as it is archived. Create it in Gmail first: triage cannot create labels.
 noise_label = "Noise"
 
@@ -38,7 +38,12 @@ channels = ["#widgets"]
 senders = ["@acme.example"]
 
 [urgency]
-people = ["my-manager"]
+# The only things that interrupt me (proc notify). Everything else waits for the brief.
+# A DM or a mention from these people, by the name each source shows (Slack and Linear name, GitHub login), any case.
+people = ["Mo", "mo-acme"]
+# A mention of me in these Slack channels (glob patterns allowed). Other messages there are not urgent.
+channels = ["#incidents", "#incident-*"]
+# A review request whose PR carries one of these labels.
 labels = ["deploy-blocking"]
 
 [autonomy]

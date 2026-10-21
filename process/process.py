@@ -5,6 +5,7 @@ stdlib only. Every external command (claude) goes through run().
 """
 
 import fcntl
+import fnmatch
 import hashlib
 import inspect
 import json
@@ -1361,6 +1362,17 @@ def protected_meeting(profile, items):
     )
 
 
+def urgent(rules, i):
+    """The profile's [urgency] rules, the only things that interrupt me: a DM or mention from one of its people, a
+    mention in one of its channels (incident-*), or a review request whose PR carries one of its labels."""
+    channel = (i.get("facts") or {}).get("channel", "").lower()
+    return (
+        i["kind"] in ("dm", "mention") and i["actor"]["name"].lower() in {p.lower() for p in rules.get("people", [])}
+        or i["kind"] == "mention" and any(fnmatch.fnmatchcase(channel, c.lower()) for c in rules.get("channels", []))
+        or i["kind"] == "review_request" and bool(set(i.get("labels", [])) & set(rules.get("labels", [])))
+    )
+
+
 def entry(name, profile, group):
     """Apply the needs-me rules to one deduped ask: what to do about it, who decides, how urgent."""
     lead = group[0]
@@ -1404,8 +1416,7 @@ def entry(name, profile, group):
         action, urgency = {"type": "slack_reply", "params": {"channel": channel, "thread_ts": thread}}, "normal"
     elif kind in ("mention", "ticket_change", "dm", "thread_question"):
         urgency = "normal"
-    rules = profile.get("urgency", {})
-    if {i["actor"]["name"] for i in group} & set(rules.get("people", [])) or {l for i in group for l in i.get("labels", [])} & set(rules.get("labels", [])):
+    if any(urgent(profile.get("urgency", {}), i) for i in group):
         urgency = "urgent"
     autonomy, status = "draft", "pending"
     if action["type"] == "none":
