@@ -253,7 +253,7 @@ def load_profile(path):
             problems += [f"phases.execute grants {t!r}, which can merge, approve, delete or push" for t in phase.get("allowed_tools", []) if never_tool(t)]
         else:
             problems += [f"phases.{name} grants {t!r}, which can send, review, RSVP or merge" for t in phase.get("allowed_tools", []) if forbidden_tool(t)]
-        if name.startswith("sweep-"):
+        if name.startswith("sweep-") or name == "next-work":  # next-work reads like a sweeper; `process next` queues
             problems += [f"phases.{name} grants {t!r}, a silent write only triage may hold" for t in phase.get("allowed_tools", []) if t in SILENT_WRITES]
     if problems:
         raise SystemExit(f"process: profile {path}:\n" + "\n".join(f"  {p}" for p in problems))
@@ -359,9 +359,11 @@ class Process:
                 swept |= {share_key(profile, s) for s in sources} - {None}
                 phases = [(f"sweep-{s}", f"/sweep-{s} {name}{sweep_args}") for s in sources]
                 phases.append(("triage", f"/triage {name}" + (f" --dry-run --fixtures {opts['--fixtures']}" if dry else "")))
+                if "next-work" in profile["phases"] and not opts.get("--delta"):  # it runs with the full brief, after triage
+                    phases.append(("next-work", f"/next-work {name}" + (f" --fixtures {opts['--fixtures']}" if dry else "")))
                 for phase, prompt in phases:
                     self.out(f"{name}: {phase}")
-                    before = self.watermarks(name)
+                    before = {**self.watermarks(name), "next-work": self.read_json(self.profile_state(name) / "next.json", {}).get("at")}
                     try:
                         self.headless(profile, phase, prompt, dry)
                         problem = self.phase_problem(name, phase, before)
@@ -409,6 +411,9 @@ class Process:
             source = phase.removeprefix("sweep-")
             if self.watermarks(name).get(source) in (None, before.get(source)):
                 return f"{phase} stored nothing: its watermark did not move"
+        elif phase == "next-work":
+            if self.read_json(self.profile_state(name) / "next.json", {}).get("at") in (None, before["next-work"]):
+                return "next-work ranked nothing: next.json was not written"
         elif self.unhandled(name):
             return f"triage left {len(self.unhandled(name))} item(s) unhandled"
 
@@ -673,6 +678,109 @@ class Process:
         (pdir / "plan.json").unlink()
         self.out(f"committed {len(entries)} entr(ies) for {name}; superseded {len(superseded)}; {len(handled)} item(s) handled")
 
+    # -- next work --
+
+    def cmd_next(self, name, *args):
+        """Rank the next-work skill's candidate tickets (JSONL on stdin, or --file) into up to 3 recommendations, each
+        with its reason, and an AFK list, in next.json. Promotions and AFK launches are queued for my approval, once
+        each: a rerun keeps a proposal still waiting, supersedes one it no longer makes, and never re-proposes one I
+        decided. All or nothing."""
+        opts = flags(args, "--file")
+        profile = self.profile(name)
+        path = opts.get("--file") and self.inbox_file(name, opts["--file"])
+        tickets = self.parse_jsonl(path.read_text() if path else self.stdin.read(), "ticket")
+        problems = [f"ticket {n}: {e}" for n, t in enumerate(tickets, 1) for e in validate(t, "ticket")]
+        if problems:
+            raise SystemExit("process: nothing ranked, invalid tickets:\n" + "\n".join(problems))
+        now = self.clock()
+        proposals = [e for e in self.queue() if e["project"] == name and e["kind"] == "next_work"]
+        decided = {(e["action"]["type"], e["subject"]): e["status"] for e in proposals if e["status"] not in ("pending", "superseded")}
+        waiting = {(e["action"]["type"], e["subject"]): e for e in proposals if e["status"] == "pending"}
+        status = lambda action_type, t: decided.get((action_type, canonical(t["url"])))
+        # An AFK launch I approved has the ticket; one I skipped (or that failed) hands it back to me.
+        free = [t for t in tickets if not t["blocked"] and status("afk_launch", t) not in ("approved", "done")]
+        todo = [t for t in free if t["state"] == "todo" and t["assignee"] != "other"]
+        afk = [t for t in todo if trivial(profile, t) and not status("afk_launch", t)]  # a separate list, not one of my 3
+        todo = [t for t in todo if t not in afk]
+        unblocked = [t for t in todo if t.get("unblocked_at", "") >= iso(now - UNBLOCKED_AGE)]
+        tiers = [
+            ("in_progress", [t for t in free if t["state"] == "in_progress" and t["assignee"] == "me"]),
+            ("unblocked", unblocked),
+            ("todo", [t for t in todo if t not in unblocked]),
+        ]
+        ranked = [(tier, t) for tier, group in tiers for t in sorted(group, key=ticket_order)]
+        picks = (self.pr_fixes(name) + [recommend(tier, t, now) for tier, t in ranked])[:NEXT_SLOTS]
+        # A promotion I approved or skipped is settled; one that failed (Linear down) may be proposed again.
+        backlog = [t for t in free if t["state"] == "backlog" and t["assignee"] != "other" and status("linear_promote", t) in (None, "failed")]
+        proposed = []
+
+        def propose(action, summary, t):
+            e = waiting.get((action["type"], canonical(t["url"]))) or self.next_entry(profile, action, summary, t)
+            proposed.append(e)
+            return e["id"]
+
+        for t in sorted(backlog, key=ticket_order)[: NEXT_SLOTS - len(picks)]:  # Todo is thin: Backlog fills the slots it leaves
+            pick = recommend("promote", t, now)
+            action = {"type": "linear_promote", "params": ticket_ref(t), "draft": f"Move {t['identifier']} from Backlog to Todo. {pick['reason']}."}
+            picks.append({**pick, "entry_id": propose(action, f"Promote {t['identifier']} {t['title']} from Backlog to Todo", t)})
+        afk_list = []
+        for t in sorted(afk, key=ticket_order):
+            action = {"type": "afk_launch", "params": ticket_ref(t), "draft": (t.get("description") or "").strip() or f"No description: see {t['url']}."}
+            entry_id = propose(action, f"Hand {t['identifier']} {t['title']} to an AFK worker", t)
+            afk_list.append({"tier": "afk", "ref": t["identifier"], "title": t["title"], "link": t["url"], "reason": trivial(profile, t), "entry_id": entry_id})
+        result = {"profile": name, "at": iso(now), "recommendations": picks, "afk": afk_list}
+        fresh = [e for e in proposed if e not in waiting.values()]
+        problems = validate(result, "next_work") + [f"{e['id']}: {p}" for e in fresh for p in validate(e, "queue_entry")]
+        if problems:
+            raise SystemExit("process: nothing written:\n" + "\n".join(f"  {p}" for p in problems))
+        stale = [{**e, "status": "superseded"} for e in waiting.values() if e not in proposed]
+        self.append_jsonl(self.state_root() / "queue.jsonl", stale + fresh)
+        self.write_json(self.profile_state(name) / "next.json", result)
+        if path:
+            path.unlink()
+        for n, r in enumerate(picks, 1):
+            self.out(f"{n}. {r['ref']}  {r['title']}  — {r['reason']}  {r['link']}")
+        for r in afk_list:
+            self.out(f"AFK {r['ref']}  {r['title']}  — {r['reason']}  {r['link']}")
+
+    def next_entry(self, profile, action, summary, t):
+        """A queue entry for a promotion or AFK launch: drafted for my approval, unless I promoted its type to silent."""
+        silent = action["type"] in profile["autonomy"]["silent"]
+        return {
+            "id": "q-" + digest(profile["name"] + "next_work" + action["type"] + canonical(t["url"])),
+            "project": profile["name"],
+            "item_ids": [f"linear:{t['identifier']}"],
+            "sources": ["linear"],
+            "kind": "next_work",
+            "subject": canonical(t["url"]),
+            "summary": summary,
+            "link": t["url"],
+            "urgency": "normal",
+            "autonomy": "silent" if silent else "draft",
+            "action": action,
+            "status": "approved" if silent else "pending",
+            "run": self.read_json(self.state_root() / "run.json", {}).get("id") or iso(self.clock()),
+            "created": iso(self.clock()),
+        }
+
+    def pr_fixes(self, name):
+        """One recommendation per PR of mine with fixes waiting on my approval, most urgent first. Silent fixes are the
+        executor's, not mine."""
+        prs = {}
+        for e in sorted(self.queue(), key=lambda e: (URGENCY.index(e["urgency"]), e["created"])):
+            if e["project"] == name and e["status"] == "pending" and e["action"]["type"] in ("gh_fix_pr", "gh_thread_reply"):
+                prs.setdefault((e["action"]["params"]["repo"], e["action"]["params"]["number"]), []).append(e)
+        return [
+            {
+                "tier": "pr_fix",
+                "ref": f"{repo}#{number}",
+                "title": fixes[0]["summary"],
+                "link": f"https://github.com/{repo}/pull/{number}",
+                "reason": f"My own PR: {len(fixes)} fix{'es' if len(fixes) > 1 else ''} waiting on me",
+            }
+            for (repo, number), fixes in prs.items()
+        ]
+
     # -- executor side --
 
     def cmd_execute(self, *args):
@@ -724,8 +832,9 @@ class Process:
         return lock
 
     def execute(self, profile, dry):
-        """Run the executor phase for one profile when it has approved entries; return what went wrong, if anything.
-        A dry run (a dry-run state directory) gets --dry-run and no service tools."""
+        """Start the profile's approved AFK launches, then run the executor phase when it has other approved entries;
+        return what went wrong, if anything. A dry run (a dry-run state directory) gets --dry-run and no service tools."""
+        self.launch_afk(profile, dry)
         name, waiting = profile["name"], len(self.approved(profile["name"]))
         if not waiting:
             return None
@@ -736,9 +845,87 @@ class Process:
         if self.approved(name):
             return f"execute left {len(self.approved(name))} approved entr(ies) without a result"
 
-    def approved(self, name):
-        """Entries waiting on the executor: approved by me, or promoted to silent, with an action that carries text."""
-        return [e for e in self.queue() if e["project"] == name and e["status"] == "approved" and needs_draft(e)]
+    def approved(self, name, action_type=None):
+        """Entries waiting on the executor phase: approved by me, or promoted to silent, with an action that carries
+        text. AFK launches are not the phase's: `execute` starts them itself, and only they are listed for afk_launch."""
+        return [
+            e for e in self.queue()
+            if e["project"] == name and e["status"] == "approved" and needs_draft(e) and (e["action"]["type"] == "afk_launch") == (action_type == "afk_launch")
+        ]
+
+    # An approved AFK launch needs no headless phase: its draft becomes a ticket in a local afk spec in the profile's
+    # workdir, and afk starts the worker, in a tmux session of the spec's own that runs afk's watcher.
+
+    def launch_afk(self, profile, dry):
+        """Start a worker for each approved afk_launch, oldest first, and record how each went."""
+        name, limit, running = profile["name"], profile.get("afk", {}).get("max_workers", AFK_MAX_WORKERS), None
+        for e in self.approved(name, "afk_launch"):
+            if dry:
+                self.record(name, e, "skipped")
+                continue
+            path = None
+            try:
+                project, spec = self.afk_project(profile)
+                if running is None:
+                    running = self.afk_running(project, profile)
+                if running >= limit:  # still approved: the next executor run tries again
+                    self.out(f"{e['id']}: waits for a free AFK slot ({running} of {limit} running)")
+                    continue
+                path = self.afk_ticket(spec, e)
+                self.run(["env", f"AFK_PROJECT={project}", "afk", "start", path.name.split("-", 1)[0]], cwd=self.workdir(profile))
+            except (subprocess.CalledProcessError, OSError, ValueError, KeyError) as error:  # ValueError, KeyError: not afk's JSON
+                if path:  # closed, so afk's frontier never offers a ticket whose launch failed
+                    path.write_text(path.read_text().replace("**Status:** ready-for-agent", "**Status:** closed", 1))
+                self.record(name, e, "failure", error=failure("afk", error).removeprefix("afk failed: "))
+                continue
+            running += 1
+            self.record(name, e, "success", link=e["action"]["params"]["url"])
+
+    def afk_running(self, project, profile):
+        """Workers running in the project, counted as afk counts them: one in review is parked on me, a hitl one is mine."""
+        workers = json.loads(self.run(["env", f"AFK_PROJECT={project}", "afk", "next"], cwd=self.workdir(profile)))["workers"]
+        return sum(w["phase"] not in ("review", "hitl") for w in workers)
+
+    def afk_project(self, profile):
+        """The profile's afk project and its spec directory, bound to a tmux session of the same name on first use."""
+        project, workdir = f"process-{profile['name']}", self.workdir(profile)
+        spec = workdir / ".scratch" / project  # afk's local spec layout: <repo>/.scratch/<project>/issues/
+        if not workdir.is_dir():
+            raise FileNotFoundError(f"no workdir {workdir}")
+        (spec / "issues").mkdir(parents=True, exist_ok=True)
+        try:
+            self.run(["tmux", "has-session", "-t", f"={project}"])
+        except subprocess.CalledProcessError:
+            # -e: the session's panes find their project even if the tmux server was started inside another afk project.
+            pane = self.run(["tmux", "new-session", "-d", "-s", project, "-c", str(workdir), "-e", f"AFK_PROJECT={project}", "-P", "-F", "#{pane_id}"]).strip()
+            try:
+                # stdin is not the caller's: tmux takes a terminal's own pane over TMUX_PANE, so proc's would win.
+                self.run(["env", f"TMUX_PANE={pane}", "afk", "init", str(spec)], input="", cwd=workdir)
+                self.run(["tmux", "send-keys", "-t", pane, "afk watch", "Enter"])  # drives the workers through their phases
+            except (subprocess.CalledProcessError, OSError):  # an unbound session would be taken as bound next time
+                self.run(["tmux", "kill-session", "-t", f"={project}"])
+                raise
+        return project, spec
+
+    def afk_ticket(self, spec, e):
+        """Write the entry's approved draft as the spec's next ticket, once: a retry finds the file it wrote before."""
+        issues = sorted((spec / "issues").glob("*.md"))
+        for path in issues:
+            if re.search(rf"^\*\*Queue entry:\*\* {e['id']}$", path.read_text(), re.M):
+                return path
+        number = str(max([int(p.name.split("-", 1)[0]) for p in issues if p.name.split("-", 1)[0].isdigit()], default=0) + 1).zfill(2)
+        params = e["action"]["params"]
+        title = " ".join(f"{params['ticket']} {params['title']}".split())
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:50].rstrip("-")
+        # afk reads a ticket's fields from their first match, so these come before the draft, which quotes Linear. A
+        # line of the draft afk would read as a field it has no value for here (Type, Repo) is marked as Linear's.
+        draft = AFK_FIELD.sub(r"(Linear) \g<0>", e["action"]["draft"].strip())
+        path = spec / "issues" / f"{number}-{slug}.md"
+        path.write_text(
+            f"# {number} — {title}\n\n**Status:** ready-for-agent\n\n**Blocked by:** None — can start immediately\n\n"
+            f"**Linear:** {params['url']}\n\n**Queue entry:** {e['id']}\n\n{draft}\n\n{AFK_PR.format(ticket=params['ticket'])}\n"
+        )
+        return path
 
     def apply_decisions(self, profiles):
         """Turn each decision on a still-pending entry into its new state. A decision on anything else is stale (the
@@ -990,6 +1177,8 @@ class Process:
             entries = [e for e in queue if e["project"] == name and e["status"] != "superseded" and shown(e, acted)]
             lines += [f"## {name}", ""] + [f"> ⚠ {p}" for p in run.get("problems", {}).get(name, [])]
             lines += render_project(entries, acted) or ["Nothing new.", ""]
+            if mode == "full":  # next-work runs with the full brief
+                lines += render_next(self.read_json(self.state_root() / "profiles" / name / "next.json", None), queue)
         unsorted = [e for e in queue if e["project"] == UNSORTED and e["status"] != "superseded" and shown(e)]
         if unsorted and not opts.get("--project"):
             lines += ["## Unsorted", "", "Items from a shared source that no profile's match rules claimed.", ""] + render_project(unsorted)
@@ -1029,6 +1218,15 @@ MERGE_BASE = (
     "Merge the base branch into the PR branch (never rebase) and resolve the conflicts. Push only if every conflict is "
     "mechanical: both sides kept, nothing about behaviour decided. Otherwise abort and report the conflicting files."
 )
+AFK_MAX_WORKERS = 2
+# A line afk's field() reads as a ticket field: optional non-word characters, the name, then a colon.
+AFK_FIELD = re.compile(r"^\W*(status|blocked by|type|repo|split into)\W*:.*$", re.I | re.M)
+# How an AFK worker's PR differs from afk's default: it is a draft, so it reads as unreviewed.
+AFK_PR = """## Pull request
+
+Open the PR as a draft. In the pr phase, push the branch and run `gh pr create --draft`, with a Conventional Commits
+title and {ticket} in the body so Linear links it, before `/open-pr`: it finds the open draft and clears its gates.
+Leave it a draft. Marking it ready for review is mine."""
 PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 
 
@@ -1128,7 +1326,8 @@ def render_project(entries, acted=()):
             lines += [f"  > {line}" for line in (e["action"].get("draft") or "").splitlines()] + [""]
     # A skip with no note is the executor's dry run; triage notes why it skipped (dry run, or already tracked).
     words = {"approved": "approved, waits on the executor", "done": "done", "failed": "FAILED", "skipped": "skipped"}
-    outcome = lambda e: f"{words[e['status']]}{': ' + e['note'] if e.get('note') else ' (dry run)' if e['status'] == 'skipped' else ''}"
+    words_for = lambda e: "approved, waits for a free AFK slot" if e["status"] == "approved" and e["action"]["type"] == "afk_launch" else words[e["status"]]
+    outcome = lambda e: f"{words_for(e)}{': ' + e['note'] if e.get('note') else ' (dry run)' if e['status'] == 'skipped' else ''}"
     if approved:
         lines += [f"### Approved ({len(approved)})", ""]
         lines += [f"- {e['summary']} · {e['link']}\n  `{e['action']['type']}` — {outcome(e)}" for e in approved] + [""]
@@ -1140,6 +1339,18 @@ def render_project(entries, acted=()):
         lines += [f"- {'**urgent** · ' if e['urgency'] == 'urgent' else ''}{e['summary']} · {e['link']}" for e in fyi]
         lines += ["", "</details>", ""]
     return lines
+
+
+def render_next(result, queue):
+    """The Next work section: my up to 3 recommendations, each with its reason, then the AFK list and where each stands."""
+    if not result or not (result["recommendations"] or result["afk"]):
+        return []
+    status = {e["id"]: "approved, waits for a free AFK slot" if e["status"] == "approved" else e["status"] for e in queue}
+    lines = ["### Next work", ""]
+    lines += [f"{n}. {r['ref']} {r['title']} — {r['reason']} · {r['link']}" for n, r in enumerate(result["recommendations"], 1)]
+    lines += [""] if result["recommendations"] else []
+    lines += [f"- AFK: {r['ref']} {r['title']} — {r['reason']} · {status.get(r['entry_id'], 'pending')}" for r in result["afk"]]
+    return lines + ([""] if result["afk"] else [])
 
 
 def protected_meeting(profile, items):
@@ -1229,9 +1440,45 @@ def entry(name, profile, group):
     }
 
 
+NEXT_SLOTS = 3
+PRIORITY = {1: "urgent", 2: "high", 3: "medium", 4: "low"}
+# A Todo ticket stays newly unblocked this long after its last blocker cleared, then it is just another Todo ticket.
+UNBLOCKED_AGE = 3 * 24 * 3600
+TIER_LEADS = {"in_progress": "Already in progress", "unblocked": "Unblocked {unblocked}", "todo": "Next in Todo", "promote": "Todo is thin, so promote from Backlog"}
+
+
+def ticket_order(t):
+    """Priority (none last), then the project's target date (none last), then age (oldest first)."""
+    return (t["priority"] or 5, t.get("target_date") or "9999-99-99", t["created"])
+
+
+def trivial(profile, t):
+    """Why a ticket meets the profile's trivial rules, or None: an estimate or label they name, none they exclude."""
+    rules = profile.get("afk", {})
+    if set(t["labels"]) & set(rules.get("exclude_labels", [])):
+        return None
+    if t.get("estimate") in rules.get("estimates", []):
+        return f"Trivial: estimate {t['estimate']}"
+    labels = [l for l in t["labels"] if l in rules.get("labels", [])]
+    return f"Trivial: labeled {', '.join(labels)}" if labels else None
+
+
+def ticket_ref(t):
+    return {"ticket": t["identifier"], "title": t["title"], "url": t["url"]}
+
+
+def recommend(tier, t, now):
+    created = datetime.fromisoformat(t["created"].replace("Z", "+00:00")).timestamp()
+    facts = [f"{PRIORITY[t['priority']]} priority"] if t["priority"] else []
+    facts += [f"project due {t['target_date']}"] if t.get("target_date") else []
+    facts.append(f"opened {max(0, int((now - created) // 86400))} days ago")
+    return {"tier": tier, "ref": t["identifier"], "title": t["title"], "link": t["url"], "reason": f"{TIER_LEADS[tier].format(unblocked=t.get('unblocked_at', '')[:10])}: {', '.join(facts)}"}
+
+
 def failure(phase, error):
-    stderr = getattr(error, "stderr", None) or ""
-    return f"{phase} failed: {(stderr.strip().splitlines() or [str(error)])[-1]}"
+    """A failed command's last line of stderr, else of stdout (afk prints its refusals there), else the error itself."""
+    said = getattr(error, "stderr", None) or getattr(error, "stdout", None) or ""
+    return f"{phase} failed: {(said.strip().splitlines() or [str(error)])[-1]}"
 
 
 class Usage(Exception):
@@ -1269,7 +1516,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: process <run|emit|watermark|triage|execute|brief|profile|profiles|validate> ...")
+        app.out("usage: process <run|emit|watermark|triage|next|execute|brief|profile|profiles|validate> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command.replace("-", "_"), None)
