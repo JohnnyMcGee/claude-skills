@@ -2166,6 +2166,19 @@ class WatchTest(AfkTestCase):
         self.assertEqual(self.afk("status").splitlines()[1:], [])
         self.assertFalse((self.project_dir / "worktrees" / "03").exists())
 
+    def test_a_merged_worker_with_changes_in_an_ignored_submodule_is_left_cleanup_pending(self):
+        # A submodule set to ignore=all hides its changes from a plain `git status`, and cleanup forces the removal.
+        self.reach_review()
+        self.merge()
+        worktree = str(self.project_dir / "worktrees" / "03")
+        self.run_fake.responses[("git", "-C", worktree, "status")] = (
+            lambda cmd: " M vendor/lib\n" if "--ignore-submodules=none" in cmd else "")
+
+        self.afk("tick")
+
+        self.assertEqual(self.cleanup_commands(), ([], [], []))
+        self.assertIn("uncommitted", self.desktop_notifications()[-1])
+
     def test_a_merged_worker_whose_branch_is_checked_out_elsewhere_is_cleaned_up_leaving_the_branch(self):
         self.reach_review()
         self.merge()

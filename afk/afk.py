@@ -492,7 +492,8 @@ class Afk:
         if command is not None and command not in SHELLS:  # a pane that's gone has no human in it
             return f"its shell pane is running {command}"
         worktree = str(worktree)
-        if self.run(["git", "-C", worktree, "status", "--porcelain"]).strip():
+        # A submodule set to ignore=all would otherwise hide its changes, which the forced removal would then delete.
+        if self.run(["git", "-C", worktree, "status", "--porcelain", "--ignore-submodules=none"]).strip():
             return "its worktree has uncommitted changes"
         if ended != "merged" and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
             return "its branch has unpushed commits"
