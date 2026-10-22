@@ -133,6 +133,19 @@ class InitTest(AfkTestCase):
         )
 
 
+class ViewTest(AfkTestCase):
+    def test_view_shows_the_current_project_config_and_its_path(self):
+        self.afk("init", str(self.scratch))
+        path = self.project_dir / "config.toml"
+        with path.open("a") as config:
+            config.write("\n[limits]\nmax_workers = 5\n")
+
+        out = self.afk("view")
+
+        self.assertEqual(out.splitlines()[0], f"# {path}")
+        self.assertEqual(tomllib.loads(out), tomllib.loads(path.read_text()))
+
+
 class GithubTestCase(AfkTestCase):
     """A project whose spec is GitHub issue acme/widgets#2 and whose tickets are its sub-issues, all via faked `gh`."""
 
@@ -545,7 +558,7 @@ class GithubStartTest(GithubTestCase):
         self.afk("tick")
 
         worktree = str(self.project_dir / "worktrees" / "7")
-        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"), [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-2-7"]])
         self.assertFalse((self.project_dir / "workers" / "7").exists())
         # Neither the closed issue nor the open PR is touched: only the claim at start edits GitHub.
@@ -1963,19 +1976,26 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual(self.status()["state"], "working")
 
+    def pane_gone(self, pane):
+        """tmux no longer has `pane`: older tmux fails to find it, tmux 3.6 prints nothing and exits 0."""
+        def failing(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr=f"can't find pane: {pane}")
+
+        return {"failing": failing, "empty": ""}
+
     def test_a_killed_agent_pane_needs_attention_instead_of_failing_every_tick(self):
-        def pane_gone(cmd):
-            raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %5")
+        for how, response in self.pane_gone("%5").items():
+            with self.subTest(how):
+                self.setUp()
+                self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = response
+                self.report("done", "Implemented")
+                self.stop()
 
-        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = pane_gone
-        self.report("done", "Implemented")
-        self.stop()
+                self.afk("tick")
+                self.afk("tick")
 
-        self.afk("tick")
-        self.afk("tick")
-
-        self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
-        self.assertEqual(len(self.desktop_notifications()), 1)
+                self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
+                self.assertEqual(len(self.desktop_notifications()), 1)
 
 
     # Merge detection and cleanup
@@ -2049,7 +2069,7 @@ class WatchTest(AfkTestCase):
             self.cleanup_commands(),
             (
                 [["tmux", "kill-window", "-t", "%5"]],
-                [["git", "-C", str(self.repo), "worktree", "remove", worktree]],
+                [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]],
                 [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-03"]],
             ),
         )
@@ -2093,20 +2113,30 @@ class WatchTest(AfkTestCase):
         self.assertEqual(self.status()["state"], "cleanup-pending")
         self.assertIn("uncommitted", self.desktop_notifications()[-1])
 
-    def test_merged_pr_whose_shell_pane_is_gone_is_left_cleanup_pending(self):
+    def test_merged_pr_whose_shell_pane_is_gone_is_cleaned_up(self):
+        # A pane that no longer exists has no human in it, so it can't hold up cleanup.
+        for how, response in self.pane_gone("%6").items():
+            with self.subTest(how):
+                self.setUp()
+                self.reach_review()
+                self.merge()
+                self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = response
+
+                self.afk("tick")
+
+                self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
+                self.assertEqual(self.afk("status").splitlines()[1:], [])
+
+    def test_merged_pr_whose_shell_pane_is_gone_with_uncommitted_changes_is_left_cleanup_pending(self):
         self.reach_review()
-        self.merge()
-
-        def pane_gone(cmd):
-            raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %6")
-
-        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = pane_gone
+        self.merge(worktree_status=" M src/widget.py\n")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = ""
 
         self.afk("tick")
 
         self.assertEqual(self.cleanup_commands(), ([], [], []))
         self.assertEqual(self.status()["state"], "cleanup-pending")
-        self.assertIn("shell pane is gone", self.desktop_notifications()[-1])
+        self.assertIn("uncommitted", self.desktop_notifications()[-1])
 
     def test_cleanup_pending_worker_is_cleaned_up_once_the_shell_is_idle_again(self):
         self.reach_review()
@@ -2118,6 +2148,36 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
         self.assertEqual(self.afk("status").splitlines()[1:], [])
+
+    def test_a_merged_worker_whose_worktree_has_submodules_is_cleaned_up(self):
+        self.reach_review()
+        self.merge()
+
+        def with_submodules(cmd):
+            if "--force" not in cmd:
+                raise subprocess.CalledProcessError(
+                    128, cmd, stderr="fatal: working trees containing submodules cannot be moved or removed")
+            return git(cmd)
+
+        self.run_fake.responses[("git", "-C", str(self.repo), "worktree", "remove")] = with_submodules
+
+        self.afk("tick")
+
+        self.assertEqual(self.afk("status").splitlines()[1:], [])
+        self.assertFalse((self.project_dir / "worktrees" / "03").exists())
+
+    def test_a_merged_worker_with_changes_in_an_ignored_submodule_is_left_cleanup_pending(self):
+        # A submodule set to ignore=all hides its changes from a plain `git status`, and cleanup forces the removal.
+        self.reach_review()
+        self.merge()
+        worktree = str(self.project_dir / "worktrees" / "03")
+        self.run_fake.responses[("git", "-C", worktree, "status")] = (
+            lambda cmd: " M vendor/lib\n" if "--ignore-submodules=none" in cmd else "")
+
+        self.afk("tick")
+
+        self.assertEqual(self.cleanup_commands(), ([], [], []))
+        self.assertIn("uncommitted", self.desktop_notifications()[-1])
 
     def test_a_merged_worker_whose_branch_is_checked_out_elsewhere_is_cleaned_up_leaving_the_branch(self):
         self.reach_review()
@@ -2511,7 +2571,7 @@ class WatchTest(AfkTestCase):
         self.afk("tick")
 
         self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%7"]])
-        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"), [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-04"]])
         self.assertFalse((self.project_dir / "workers" / "04").exists())
 
@@ -2595,7 +2655,7 @@ class WatchTest(AfkTestCase):
 
         worktree = str(self.project_dir / "worktrees" / "04")
         self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%7"]])
-        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"), [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-04"]])
         self.assertFalse((self.project_dir / "workers" / "04").exists())
         self.assertIn("04 ticket closed and cleaned up", self.desktop_notifications()[-1])
@@ -2971,7 +3031,7 @@ class ApprovedStartTest(AfkTestCase):
         worktree = str(self.project_dir / "worktrees" / "05")
         self.assertEqual(
             [c for c in self.run_fake.find("git", "-C") if c[3] in ("worktree", "branch") and c[4] != "add"],
-            [["git", "-C", str(self.api), "worktree", "remove", worktree],
+            [["git", "-C", str(self.api), "worktree", "remove", "--force", worktree],
              ["git", "-C", str(self.api), "branch", "-D", "afk/widgets-05"]],
         )
 
