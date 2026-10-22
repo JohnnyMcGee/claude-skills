@@ -489,9 +489,7 @@ class Afk:
         if "shell_pane" not in status:
             return "its shell pane is unknown (it was started by an older afk)"
         command = self.pane_command(status["shell_pane"])
-        if command is None:
-            return "its shell pane is gone"
-        if command not in SHELLS:
+        if command is not None and command not in SHELLS:  # a pane that's gone has no human in it
             return f"its shell pane is running {command}"
         worktree = str(worktree)
         if self.run(["git", "-C", worktree, "status", "--porcelain"]).strip():
@@ -520,7 +518,8 @@ class Afk:
         self.best_effort(["tmux", "kill-window", "-t", pane])
         worktree = self.worktree(ticket_id)
         if worktree.exists():
-            self.run(["git", "-C", repo, "worktree", "remove", str(worktree)])
+            # Forced, since git won't otherwise remove a worktree with submodules; cleanup_blocker has checked it's clean.
+            self.run(["git", "-C", repo, "worktree", "remove", "--force", str(worktree)])
         else:
             self.best_effort(["git", "-C", repo, "worktree", "prune"])  # forget a worktree whose dir is gone
         branch = f"afk/{project}-{ticket_id}"
@@ -595,9 +594,12 @@ class Afk:
         return self.pane_command(pane) == "claude"
 
     def pane_command(self, pane):
-        """The pane's foreground command, or None if the pane is gone."""
+        """The pane's foreground command, or None if the pane is gone.
+
+        Older tmux fails to find a pane that's gone; tmux 3.6 prints nothing and exits 0.
+        """
         try:
-            return self.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"]).strip()
+            return self.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"]).strip() or None
         except subprocess.CalledProcessError:
             return None
 
