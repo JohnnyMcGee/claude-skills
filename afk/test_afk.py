@@ -3356,6 +3356,17 @@ class LandRefusalTest(LandTestCase):
         self.assertRefused("already landed")
 
 
+    def test_a_clean_merge_of_anything_but_the_target_after_approval_needs_a_new_one(self):
+        self.work()
+        # Older than the approval, on main, checked out in the clone: none of it the target's.
+        self.commit("base.py", "unreviewed = 1\n", "Unreviewed work on base", at=self.now - 600)
+        self.prompt("lgtm")
+        self.now += 120
+        self.git("merge", "-q", "--no-edit", "main", cwd=self.worktree, at=self.now - 60)
+
+        self.assertRefused("no approval since")
+
+
 class LandedCleanupTest(LandTestCase):
     def setUp(self):
         super().setUp()

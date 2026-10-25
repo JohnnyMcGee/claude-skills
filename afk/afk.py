@@ -404,9 +404,9 @@ class Afk:
             raise SystemExit(f"afk: nothing to land: the branch has no commits of its own on top of {target}")
         approved = status.get("last_human_prompt_at", float("-inf"))
         # A merge of the target git made unaided keeps the approval; one whose conflicts the worker resolved is its own
-        # work, as is any change slipped into a merge.
+        # work, as is any change slipped into a merge, and anything merged from elsewhere, which the human never saw.
         merges = (line.split() for line in git("log", "--merges", "--format=%ct %H", head, "--not", old).splitlines())
-        changed = [int(committed), *(int(at) for at, merge in merges if not self.clean_merge(worktree, merge))]
+        changed = [int(committed), *(int(at) for at, merge in merges if not self.clean_merge(worktree, merge, old))]
         if approved < max(changed) + 1:
             raise SystemExit("afk: no approval since the branch's last commit: the human must approve it as it stands, "
                              "in this pane")
@@ -442,11 +442,16 @@ class Afk:
             fields = dict(line.partition(" ")[::2] for line in block.splitlines())
             yield fields["worktree"], fields.get("branch")
 
-    def clean_merge(self, worktree, merge):
-        """Whether the merge commit is exactly what git merges its two parents to, without conflicts."""
+    def clean_merge(self, worktree, merge, target):
+        """Whether the merge commit merged the target, at or before commit `target`, and is exactly what git merges
+        its two parents to, without conflicts."""
         parents = self.run(["git", "-C", worktree, "log", "-1", "--format=%P", merge]).split()
         if len(parents) != 2:
             return False
+        try:
+            self.run(["git", "-C", worktree, "merge-base", "--is-ancestor", parents[1], target])
+        except subprocess.CalledProcessError:
+            return False  # merged from elsewhere
         try:
             tree = self.run(["git", "-C", worktree, "merge-tree", "--write-tree", *parents]).split("\n", 1)[0]
         except subprocess.CalledProcessError:
