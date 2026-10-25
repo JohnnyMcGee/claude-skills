@@ -32,7 +32,7 @@ Set `XDG_STATE_HOME` **on the command only**, never `export` it in your shell: `
 
 ## Reviewers
 
-Critique runs CodeRabbit and Copilot over the branch's diff. CodeRabbit keeps a local checkpoint per worktree and branch, so a later round prints only new findings and points at `coderabbit review findings` for the earlier ones. Each CodeRabbit run counts against the account's included reviews; Copilot's against its AI credits.
+Critique runs CodeRabbit and Copilot over the branch's diff. CodeRabbit keeps a local checkpoint per worktree and branch, so a later round prints only new findings and points at `coderabbit review findings` for the earlier ones. Its `file:line` comes wrapped in a terminal-hyperlink escape; ignore it. Each CodeRabbit run counts against the account's included reviews; Copilot's against its AI credits.
 
 ## Verification recipes
 
