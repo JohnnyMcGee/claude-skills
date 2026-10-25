@@ -3235,6 +3235,14 @@ class LandRefusalTest(LandTestCase):
         self.assertEqual((checkout / "README.md").read_text(), "widgets, half edited\n")
 
 
+    def test_a_branch_already_landed_is_refused(self):
+        self.work()
+        self.prompt("lgtm")
+        self.land()
+
+        self.assertRefused("already landed")
+
+
 class LandedCleanupTest(LandTestCase):
     def setUp(self):
         super().setUp()

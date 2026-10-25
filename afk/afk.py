@@ -382,6 +382,9 @@ class Afk:
             raise SystemExit("afk: this worker lands by PR, not with `afk land`; see its project's [landing]")
         if not message.strip():
             raise SystemExit('afk land needs a commit message: afk land "<type(scope): summary>"')
+        if status.get("ended") == "landed":
+            raise SystemExit(f"afk: already landed as {status['landed_sha'][:7]} on {status['target']}; afk cleans this "
+                             "worker up next")
         target = status["target"]
         ref = f"refs/heads/{target}"
         worktree = str(self.worktree(status["ticket"]))
@@ -1545,7 +1548,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|status|view|hook|check|trial> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|land|status|view|hook|check|trial> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)
