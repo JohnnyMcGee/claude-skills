@@ -3821,6 +3821,28 @@ class ProjectLandedTest(AfkTestCase):
         self.assertNotIn(self.LANDED, output.splitlines())
         self.assertEqual(landed, [f"afk: widgets {self.LANDED}"])
 
+    def test_no_notice_in_pr_mode_or_when_the_target_is_base(self):
+        for init in [(), ("--land", "local"), ("--land", "local", "--target", "main")]:
+            with self.subTest(init=init):
+                shutil.rmtree(self.project_dir, ignore_errors=True)
+                self.afk("init", str(self.scratch), *init)
+
+                output, notifications = self.tick()
+
+                self.assertNotIn("all tickets landed", output)
+                self.assertEqual(notifications, [])
+
+    def test_no_notice_while_a_worker_is_left(self):
+        self.ticket("07-import", "Widget import")
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        self.afk("start", "07")
+        self.ticket("07-import", "Widget import", status="closed")  # closed by hand, its worker not yet cleaned up
+
+        output, notifications = self.tick()
+
+        self.assertNotIn("all tickets landed", output)
+        self.assertEqual(notifications, [])
+
 
 class ApprovedStartTest(AfkTestCase):
     """Starting the tickets approved at Gate 1: within max_workers, with the user's corrections."""
