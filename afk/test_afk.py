@@ -1239,6 +1239,30 @@ class CheckTest(AfkTestCase):
         self.assertEqual(code, 1)
         self.assertIn("base branch 'develop' does not exist", out)
 
+    def test_reviewers_must_be_a_list_of_commands(self):
+        self.repo_config('reviewers = "coderabbit review"', body=PROSE)
+
+        code, out = self.check()
+
+        self.assertEqual(code, 1)
+        self.assertIn("'reviewers' must be a list of strings", out)
+
+    def test_a_reviewer_whose_binary_is_not_on_path_warns_without_failing(self):
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "coderabbit").write_text("#!/bin/sh\n")
+        (bin_dir / "coderabbit").chmod(0o755)
+        self.env["PATH"] = str(bin_dir)
+        self.repo_config(
+            'reviewers = ["coderabbit review --base {{target}} --plain", "copilot -p \'review the diff\'"]', body=PROSE
+        )
+
+        code, out = self.check()
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("warning: reviewer `copilot -p 'review the diff'`: copilot is not on PATH", out)
+        self.assertNotIn("coderabbit is not on PATH", out)
+
     def test_missing_prose_sections_warn_without_failing(self):
         self.repo_config('base = "main"', body="# AFK\n\n## Dev server\n\n`npm run dev`\n")
 

@@ -283,7 +283,8 @@ class Afk:
     def cmd_check(self, repo=None):
         """Validate a repo's docs/agents/afk.md (plus afk.local.md) against what `afk start` reads."""
         repo = Path(repo or self.run(["git", "rev-parse", "--show-toplevel"]).strip()).resolve()
-        errors, warnings = check_repo_config(repo, self.branch_exists)
+        which = lambda binary: shutil.which(binary, path=self.env.get("PATH", os.defpath))
+        errors, warnings = check_repo_config(repo, self.branch_exists, which)
         for warning in warnings:
             self.out(f"warning: {warning}")
         for error in errors:
@@ -770,6 +771,7 @@ REPO_KEYS = {
     "verify_concurrency": (int, "an integer of at least 1"),
     "default_type": (str, "a string"),
     "task_types": (dict, "a table of task types"),
+    "reviewers": (list, "a list of strings"),
 }
 TASK_TYPE_KEYS = ("agent", "model", "effort", "skill", "prompt")
 
@@ -1287,8 +1289,8 @@ def repo_config_layers(repo):
     return [frontmatter(p.read_text()) for p in (docs / "afk.md", docs / "afk.local.md") if p.is_file()]
 
 
-def check_repo_config(repo, branch_exists):
-    """(errors, warnings) for a repo's AFK config, as `afk start` would read it."""
+def check_repo_config(repo, branch_exists, which):
+    """(errors, warnings) for a repo's AFK config, as `afk start` would read it; which(binary) finds one on PATH."""
     docs = repo / "docs" / "agents"
     main = docs / "afk.md"
     if not main.is_file():
@@ -1341,6 +1343,18 @@ def check_repo_config(repo, branch_exists):
         for name in config["copy"]:
             if isinstance(name, str) and not (repo / name).is_file():
                 errors.append(f"copy: {name} not found in {repo}")
+    if isinstance(config.get("reviewers"), list):
+        # Critique skips a missing reviewer rather than failing, so a missing binary is a warning.
+        for command in (c for c in config["reviewers"] if isinstance(c, str)):
+            try:
+                binary = next((word for word in shlex.split(command) if not re.match(r"\w+=", word)), None)
+            except ValueError as error:
+                errors.append(f"reviewer `{command}`: {error}")
+                continue
+            if binary is None:
+                errors.append(f"reviewer `{command}` names no command")
+            elif not which(binary):
+                warnings.append(f"reviewer `{command}`: {binary} is not on PATH, so critique will skip it")
     base = config.get("base", "main")
     if isinstance(base, str) and not branch_exists(repo, base):
         errors.append(f"base branch '{base}' does not exist in {repo}")
