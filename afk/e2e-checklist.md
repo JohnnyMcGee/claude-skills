@@ -147,7 +147,7 @@ In the repo, run `claude` and `/afk-setup`. Accept its proposals: base `main`, n
 - [ ] It writes `docs/agents/afk.md`, and `afk check` prints `is valid` with no warnings
 - [ ] It creates `.claude/skills/pre-pr/SKILL.md`, and afk.md names it
 - [ ] Step 5 finds the reviewer CLIs on your PATH (`coderabbit`, `copilot`): it proposes a `reviewers` command for each one found, and gives an install hint for each one missing without installing it. Accept its proposals.
-- [ ] The proof passes every step in one run, each reviewer exiting 0 over the trial diff and leaving the worktree clean. With no reviewer installed, the reviewers step is skipped. Afterwards `git worktree list` and `git branch` show no `afk/trial`.
+- [ ] The proof passes every step in one run, each reviewer exiting 0 over the trial diff without prompting, printing its findings or that it found none, and leaving the worktree clean and HEAD unchanged. With no reviewer installed, the reviewers step is skipped. Afterwards `git worktree list` and `git branch` show no `afk/trial`.
 - [ ] It shows the diff and commits only once you approve. Push the commit to `main`.
 
 ## 3. Init
