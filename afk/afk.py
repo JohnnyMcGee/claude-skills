@@ -809,7 +809,8 @@ class Afk:
 REPORT_STATES = ("done", "blocked", "question")
 
 # A prompt afk sent the worker, a phase or guide-mode prompt, perhaps after its task type's skill: never the human's.
-AFK_PROMPT = re.compile(r"\s*(?:/\S+\s+)?AFK (?:phase:|guide mode)")
+# Claude Code hands the prompt hook a paste, as the watcher sends phase prompts, wrapped in a <pasted_content> tag.
+AFK_PROMPT = re.compile(r"\s*(?:<pasted_content[^>]*>\s*)?(?:/\S+\s+)?AFK (?:phase:|guide mode)")
 
 AGENTS = ("claude",)
 

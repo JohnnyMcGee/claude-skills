@@ -2983,7 +2983,8 @@ class ApprovalTest(WorkerTestCase):
         self.now += 300
         self.finish_phase()
 
-        self.prompt(self.prompts_sent()[-1])  # the verify prompt, as the watcher pasted it
+        # The verify prompt, as Claude Code hands the hook a paste: wrapped, after blank lines.
+        self.prompt(f'\n\n<pasted_content id="7eeb">\n{self.prompts_sent()[-1]}</pasted_content id="7eeb">\n')
         self.prompt("/tdd AFK phase: implement — ticket 03 (x)\n\nImplement it.")  # the first, with its skill
 
         self.assertEqual(self.status()["last_human_prompt_at"], approved)
