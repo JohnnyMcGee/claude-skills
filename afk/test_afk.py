@@ -1041,6 +1041,36 @@ class LandingStartTest(AfkTestCase):
         self.assertEqual(self.worktree_base(), "main")
         self.assertEqual((self.status()["landing"], self.status()["target"]), ("pr", "main"))
 
+    def deny(self):
+        """The deny list the worker's claude was launched with."""
+        return json.loads((self.project_dir / "workers" / "03" / "settings.json").read_text())["permissions"]["deny"]
+
+    def test_a_local_mode_worker_is_denied_moving_or_checking_out_its_target_as_well_as_pushing_base(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("start", "03")
+
+        for rule in [
+            "Bash(git push * main)",
+            "Bash(git push * widgets-v2)",
+            "Bash(git push * HEAD:widgets-v2)",
+            "Bash(git push * *:widgets-v2)",
+            "Bash(git update-ref *widgets-v2*)",
+            "Bash(git checkout widgets-v2)",
+            "Bash(git checkout * widgets-v2)",
+            "Bash(git switch widgets-v2)",
+            "Bash(git switch * widgets-v2)",
+        ]:
+            self.assertIn(rule, self.deny())
+
+    def test_a_pr_mode_worker_is_denied_nothing_about_its_target_beyond_pushing_base(self):
+        self.afk("init", str(self.scratch))
+
+        self.afk("start", "03")
+
+        self.assertEqual([r for r in self.deny() if "main" in r],
+                         ["Bash(git push * main)", "Bash(git push * HEAD:main)", "Bash(git push * *:main)"])
+
     def test_an_unknown_landing_mode_in_the_project_config_fails_before_creating_anything(self):
         self.afk("init", str(self.scratch))
         with open(self.project_dir / "config.toml", "a") as config:

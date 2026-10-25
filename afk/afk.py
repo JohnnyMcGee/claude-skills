@@ -245,7 +245,7 @@ class Afk:
             shell = self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree), "-P", "-F", "#{pane_id}"]).strip()
 
             settings = worker_dir / "settings.json"
-            settings.write_text(json.dumps(worker_settings(base), indent=2) + "\n")
+            settings.write_text(json.dumps(worker_settings(base, target if mode == "local" else None), indent=2) + "\n")
             launch = [
                 "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
@@ -1311,9 +1311,22 @@ def window_name(ticket):
     return f"{ticket.id}-{abbrev}"
 
 
-def worker_settings(base):
-    """Per-session Claude settings: status hooks plus a deny list against irreversible damage."""
+def worker_settings(base, target=None):
+    """Per-session Claude settings: status hooks plus a deny list against irreversible damage.
+
+    A local-mode worker's target is moved only by `afk land`, so the worker is denied moving it, or checking it out,
+    by hand. Best-effort: a worker in auto permission mode can find another way.
+    """
     hook = lambda event: [{"hooks": [{"type": "command", "command": f"{shlex.quote(AFK_BIN)} hook {event}"}]}]
+    pushes = lambda branch: [f"Bash(git push * {branch})", f"Bash(git push * HEAD:{branch})", f"Bash(git push * *:{branch})"]
+    landing = [
+        *(pushes(target) if target != base else []),
+        f"Bash(git update-ref *{target}*)",
+        f"Bash(git checkout {target})",
+        f"Bash(git checkout * {target})",
+        f"Bash(git switch {target})",
+        f"Bash(git switch * {target})",
+    ] if target else []
     return {
         "permissions": {
             "deny": [
@@ -1321,9 +1334,8 @@ def worker_settings(base):
                 "Bash(git push * -f)",
                 "Bash(git push * -f *)",
                 "Bash(git push * +*)",
-                f"Bash(git push * {base})",
-                f"Bash(git push * HEAD:{base})",
-                f"Bash(git push * *:{base})",
+                *pushes(base),
+                *landing,
                 "Bash(gh pr merge *)",
                 "Bash(git worktree remove *)",
                 "Bash(git worktree prune *)",
