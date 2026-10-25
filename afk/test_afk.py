@@ -1613,6 +1613,12 @@ class WorkerTestCase(AfkTestCase):
         payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "PreToolUse"}
         self.afk("hook", "activity", stdin=json.dumps(payload), env=self.worker_env(ticket))
 
+    def prompt(self, text, ticket="03"):
+        """Text submitted in the worker's pane, typed by the human or pasted by the watcher."""
+        payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "UserPromptSubmit",
+                   "prompt": text}
+        self.afk("hook", "prompt", stdin=json.dumps(payload), env=self.worker_env(ticket))
+
     def transcript(self, ticket="03"):
         return self.tmp / f"{ticket}.jsonl"
 
@@ -2898,11 +2904,6 @@ class LocalLandingWatchTest(WorkerTestCase):
 class ApprovalTest(WorkerTestCase):
     INIT = ("--land", "local", "--target", "widgets-v2")
 
-    def prompt(self, text):
-        payload = {"session_id": "s", "transcript_path": str(self.transcript()), "hook_event_name": "UserPromptSubmit",
-                   "prompt": text}
-        self.afk("hook", "prompt", stdin=json.dumps(payload), env=self.worker_env())
-
     def test_a_prompt_the_human_types_is_recorded_as_their_last(self):
         self.now += 300
 
@@ -2920,6 +2921,94 @@ class ApprovalTest(WorkerTestCase):
         self.prompt("/tdd AFK phase: implement — ticket 03 (x)\n\nImplement it.")  # the first, with its skill
 
         self.assertEqual(self.status()["last_human_prompt_at"], approved)
+
+
+class GitRun(FakeRun):
+    """FakeRun, except git, which runs for real: landing is git's work, so it is checked against real repos."""
+
+    def __call__(self, cmd, input=None, cwd=None):
+        if cmd[0] != "git":
+            return super().__call__(cmd, input, cwd)
+        self.calls.append(list(cmd))
+        self.inputs.append(input)
+        self.cwds.append(cwd and str(cwd))
+        before = self.responses.get(("git", "before"))
+        if before:
+            before(cmd)
+        return afk.default_run(cmd, input, cwd)
+
+
+class LandTestCase(WorkerTestCase):
+    """Worker 03 of a local-mode project, in a real git clone with an origin, landing on INIT's target."""
+
+    INIT = ("--land", "local", "--target", "widgets-v2")
+
+    def setUp(self):
+        AfkTestCase.setUp(self)
+        identity = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "Ada",
+                    "GIT_AUTHOR_EMAIL": "ada@example.com", "GIT_COMMITTER_NAME": "Ada", "GIT_COMMITTER_EMAIL": "ada@example.com"}
+        patcher = mock.patch.dict(os.environ, identity)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = 1_700_000_000.0
+        self.run_fake = GitRun(self.run_fake.responses)
+        del self.run_fake.responses[("git", "-C")]
+        self.origin = self.tmp / "origin.git"
+        self.git("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=self.tmp)
+        self.git("init", "-q", "-b", "main")
+        self.commit("README.md", "widgets\n", "Initial commit", at=self.now - 3600)
+        self.git("remote", "add", "origin", str(self.origin))
+        self.git("push", "-q", "origin", "main")
+        self.ticket("03-ui", "Widget UI")
+        self.afk("init", str(self.scratch), *self.INIT)
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.afk("start", "03")
+        self.calls_before = len(self.run_fake.calls)
+        self.worktree = self.project_dir / "worktrees" / "03"
+
+    def git(self, *args, cwd=None, at=None):
+        env = {**os.environ, **({"GIT_AUTHOR_DATE": f"@{int(at)} +0000", "GIT_COMMITTER_DATE": f"@{int(at)} +0000"} if at else {})}
+        return subprocess.run(["git", *args], cwd=cwd or self.repo, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, name, text, message, cwd=None, at=None):
+        """Commit `text` to file `name`, in the clone or the given worktree, at clock time `at`."""
+        cwd = cwd or self.repo
+        (Path(cwd) / name).write_text(text)
+        self.git("add", name, cwd=cwd)
+        self.git("commit", "-q", "-m", message, cwd=cwd, at=at or self.now)
+        return self.git("rev-parse", "HEAD", cwd=cwd)
+
+    def work(self, name="widget.py", text="widget = 1\n", message="Add the widget"):
+        """The worker commits on its branch, a minute ago."""
+        return self.commit(name, text, message, cwd=self.worktree, at=self.now - 60)
+
+    def tip(self, branch, cwd=None):
+        return self.git("rev-parse", branch, cwd=cwd)
+
+    def land(self, message="feat(widgets): add the widget\n\nA widget.\n\nTicket: 03\n"):
+        """`afk land` from the worker, as (exit code, output)."""
+        out = io.StringIO()
+        code = afk.main(["land", message], run=self.run_fake, env={**self.env, **self.worker_env()},
+                        stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+        return code, out.getvalue()
+
+
+class LandTest(LandTestCase):
+    def test_an_approved_branch_lands_as_one_squash_commit_on_the_target(self):
+        head = self.work()
+        self.work("widget_test.py", "assert widget\n", "Test the widget")
+        before = self.tip("widgets-v2")
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        landed = self.tip("widgets-v2")
+        self.assertEqual(self.git("rev-parse", f"{landed}^"), before)
+        self.assertEqual(self.git("rev-parse", f"{landed}^{{tree}}"), self.git("rev-parse", "HEAD^{tree}", cwd=self.worktree))
+        self.assertEqual(self.git("log", "-1", "--format=%B", landed), "feat(widgets): add the widget\n\nA widget.\n\nTicket: 03")
+        self.assertEqual((self.status()["ended"], self.status()["landed_sha"]), ("landed", landed))
+        self.assertIn(landed[:7], out)
 
 
 class LimitsTest(unittest.TestCase):

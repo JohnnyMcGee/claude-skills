@@ -375,6 +375,19 @@ class Afk:
             return 2
         self.update_status(lambda status: dict(state=state, message=message, idle=False, reports=status.get("reports", 0) + 1))
 
+    def cmd_land(self, message):
+        """Squash the worker's branch onto its target branch as one commit with the message."""
+        status = read_json(self.worker_status_path())
+        target = status["target"]
+        ref = f"refs/heads/{target}"
+        worktree = str(self.worktree(status["ticket"]))
+        git = lambda *args, input=None: self.run(["git", "-C", worktree, *args], input=input).strip()
+        old = git("rev-parse", ref)
+        new = git("commit-tree", "HEAD^{tree}", "-p", old, "-F", "-", input=message)
+        git("update-ref", ref, new, old)
+        self.update_status(lambda status: dict(ended="landed", landed_sha=new))
+        self.out(f"landed {new[:7]} on {target}")
+
     def cmd_hook(self, event):
         payload = json.loads(self.stdin.read() or "{}")
 
