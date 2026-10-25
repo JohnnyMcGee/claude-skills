@@ -2837,7 +2837,7 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertEqual(self.run_fake.find("gh", "pr", "view"), [])
         self.assertEqual(self.status()["state"], "review")
 
-    def test_a_worker_in_review_whose_ticket_is_closed_ends_without_a_pr(self):
+    def test_a_worker_in_review_whose_ticket_is_closed_ends_without_a_pr_until_it_is_reopened(self):
         for _ in range(3):
             self.finish_phase()
         self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
@@ -2850,6 +2850,13 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertEqual(self.run_fake.find("gh", "pr", "view"), [])
         self.assertEqual(self.status()["state"], "cleanup-pending")
         self.assertEqual(self.status()["ended"], "ticket closed")
+
+        path.write_text(path.read_text().replace("**Status:** closed", "**Status:** ready-for-agent"))
+        self.now += afk.PR_POLL_SECONDS
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "review")
+        self.assertNotIn("ended", self.status())
 
     def test_a_hitl_workers_pr_is_still_found_by_its_branch(self):
         self.ticket("04-spike", "Widget spike", type="hitl")

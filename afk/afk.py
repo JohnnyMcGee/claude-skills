@@ -446,7 +446,7 @@ class Afk:
                         ticket = self.find_ticket(before["ticket"])
                         ticket_closed = bool(ticket and ticket.done)
                     given.update(polled=polled, pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
-                    ended = ending(before, pr_state, ticket_closed)
+                    ended = ending(before, polled, pr_state, ticket_closed)
                     blocker = self.cleanup_blocker(before, ended) if ended else None
                     status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
                     if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
@@ -781,13 +781,13 @@ def waiting_on_human(status):
         status.get("state") == "attention" and status.get("message") == NO_REPORT)
 
 
-def ending(status, pr_state, ticket_closed=False):
+def ending(status, polled, pr_state, ticket_closed=False):
     """How the worker's work ended: its PR "merged" or "closed", or its "ticket closed"; None while it goes on.
 
     A closed ticket outranks a closed PR, so cleanup never releases a ticket that is already closed. A pending
-    worker keeps its ending between polls; a fresh poll decides it again, as a closed PR can be reopened.
+    worker keeps its ending between polls; a fresh poll decides it again, as a closed PR or ticket can be reopened.
     """
-    if status["state"] == "cleanup-pending" and pr_state is None:
+    if status["state"] == "cleanup-pending" and not polled:
         return status.get("ended", "merged")  # workers left pending before closed PRs were cleaned up had merged
     if pr_state == "MERGED":
         return "merged"
@@ -802,14 +802,15 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
-    polled says this tick polled GitHub and the tracker for the worker, as it does about once a minute.
+    polled says this tick polled the tracker for the worker, and GitHub unless it's a local-mode worker, as it does
+    about once a minute.
     pr_state is GitHub's state for the worker's PR when this tick polled it, else None; pr_url is the PR's URL, if any.
     pr_ready says the polled PR carries READY_LABEL.
     ticket_closed says the tracker, polled with the PR, has the worker's ticket closed.
     cleanup_blocker, for a merged or closed PR or a closed ticket, says why cleaning up now could lose the human's work.
     A status of None out means the worker is cleaned up and gone.
     """
-    ended = ending(status, pr_state, ticket_closed)
+    ended = ending(status, polled, pr_state, ticket_closed)
     if ended and cleanup_blocker is None:
         return None, [
             ("cleanup", ticket, status["pane"], ended),
