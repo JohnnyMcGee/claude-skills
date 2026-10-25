@@ -447,11 +447,13 @@ class Afk:
         self.update_status(lambda status: dict(ended="landed"))
 
     def worktrees(self, repo):
-        """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD."""
+        """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD. One whose
+        directory is gone, which git calls prunable, has no files to keep up to date, so it isn't listed."""
         listing = self.run(["git", "-C", repo, "worktree", "list", "--porcelain"])
         for block in listing.strip().split("\n\n"):
             fields = dict(line.partition(" ")[::2] for line in block.splitlines())
-            yield fields["worktree"], fields.get("branch")
+            if "prunable" not in fields:
+                yield fields["worktree"], fields.get("branch")
 
     def clean_merge(self, worktree, merge, target):
         """Whether the merge commit merged the target, at or before commit `target`, and is exactly what git merges

@@ -3280,6 +3280,17 @@ class LandTest(LandTestCase):
         self.assertIn(f"{checkout} still has", self.run_fake.find("notify-send")[-1][-1])
 
 
+    def test_a_checkout_of_the_target_whose_directory_is_gone_does_not_stop_the_land(self):
+        shutil.rmtree(self.other_checkout())  # git still lists it, as prunable
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.status()["ended"], "landed")
+
+
 class LandOnBaseTest(LandTestCase):
     INIT = ("--land", "local")
 
