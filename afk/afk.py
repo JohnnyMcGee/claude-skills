@@ -446,6 +446,30 @@ class Afk:
         # Last, as the watcher then cleans the worker up, which mustn't cut the land short.
         self.update_status(lambda status: dict(ended="landed"))
 
+    def cmd_drop(self, ticket_id, *options):
+        """Abandon a local-mode worker: release its ticket back onto the frontier and clean it up, deleting its
+        unlanded commits."""
+        worker_dir = self.workers_dir() / ticket_id
+        self.workers_dir().mkdir(parents=True, exist_ok=True)
+        # Under the tick lock, then the worker's, as a tick takes them, so the watcher can't act on it meanwhile.
+        with locked(self.workers_dir()):
+            if not (worker_dir / "status.json").exists():
+                raise SystemExit(f"afk: no worker for ticket {ticket_id}; see `afk status`")
+            with locked(worker_dir):
+                status = read_json(worker_dir / "status.json")
+                if status.get("landing", "pr") != "local":
+                    raise SystemExit(f"afk: {ticket_id} lands by PR: close its PR instead, and afk cleans it up and "
+                                     "releases its ticket")
+                worktree = str(self.worktree(ticket_id))
+                commits = int(self.run(["git", "-C", worktree, "rev-list", "--count", "HEAD", "--not",
+                                        f"refs/heads/{status['target']}"]))
+                lost = f"{commits} unlanded commit{'s' * (commits != 1)}"
+                if "--discard" not in options:
+                    raise SystemExit(f"afk: dropping {ticket_id} would delete {lost}; run `afk drop {ticket_id} "
+                                     "--discard` to drop it anyway")
+                self.clean_up(ticket_id, status["pane"], "dropped")
+        self.out(f"dropped {ticket_id}: deleted {lost}; its ticket is back on the frontier")
+
     def worktrees(self, repo):
         """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD. One whose
         directory is gone, which git calls prunable, has no files to keep up to date, so it isn't listed."""
@@ -656,7 +680,7 @@ class Afk:
             tracker.complete(ticket)
         elif ticket and ended == "landed":
             tracker.complete(ticket, landed=(status["landed_sha"], status["target"]))
-        elif ticket and ended == "closed":
+        elif ticket and ended in ("closed", "dropped"):
             tracker.release(ticket)
         self.best_effort(["tmux", "kill-window", "-t", pane])
         worktree = self.worktree(ticket_id)

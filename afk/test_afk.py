@@ -3481,6 +3481,75 @@ class LandPrModeTest(LandTestCase):
         self.assertNotIn("ended", self.status())
 
 
+class DropTestCase(LandTestCase):
+    """Worker 03 of a local-mode project, as in LandTestCase, with an idle shell pane, for the human to drop."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "zsh\n"  # an idle shell pane
+
+    def drop(self, *args):
+        """`afk drop` run by the human from the project's session, as (exit code, output)."""
+        out = io.StringIO()
+        code = afk.main(["drop", *args], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+        return code, out.getvalue()
+
+    def assertRefused(self, message, *args):
+        """afk drop fails with `message`, leaving the worker, its worktree and its branch as they were."""
+        status, head = self.status(), self.tip("HEAD", cwd=self.worktree)
+        code, out = self.drop(*args)
+        self.assertEqual(code, 1, out)
+        self.assertIn(message, out)
+        self.assertEqual(self.status(), status)
+        self.assertEqual(self.tip("afk/widgets-03"), head)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+
+class DropTest(DropTestCase):
+    def test_a_dropped_worker_is_cleaned_up_with_its_unlanded_commits_and_its_ticket_offered_again(self):
+        self.work()
+        self.work("widget_test.py", "assert widget\n", "Test the widget")
+        before = self.tip("widgets-v2")
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 2 unlanded commits", out)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%5"]])
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
+        self.assertFalse((self.project_dir / "workers" / "03").exists())  # its slot is free
+        self.assertEqual(self.tip("widgets-v2"), before)
+        self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "ready-for-agent")
+        self.assertEqual([t["id"] for t in json.loads(self.afk("next"))["tickets"]], ["03"])
+
+    def test_without_discard_it_refuses_saying_how_many_unlanded_commits_would_be_lost(self):
+        self.work()
+        self.work("widget_test.py", "assert widget\n", "Test the widget")
+
+        self.assertRefused("dropping 03 would delete 2 unlanded commits; run `afk drop 03 --discard`", "03")
+
+    def test_a_ticket_without_a_worker_is_refused(self):
+        self.ticket("04-api", "Widget API")
+
+        for ticket in ("04", "99"):
+            code, out = self.drop(ticket, "--discard")
+
+            self.assertEqual(code, 1, out)
+            self.assertIn(f"afk: no worker for ticket {ticket}", out)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+
+class DropPrModeTest(DropTestCase):
+    INIT = ()
+
+    def test_a_worker_landing_by_pr_is_refused_as_closing_its_pr_drops_it(self):
+        self.work()
+
+        self.assertRefused("03 lands by PR: close its PR instead", "03", "--discard")
+
+
 class LimitsTest(unittest.TestCase):
     """Runaway limits, one pure tick() at a time with an injected clock."""
 
