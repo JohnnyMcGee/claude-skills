@@ -100,7 +100,7 @@ A project in local landing mode (`afk init <spec> --land local`, see [SKILL.md](
 
 A project in local landing mode opens no PR, so no bot reviews its work. Its critique phase stands in for them (see [SKILL.md](SKILL.md#phases)): the worker runs each `reviewers` command from the worktree root over `git diff <target>...HEAD`, with `{{target}}` filled in, and fixes what they find. Write each command to review that diff headless and print its findings, as in the example above.
 
-A reviewer whose binary isn't on PATH is skipped and named in the worker's report; `afk check` warns about it. With no reviewers, critique is a code-review subagent. pr mode ignores the key.
+A reviewer whose binary isn't on PATH is skipped and named in the worker's report; `afk check` warns about it. When none runs, because none is configured or all are missing, critique is a code-review subagent. pr mode ignores the key.
 
 ## Repos
 

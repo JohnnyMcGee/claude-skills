@@ -6,7 +6,7 @@ The repo's reviewers, from `reviewers` in `docs/agents/afk.md`:
 
 {{reviewers}}
 
-1. Run each reviewer command above from the worktree root, over `git diff {{target}}...HEAD`. Skip one whose binary isn't on PATH (`command -v <binary>`) and name it in your report; a missing reviewer doesn't fail the phase. With no reviewers configured, run a code-review subagent over `git diff {{target}}...HEAD` instead, against the ticket's acceptance criteria and this repo's coding standards.
+1. Run each reviewer command above from the worktree root, over `git diff {{target}}...HEAD`. Skip one whose binary isn't on PATH (`command -v <binary>`) and name it in your report; a missing reviewer doesn't fail the phase. When none runs, because none is configured or every binary is missing, run a code-review subagent over `git diff {{target}}...HEAD` instead, against the ticket's acceptance criteria and this repo's coding standards.
 2. Reviewers don't share your context: judge every finding against the code, not the reviewer's confidence. Sort each into exactly one bucket, as `/open-pr` sorts bot comments:
    - **Valid, in scope**: fix it, one atomic commit per fix.
    - **Invalid**: no change. It is wrong about the code, wrong about the requirements, or invented.
