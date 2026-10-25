@@ -3198,9 +3198,10 @@ class GitRun(FakeRun):
 
 
 class LandTestCase(WorkerTestCase):
-    """Worker 03 of a local-mode project, in a real git clone with an origin, landing on INIT's target."""
+    """Worker 03 of a local-mode project, of task type TYPE, in a real git clone with an origin, landing on INIT's target."""
 
     INIT = ("--land", "local", "--target", "widgets-v2")
+    TYPE = None
 
     def setUp(self):
         AfkTestCase.setUp(self)
@@ -3218,7 +3219,7 @@ class LandTestCase(WorkerTestCase):
         self.commit("README.md", "widgets\n", "Initial commit", at=self.now - 3600)
         self.git("remote", "add", "origin", str(self.origin))
         self.git("push", "-q", "origin", "main")
-        self.ticket("03-ui", "Widget UI")
+        self.ticket("03-ui", "Widget UI", type=self.TYPE)
         self.afk("init", str(self.scratch), *self.INIT)
         self.run_fake.responses[("tmux", "split-window")] = "%6\n"
         self.afk("start", "03")
@@ -3532,6 +3533,57 @@ class LandedCleanupTest(LandTestCase):
 
         self.assertEqual(self.status()["state"], "cleanup-pending")
         self.assertTrue(self.worktree.exists())
+
+
+class HitlLandTest(LandTestCase):
+    """A hitl ticket's guide-mode worker, landing on the human's request."""
+
+    TYPE = "hitl"
+
+    def test_the_humans_request_to_land_is_the_approval(self):
+        self.assertEqual(self.status()["phase"], "hitl")
+        self.work()
+        before = self.tip("widgets-v2")
+        self.prompt("land it")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        landed = self.tip("widgets-v2")
+        self.assertEqual(self.git("rev-parse", f"{landed}^"), before)
+        self.assertEqual((self.status()["ended"], self.status()["landed_sha"]), ("landed", landed))
+
+    def test_a_commit_made_after_the_request_needs_the_human_to_confirm(self):
+        self.prompt("land it")
+        self.commit("widget.py", "widget = 1\n", "Add the widget", cwd=self.worktree, at=self.now)
+        before = self.tip("widgets-v2")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("no approval since the branch's last commit", out)
+        self.assertEqual(self.tip("widgets-v2"), before)
+
+        self.now += 60
+        self.prompt("yes, land it")
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertNotEqual(self.tip("widgets-v2"), before)
+
+    def test_a_landed_hitl_worker_is_cleaned_up_like_any_landed_worker(self):
+        self.work()
+        self.prompt("land it")
+        self.assertEqual(self.land()[0], 0)
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "zsh\n"
+
+        self.afk("tick")
+
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
+        self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "done")
+        self.assertIn("03 landed and cleaned up", " ".join(c[-1] for c in self.run_fake.find("notify-send")))
 
 
 class LandPrModeTest(LandTestCase):
