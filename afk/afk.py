@@ -48,8 +48,20 @@ class Afk:
     def project_dir(self, project):
         return self.state_root() / project
 
-    def cmd_init(self, spec=None):
-        """Create the project, or refresh it: re-running keeps its limits, overrides and hand-added repos."""
+    def cmd_init(self, *args):
+        """Create the project, or refresh it: re-running keeps its landing, limits, overrides and hand-added repos."""
+        spec, options = None, {}
+        args = list(args)
+        while args:
+            arg = args.pop(0)
+            if arg in INIT_OPTIONS and args:
+                options[arg[2:]] = args.pop(0)
+            elif arg.startswith("--") or spec is not None:
+                raise SystemExit("afk: usage: afk init [<spec>] [--land <pr|local>] [--target <branch>]")
+            else:
+                spec = arg
+        if options.get("land", "pr") not in LANDING_MODES:
+            raise SystemExit(f"afk: unknown landing mode '{options['land']}'; supported: {', '.join(LANDING_MODES)}")
         if spec is None:
             spec = self.config()["spec"]  # re-init the current session's project
         issue = GITHUB_ISSUE.match(spec)
@@ -66,9 +78,19 @@ class Afk:
             tickets = LocalTracker(spec)
         session = self.run(["tmux", "display-message", "-p", "#{session_name}"]).strip()
         pdir = self.project_dir(project)
-        pdir.mkdir(parents=True, exist_ok=True)
         path = pdir / "config.toml"
         config = tomllib.loads(path.read_text()) if path.exists() else {}
+        # Flags change the landing re-init keeps; without a target, each repo's work lands on its base.
+        landing = {**config.pop("landing", {}), **({"mode": options["land"]} if "land" in options else {})}
+        if landing.get("mode") == "pr":
+            landing = {}
+        if "target" in options:
+            if not landing:
+                raise SystemExit("afk: --target needs --land local")
+            landing["target"] = options["target"]
+        if landing:
+            config["landing"] = landing
+        pdir.mkdir(parents=True, exist_ok=True)
         own = getattr(tickets, "repo", None)
         wanted = [r for r in tickets.repos() if not (own and same(r, own))]
         found = self.find_clones(repo, wanted)
@@ -81,6 +103,13 @@ class Afk:
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
         for name, clone in repos.items():
             self.out(f"  {name}  {clone}")
+        target = landing.get("target")
+        for clone in dict.fromkeys([str(repo), *repos.values()]) if target else ():
+            # An integration branch: started from each clone's base, then left alone, as it holds landed work.
+            base = reduce(deep_merge, [*repo_config_layers(Path(clone)), config.get("overrides", {})], {}).get("base", "main")
+            if target != base and not self.branch_exists(clone, target):
+                self.run(["git", "-C", clone, "branch", target, base])
+                self.out(f"created branch {target} from {base} in {clone}")
         missing = [r for r in wanted if not any(same(r, k) for k in repos)]
         if missing:
             self.out(f"no local clone of {', '.join(missing)}: clone it next to {repo} (or as a submodule) and run "
@@ -188,6 +217,12 @@ class Afk:
             raise SystemExit(f"afk: ticket {ticket.id} would use agent '{choices['agent']}'; supported: {', '.join(AGENTS)}")
         task_type = task_types.get(type_name, {})
         base = repo_config.get("base", "main")
+        landing = config.get("landing", {})
+        # Recorded in its status, so a change to the project's landing never strands a running worker.
+        mode = landing.get("mode", "pr")
+        if mode not in LANDING_MODES:
+            raise SystemExit(f"afk: unknown landing mode '{mode}' in the project's [landing]; supported: {', '.join(LANDING_MODES)}")
+        target = (mode == "local" and landing.get("target")) or base
         # A hitl ticket is the human's: its worker guides them and is never driven through the phases.
         phase, state = ("hitl", "yours") if type_name == HITL else ("implement", "working")
         slot = self.claim_worker(worker_dir, counted=phase != "hitl")
@@ -197,7 +232,7 @@ class Afk:
         try:
             tracker.claim(ticket)
             undo.append(lambda: tracker.release(ticket))
-            self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), base])
+            self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), target])
             undo.append(lambda: self.run(["git", "-C", str(clone), "branch", "-D", branch]))
             undo.append(lambda: self.run(["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)]))
             self.prepare_worktree(clone, worktree, repo_config, slot_env)
@@ -215,13 +250,13 @@ class Afk:
                 "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
                 *[arg for key in ("model", "effort") if choices[key] for arg in (f"--{key}", choices[key])],
-                self.first_prompt(ticket, phase, task_type, clone),
+                self.first_prompt(ticket, phase, task_type, clone, mode, target),
             ]
             write_json(
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "title": ticket.title, "phase": phase, "state": state, "message": "",
                  "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "repo": repo, **choices,
-                 "started_at": self.clock(), "phase_started_at": self.clock()},
+                 "landing": mode, "target": target, "started_at": self.clock(), "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
@@ -406,12 +441,15 @@ class Afk:
                 try:
                     pr_state = pr_url = None
                     pr_ready = ticket_closed = False
-                    if before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
-                        pr_state, pr_url, pr_ready = self.pr_state(before)
+                    polled = before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS
+                    if polled:
+                        # A local-mode worker never opens a PR, but the human may open one for a hitl ticket.
+                        if before["phase"] == "hitl" or before.get("landing", "pr") == "pr":
+                            pr_state, pr_url, pr_ready = self.pr_state(before)
                         ticket = self.find_ticket(before["ticket"])
                         ticket_closed = bool(ticket and ticket.done)
-                    given.update(pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
-                    ended = ending(before, pr_state, ticket_closed)
+                    given.update(polled=polled, pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
+                    ended = ending(before, polled, pr_state, ticket_closed)
                     blocker = self.cleanup_blocker(before, ended) if ended else None
                     status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
                     if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
@@ -462,8 +500,9 @@ class Afk:
     def perform(self, kind, *args):
         if kind == "prompt":
             ticket_id, pane, phase = args
-            repo = read_json(self.workers_dir() / ticket_id / "status.json").get("repo")
-            self.send_prompt(ticket_id, pane, self.phase_prompt(ticket_id, phase, self.clone(repo)))
+            status = read_json(self.workers_dir() / ticket_id / "status.json")
+            prompt = self.phase_prompt(ticket_id, phase, self.clone(status.get("repo")), status.get("landing", "pr"), status.get("target"))
+            self.send_prompt(ticket_id, pane, prompt)
         elif kind == "window":
             # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
             pane, name, state = args
@@ -545,18 +584,22 @@ class Afk:
         except (OSError, subprocess.CalledProcessError):
             pass
 
-    def phase_prompt(self, ticket_id, phase, clone):
+    def phase_prompt(self, ticket_id, phase, clone, landing="pr", target=None):
+        """The phase's prompt for the worker's landing mode: phase-<phase>-<landing>.md where the mode has its own."""
         ticket = self.tracker().get(ticket_id)
+        base = self.repo_config(clone).get("base", "main")
+        template = SKILL_DIR / f"phase-{phase}-{landing}.md"
         return render(
-            SKILL_DIR / f"phase-{phase}.md",
+            template if template.is_file() else SKILL_DIR / f"phase-{phase}.md",
             ticket=ticket.id,
             ticket_path=ticket.path,
-            base=self.repo_config(clone).get("base", "main"),
+            base=base,
+            target=target or base,
         )
 
-    def first_prompt(self, ticket, phase, task_type, clone):
+    def first_prompt(self, ticket, phase, task_type, clone, landing="pr", target=None):
         """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
-        prompt = self.phase_prompt(ticket.id, phase, clone)
+        prompt = self.phase_prompt(ticket.id, phase, clone, landing, target)
         if "prompt" in task_type:
             template = clone / task_type["prompt"]
             prompt += "\n" + render(template, ticket=ticket.id, ticket_path=ticket.path)
@@ -691,10 +734,16 @@ FRONTIER_POLL = 60  # seconds between the watcher's reads of the tracker
 # Corrections the user can make at Gate 1, each a `afk start` option.
 START_OPTIONS = ("--type", "--agent", "--model", "--effort", "--repo")
 
+INIT_OPTIONS = ("--land", "--target")
+
+# How a project's work reaches its target branch: by a PR the human merges, or landed by the worker once approved.
+LANDING_MODES = ("pr", "local")
+
 # Runaway limits; a project's config.toml [limits] table overrides any of them.
 LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
 
-PHASES = ("implement", "verify", "prepr", "pr", "review")
+# Each landing mode's phases: a local-mode worker never opens a PR.
+PHASES = {"pr": ("implement", "verify", "prepr", "pr", "review"), "local": ("implement", "verify", "prepr", "review")}
 
 PR_POLL_SECONDS = 60
 NO_PR = "no PR found for its branch"
@@ -735,13 +784,13 @@ def waiting_on_human(status):
         status.get("state") == "attention" and status.get("message") == NO_REPORT)
 
 
-def ending(status, pr_state, ticket_closed=False):
+def ending(status, polled, pr_state, ticket_closed=False):
     """How the worker's work ended: its PR "merged" or "closed", or its "ticket closed"; None while it goes on.
 
     A closed ticket outranks a closed PR, so cleanup never releases a ticket that is already closed. A pending
-    worker keeps its ending between polls; a fresh poll decides it again, as a closed PR can be reopened.
+    worker keeps its ending between polls; a fresh poll decides it again, as a closed PR or ticket can be reopened.
     """
-    if status["state"] == "cleanup-pending" and pr_state is None:
+    if status["state"] == "cleanup-pending" and not polled:
         return status.get("ended", "merged")  # workers left pending before closed PRs were cleaned up had merged
     if pr_state == "MERGED":
         return "merged"
@@ -751,24 +800,26 @@ def ending(status, pr_state, ticket_closed=False):
 
 
 def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None,
-         pr_state=None, pr_url=None, pr_ready=False, ticket_closed=False, cleanup_blocker=None):
+         polled=False, pr_state=None, pr_url=None, pr_ready=False, ticket_closed=False, cleanup_blocker=None):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
+    polled says this tick polled the tracker for the worker, and GitHub unless it's a local-mode worker, as it does
+    about once a minute.
     pr_state is GitHub's state for the worker's PR when this tick polled it, else None; pr_url is the PR's URL, if any.
     pr_ready says the polled PR carries READY_LABEL.
     ticket_closed says the tracker, polled with the PR, has the worker's ticket closed.
     cleanup_blocker, for a merged or closed PR or a closed ticket, says why cleaning up now could lose the human's work.
     A status of None out means the worker is cleaned up and gone.
     """
-    ended = ending(status, pr_state, ticket_closed)
+    ended = ending(status, polled, pr_state, ticket_closed)
     if ended and cleanup_blocker is None:
         return None, [
             ("cleanup", ticket, status["pane"], ended),
             ("notify", f"{ticket} {ended} and cleaned up; run `/afk next` to propose the next batch"),
         ]
-    if pr_state is not None:
+    if polled:
         status = {**status, "pr_polled_at": now}
     if pr_url:
         status = {**status, "pr": pr_url}
@@ -829,7 +880,8 @@ def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=Non
                 return {**status, "state": "stuck", "message": reason, "fix_loops": 0}, [("notify", f"{ticket} stuck: {reason}")]
             status = {**status, "state": "review", "fix_loops": loops}
             return status, [("notify", f"{ticket} addressed review feedback: {message}")]
-        phase = PHASES[PHASES.index(phase) + 1]
+        phases = PHASES[status.get("landing", "pr")]  # workers started before landing modes landed by PR
+        phase = phases[phases.index(phase) + 1]
         if phase == "verify" and not may_verify:
             # Stays in its finished phase, so if it needs attention while queued, done still leads to verify.
             return {**status, "state": "queued", "queued_at": now}, []
