@@ -892,7 +892,7 @@ def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=Non
             rounds = status.get("critique_rounds", 0) + 1
             if rounds >= limits["critique_rounds"]:
                 # As with fix loops, it has already stopped, and counting restarts for after the human has looked.
-                reason = f"over {limits['critique_rounds']} critique rounds"
+                reason = f"still fixing after {limits['critique_rounds']} critique rounds"
                 return {**status, "state": "stuck", "message": reason, "critique_rounds": 0}, [("notify", f"{ticket} stuck: {reason}")]
             status = {**status, "state": "working", "message": "", "idle": False, "phase_started_at": now, "critique_rounds": rounds}
             return status, [("prompt", ticket, status["pane"], "critique")]

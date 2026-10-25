@@ -1247,6 +1247,16 @@ class CheckTest(AfkTestCase):
         self.assertEqual(code, 1)
         self.assertIn("'reviewers' must be a list of strings", out)
 
+    def test_a_reviewer_that_is_not_a_runnable_command_is_an_error(self):
+        self.repo_config('reviewers = ["copilot -p \'unbalanced", "", "FOO=1"]', body=PROSE)
+
+        code, out = self.check()
+
+        self.assertEqual(code, 1)
+        self.assertIn("reviewer `copilot -p 'unbalanced`: No closing quotation", out)
+        self.assertIn("reviewer `` names no command", out)
+        self.assertIn("reviewer `FOO=1` names no command", out)
+
     def test_a_reviewer_whose_binary_is_not_on_path_warns_without_failing(self):
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
@@ -2915,7 +2925,7 @@ class LocalLandingWatchTest(WorkerTestCase):
             ["AFK phase: critique", "AFK phase: critique", "AFK phase: review"],
         )
 
-    def test_review_feedback_is_critiqued_again_and_approval_lands_without_pushing(self):
+    def test_the_review_prompt_critiques_feedback_fixes_and_lands_on_approval_without_pushing(self):
         self.repo_config('reviewers = ["coderabbit review --base {{target}} --plain"]')
         for _ in range(4):
             self.finish_phase()
@@ -3065,7 +3075,6 @@ class LimitsTest(unittest.TestCase):
 
         self.assertEqual(status["state"], "review")
 
-
     def critique_round(self, status, now, message="round: fixed a finding"):
         """The worker finishes a critique round, reports done and stops."""
         return afk.tick("03", {**status, "state": "done", "message": message, "idle": True}, now,
@@ -3079,7 +3088,7 @@ class LimitsTest(unittest.TestCase):
         status, effects = self.critique_round(status, now=3)
 
         self.assertEqual((status["phase"], status["state"]), ("critique", "stuck"))
-        self.assertIn("2 critique rounds", status["message"])
+        self.assertIn("still fixing after 2 critique rounds", status["message"])
         [(_, notification)] = [e for e in effects if e[0] == "notify"]
         self.assertIn("stuck", notification)
         self.assertFalse([e for e in effects if e[0] in ("prompt", "interrupt")])
