@@ -596,7 +596,8 @@ class Afk:
     def cleanup_blocker(self, status, ended):
         """Why cleaning up this worker could lose the human's work, or None if it's safe.
 
-        Unless it merged, its branch may hold commits that were never pushed, which deleting the branch would lose.
+        Unless it merged or landed, its branch may hold commits that were never pushed, which deleting the branch would
+        lose.
         A worktree already gone, as after a cleanup that failed partway, holds nothing left to lose.
         """
         worktree = self.worktree(status["ticket"])
@@ -611,14 +612,14 @@ class Afk:
         # A submodule set to ignore=all would otherwise hide its changes, which the forced removal would then delete.
         if self.run(["git", "-C", worktree, "status", "--porcelain", "--ignore-submodules=none"]).strip():
             return "its worktree has uncommitted changes"
-        if ended != "merged" and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
+        if ended not in ("merged", "landed") and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
             return "its branch has unpushed commits"
         return None
 
     def clean_up(self, ticket_id, pane, ended):
         """Remove an ended worker's window, worktree, local branch and state; removing its dir frees its slot.
 
-        A merged ticket is completed. One whose PR was closed unmerged is released, back onto the frontier. A closed
+        A merged or landed ticket is completed. One whose PR was closed unmerged is released, back onto the frontier. A closed
         ticket is left as it is, as is one gone from the tracker.
 
         Removing the worker's dir is the commit point, so each step before it tolerates having been done by a cleanup
@@ -626,10 +627,13 @@ class Afk:
         human: cleanup_blocker has already checked it holds nothing unpushed.
         """
         project = self.current_project()
-        repo = str(self.clone(read_json(self.workers_dir() / ticket_id / "status.json").get("repo")))
+        status = read_json(self.workers_dir() / ticket_id / "status.json")
+        repo = str(self.clone(status.get("repo")))
         tracker, ticket = self.tracker(), self.find_ticket(ticket_id)
         if ticket and ended == "merged":
             tracker.complete(ticket)
+        elif ticket and ended == "landed":
+            tracker.complete(ticket, landed=(status["landed_sha"], status["target"]))
         elif ticket and ended == "closed":
             tracker.release(ticket)
         self.best_effort(["tmux", "kill-window", "-t", pane])
@@ -865,11 +869,15 @@ def waiting_on_human(status):
 
 
 def ending(status, polled, pr_state, ticket_closed=False):
-    """How the worker's work ended: its PR "merged" or "closed", or its "ticket closed"; None while it goes on.
+    """How the worker's work ended: "landed" by `afk land`, its PR "merged" or "closed", or its "ticket closed"; None
+    while it goes on.
 
-    A closed ticket outranks a closed PR, so cleanup never releases a ticket that is already closed. A pending
-    worker keeps its ending between polls; a fresh poll decides it again, as a closed PR or ticket can be reopened.
+    Landing is final, as its work is in the target. A closed ticket outranks a closed PR, so cleanup never releases a
+    ticket that is already closed. A pending worker keeps its ending between polls; a fresh poll decides it again, as a
+    closed PR or ticket can be reopened.
     """
+    if status.get("ended") == "landed":
+        return "landed"
     if status["state"] == "cleanup-pending" and not polled:
         return status.get("ended", "merged")  # workers left pending before closed PRs were cleaned up had merged
     if pr_state == "MERGED":
@@ -1097,8 +1105,8 @@ class LocalTracker:
     def release(self, ticket):
         pass
 
-    def complete(self, ticket):
-        """Merged: mark it done, as GitHub closes an issue, so the frontier doesn't offer it again."""
+    def complete(self, ticket, landed=None):
+        """Merged or landed: mark it done, as GitHub closes an issue, so the frontier doesn't offer it again."""
         ticket.path.write_text(set_field(ticket.path.read_text(), "Status", "done"))
 
     def split(self, ticket, parts):
@@ -1213,8 +1221,9 @@ class GithubTracker:
         repo, number = self.locate(ticket.id)
         self.run(["gh", "issue", "edit", number, "--repo", repo, "--remove-assignee", "@me"])
 
-    def complete(self, ticket):
-        """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it."""
+    def complete(self, ticket, landed=None):
+        """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it. Landed, as the
+        (sha, target) it landed as: no PR will close it, so it is closed here."""
 
     def blockers(self, ticket):
         """Native blocked-by dependencies; failing those, the issues the body's "Blocked by" section names."""

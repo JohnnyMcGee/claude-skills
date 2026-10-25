@@ -3169,6 +3169,48 @@ class LandRefusalTest(LandTestCase):
         self.assertEqual((checkout / "README.md").read_text(), "widgets, half edited\n")
 
 
+class LandedCleanupTest(LandTestCase):
+    def setUp(self):
+        super().setUp()
+        self.work()
+        self.prompt("lgtm")
+        code, out = self.land()
+        self.assertEqual(code, 0, out)
+        self.shell("zsh")
+
+    def shell(self, command):
+        """The worker's shell pane runs `command`."""
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = command + "\n"
+
+    def test_a_landed_worker_is_cleaned_up_its_ticket_done_and_its_unpushed_branch_deleted(self):
+        self.afk("tick")
+
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
+        self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "done")
+        self.assertIn("03 landed and cleaned up", self.run_fake.find("notify-send")[-1][-1])
+
+
+    def test_a_landed_worker_with_a_busy_shell_waits_for_it_to_go_idle(self):
+        self.shell("vim")
+
+        self.afk("tick")
+
+        self.assertEqual((self.status()["state"], self.status()["message"]), ("cleanup-pending", "its shell pane is running vim"))
+        self.shell("zsh")
+        self.afk("tick")
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+    def test_a_landed_worker_with_uncommitted_changes_waits_for_them(self):
+        (self.worktree / "widget.py").write_text("widget = 2\n")
+
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertTrue(self.worktree.exists())
+
+
 class LandPrModeTest(LandTestCase):
     INIT = ()
 
