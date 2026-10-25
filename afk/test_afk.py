@@ -210,6 +210,14 @@ class LandingInitTest(AfkTestCase):
 
         self.assertNotIn("reviewers", output)
 
+    def test_pr_landing_does_not_read_the_repo_config(self):
+        self.repo_config('base = "main"')
+        self.repo_config("base = ", name="afk.local.md")
+
+        output = self.afk("init", str(self.scratch))
+
+        self.assertIn("bound to tmux session", output)
+
     def test_view_shows_the_landing(self):
         self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
 
@@ -383,6 +391,13 @@ class InitReposTest(GithubTestCase):
         self.assertIn("acme/web", warning)
         self.assertIn("acme/api", warning)
         self.assertNotIn(str(self.repo), warning)
+
+    def test_local_landing_names_the_spec_repo_by_owner_and_name(self):
+        self.issue(4, "Widget page")
+
+        output = self.afk("init", self.SPEC, "--land", "local")
+
+        self.assertIn("warning: no reviewers in acme/widgets,", output)
 
     def test_reinit_without_a_spec_refreshes_repos_and_keeps_limits_overrides_and_hand_added_repos(self):
         self.afk("init", self.SPEC)

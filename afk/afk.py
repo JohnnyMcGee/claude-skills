@@ -103,11 +103,12 @@ class Afk:
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
         for name, clone in repos.items():
             self.out(f"  {name}  {clone}")
+        # Only local landing reads the clones' configs, so a pr-mode init never trips on one that afk check would flag.
         clones = {c: reduce(deep_merge, [*repo_config_layers(Path(c)), config.get("overrides", {})], {})
-                  for c in dict.fromkeys([str(repo), *repos.values()])}
-        names = {**{c: c for c in clones}, **{c: name for name, c in repos.items()}}  # owner/name where known
+                  for c in dict.fromkeys([str(repo), *repos.values()])} if landing else {}
+        names = {c: c for c in clones} | ({str(repo): own} if own else {}) | {c: name for name, c in repos.items()}
         unreviewed = [names[c] for c, repo_config in clones.items() if not repo_config.get("reviewers")]
-        if landing and unreviewed:
+        if unreviewed:
             self.out(f"warning: no reviewers in {', '.join(unreviewed)}, so critique there is a code-review subagent; "
                      f"run /afk-setup in each to add them")
         target = landing.get("target")
