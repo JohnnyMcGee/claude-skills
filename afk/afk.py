@@ -422,6 +422,14 @@ class Afk:
         if checkout:
             # What `git checkout` does: update the files the land changed, refusing to overwrite any changed since.
             self.run(["git", "-C", checkout, "read-tree", "-m", "-u", old, new])
+        # An integration branch is pushed, so it's safe off this machine; base never is: taking work there is the human's.
+        if target != self.repo_config(self.clone(status.get("repo"))).get("base", "main"):
+            try:
+                git("push", "origin", f"{new}:{ref}")  # never forced, so only ever a fast-forward
+            except subprocess.CalledProcessError as error:
+                failed = f"{status['ticket']} landed on {target}, but pushing it failed: {(error.stderr or '').strip()}"
+                self.out(failed)
+                self.notify(failed)
 
     def worktrees(self, repo):
         """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD."""

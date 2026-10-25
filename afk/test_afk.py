@@ -3045,6 +3045,45 @@ class LandTest(LandTestCase):
         self.assertEqual(self.git("status", "--porcelain", cwd=checkout), "?? notes.txt")
 
 
+    def test_an_integration_branch_is_pushed_once_landed(self):
+        self.work()
+        self.prompt("lgtm")
+
+        self.land()
+
+        self.assertEqual(self.tip("widgets-v2", cwd=self.origin), self.tip("widgets-v2"))
+
+    def test_a_failed_push_notifies_without_undoing_the_land(self):
+        pushed = self.git("commit-tree", "main^{tree}", "-p", "main", "-m", "Pushed from elsewhere")
+        self.git("push", "-q", "origin", f"{pushed}:refs/heads/widgets-v2")  # so landing can't fast-forward origin's
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.tip("widgets-v2"), self.status()["landed_sha"])
+        self.assertEqual(self.tip("widgets-v2", cwd=self.origin), pushed)
+        self.assertIn("push", self.run_fake.find("notify-send")[-1][-1])
+
+
+class LandOnBaseTest(LandTestCase):
+    INIT = ("--land", "local")
+
+    def test_base_is_landed_on_its_checkout_in_the_clone_and_never_pushed(self):
+        pushed = self.tip("main", cwd=self.origin)
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.tip("HEAD"), self.tip("main"))
+        self.assertEqual((self.repo / "widget.py").read_text(), "widget = 1\n")
+        self.assertEqual(self.tip("main", cwd=self.origin), pushed)
+        self.assertEqual([c for c in self.run_fake.find("git") if "push" in c], [])
+
+
 class LandRefusalTest(LandTestCase):
     def assertRefused(self, message, land_message=None):
         """afk land fails with `message`, leaving the target and the worker's status as they were."""
