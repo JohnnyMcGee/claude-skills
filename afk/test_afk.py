@@ -165,6 +165,20 @@ class LandingInitTest(AfkTestCase):
 
         self.assertEqual(self.config()["landing"], {"mode": "local", "target": "widgets-v2"})
 
+    def test_reinit_with_a_new_target_keeps_local_landing(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("init", "--target", "widgets-v3")
+
+        self.assertEqual(self.config()["landing"], {"mode": "local", "target": "widgets-v3"})
+
+    def test_reinit_with_pr_landing_drops_the_landing(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("init", "--land", "pr")
+
+        self.assertNotIn("landing", self.config())
+
     def test_a_target_without_local_landing_fails_before_anything_is_written(self):
         out = io.StringIO()
 
@@ -295,6 +309,7 @@ class IntegrationBranchTest(GithubTestCase):
         self.missing(self.repo, "main")
 
         self.afk("init", self.SPEC, "--land", "local")
+        self.afk("init", self.SPEC, "--land", "local", "--target", "main")
 
         self.assertEqual(self.branches_created(), [])
 
@@ -1000,6 +1015,18 @@ class LandingStartTest(AfkTestCase):
 
         self.assertEqual(self.worktree_base(), "main")
         self.assertEqual((self.status()["landing"], self.status()["target"]), ("pr", "main"))
+
+    def test_an_unknown_landing_mode_in_the_project_config_fails_before_creating_anything(self):
+        self.afk("init", str(self.scratch))
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write('\n[landing]\nmode = "Local"\n')
+        out = io.StringIO()
+
+        code = afk.main(["start", "03"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("unknown landing mode 'Local'", out.getvalue())
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
 
 
 TASK_TYPES = """

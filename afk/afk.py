@@ -219,7 +219,10 @@ class Afk:
         base = repo_config.get("base", "main")
         landing = config.get("landing", {})
         # Recorded in its status, so a change to the project's landing never strands a running worker.
-        mode, target = landing.get("mode", "pr"), landing.get("target") or base
+        mode = landing.get("mode", "pr")
+        if mode not in LANDING_MODES:
+            raise SystemExit(f"afk: unknown landing mode '{mode}' in the project's [landing]; supported: {', '.join(LANDING_MODES)}")
+        target = (mode == "local" and landing.get("target")) or base
         # A hitl ticket is the human's: its worker guides them and is never driven through the phases.
         phase, state = ("hitl", "yours") if type_name == HITL else ("implement", "working")
         slot = self.claim_worker(worker_dir, counted=phase != "hitl")
