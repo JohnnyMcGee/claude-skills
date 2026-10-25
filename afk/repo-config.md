@@ -43,7 +43,7 @@ Every key is optional.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `base` | `"main"` | Branch worktrees are created from and PRs target. Workers are denied pushing to it. |
+| `base` | `"main"` | Branch worktrees are created from and PRs target. Workers are denied pushing to it. A project in local landing mode lands on it too, unless it names an integration branch as its target: see [Target branch](#target-branch). |
 | `copy` | `[]` | Gitignored files, relative to the repo root, copied into each new worktree. |
 | `bootstrap` | `[]` | Shell commands run in order in each new worktree, after `copy`. A failure rolls the start back. |
 | `port_base` | `4000` | Worker slot `n` gets `AFK_PORT_BASE = port_base + 100·n`. |
@@ -89,6 +89,10 @@ Later layers win, key by key, so an override only needs the fields it changes:
    [overrides.task_types.frontend]
    model = "haiku"
    ```
+
+## Target branch
+
+A project in local landing mode (`afk init <spec> --land local`, see [SKILL.md](SKILL.md#landing-mode)) lands each ticket on its target branch, and its worktrees branch from the target instead of `base`. Without `--target`, the target is each repo's `base`. With `--target <branch>`, it is that integration branch in every repo of the project: `afk init` creates it from each clone's `base` where it doesn't exist yet. The target is the project's, stored under `[landing]` in its `config.toml`, not the repo's.
 
 ## Repos
 

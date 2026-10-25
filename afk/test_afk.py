@@ -165,6 +165,21 @@ class LandingInitTest(AfkTestCase):
 
         self.assertEqual(self.config()["landing"], {"mode": "local", "target": "widgets-v2"})
 
+    def test_a_target_without_local_landing_fails_before_anything_is_written(self):
+        out = io.StringIO()
+
+        code = afk.main(["init", str(self.scratch), "--target", "widgets-v2"], run=self.run_fake, env=self.env,
+                        stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("--target needs --land local", out.getvalue())
+        self.assertFalse(self.project_dir.exists())
+
+    def test_view_shows_the_landing(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.assertEqual(tomllib.loads(self.afk("view"))["landing"], {"mode": "local", "target": "widgets-v2"})
+
 
 class ViewTest(AfkTestCase):
     def test_view_shows_the_current_project_config_and_its_path(self):
