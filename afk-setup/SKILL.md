@@ -62,7 +62,7 @@ Done when the skill exists, afk.md names it, and each command in it exits 0 on t
 A project in local landing mode opens no PR, so its critique phase runs the repo's `reviewers` commands instead of bot reviews (see [repo-config.md](../afk/repo-config.md#reviewers)). Configure them from the reviewer CLIs installed here. Never install one yourself.
 
 1. **Detect.** `command -v coderabbit` and `command -v copilot`. For each one missing, give the user its install hint and leave it out:
-   - CodeRabbit: `curl -fsSL https://cli.coderabbit.ai/install.sh | sh`, then `coderabbit auth login`.
+   - CodeRabbit: `brew install coderabbit` (or its install script, from https://www.coderabbit.ai/cli), then `coderabbit auth login`.
    - Copilot: `npm install -g @github/copilot` (or `brew install copilot-cli`), then `copilot login`.
 2. **Propose** a command for each one found. Each runs headless, prints plain-text findings, and reviews `git diff {{target}}...HEAD` with nothing that can write: no file edits, no pushes, no PR or issue comments.
    - CodeRabbit: `NO_COLOR=1 coderabbit review --committed --base {{target}}`. Its default mode is plain text, and `NO_COLOR` guards against colour codes. Each finding's `file:line` still comes wrapped in a terminal-hyperlink escape, which nothing turns off; readers can ignore it. Its `--agent` mode prints JSON lines instead, so it isn't the plain text critique expects.
