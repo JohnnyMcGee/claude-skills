@@ -1,6 +1,10 @@
 +++
 base = "main"
 default_type = "skill"
+reviewers = [
+  "NO_COLOR=1 coderabbit review --committed --base {{target}}",
+  """copilot -p "Review this branch's diff, below, as a code reviewer; read the repo's files for context. Print each finding as plain text: file:line, severity, the problem in one line, the fix in one line. Print 'No findings.' if there are none. Don't change any file. $(git diff {{target}}...HEAD)" -s --no-color --no-ask-user --disable-builtin-mcps --deny-tool shell --deny-tool write""",
+]
 
 [task_types.skill]
 model = "opus"
@@ -25,6 +29,10 @@ Run `/pre-pr` in the prepr phase, and again after any merge from `main`. It runs
 None. What stands in for one is a skill's state directory. Skills that keep state under `$XDG_STATE_HOME` (afk, process) must be pointed at a per-slot directory during verification, e.g. `/tmp/afk-state-$AFK_SLOT`.
 
 Set `XDG_STATE_HOME` **on the command only**, never `export` it in your shell: `afk report` reads the same variable to find this worker's status, so an exported override hides your reports from the watcher. Remove the directory when you are done: `rm -rf /tmp/afk-state-$AFK_SLOT`.
+
+## Reviewers
+
+Critique runs CodeRabbit and Copilot over the branch's diff. CodeRabbit keeps a local checkpoint per worktree and branch, so a later round prints only new findings and points at `coderabbit review findings` for the earlier ones. Its `file:line` comes wrapped in a terminal-hyperlink escape; ignore it. Each CodeRabbit run counts against the account's included reviews; Copilot's against its AI credits.
 
 ## Verification recipes
 

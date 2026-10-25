@@ -14,7 +14,7 @@ Invoke with `/afk <init <spec> | next | frontier | start <ticket> | watch | stat
 
 ### afk-setup
 
-Onboards a repo for `afk`, once per repo. It inspects the repo and interviews you to write `docs/agents/afk.md` (base branch, gitignored files to copy, bootstrap, dev-server port and database isolation, verification recipes, task types), creates a `/pre-pr` skill mirroring CI if the repo has none, then proves the config: a scratch worktree, bootstrap, and the dev server started and stopped on a slot port, reporting exactly which step failed. On a new machine it also puts `afk` on PATH, adds a tmux snippet that colours worker windows by state, and checks for `notify-send`, skipping whatever is already done.
+Onboards a repo for `afk`, once per repo. It inspects the repo and interviews you to write `docs/agents/afk.md` (base branch, gitignored files to copy, bootstrap, dev-server port and database isolation, verification recipes, task types), creates a `/pre-pr` skill mirroring CI if the repo has none, configures the installed reviewer CLIs (CodeRabbit, Copilot) for local-landing critique, then proves the config: a scratch worktree, bootstrap, the dev server started and stopped on a slot port, and each reviewer run headless over a trial diff, reporting exactly which step failed. On a new machine it also puts `afk` on PATH, adds a tmux snippet that colours worker windows by state, and checks for `notify-send`, skipping whatever is already done.
 
 Invoke with `/afk-setup` from the repo.
 
