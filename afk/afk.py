@@ -392,10 +392,13 @@ class Afk:
                 # About to use a tool, so no longer stopped: it resumed, say when a background task it waited on
                 # landed. Nothing may be pasted into it until it stops again.
                 changes["idle"] = False
-            elif event == "prompt" and waiting_on_human(status):
-                # The human answered or nudged it, so it's working again. Time spent waiting on them isn't the
-                # worker's: its phase clock restarts, and its limits apply afresh.
-                changes.update(state="working", message="", idle=False, phase_started_at=self.clock())
+            elif event == "prompt" and not AFK_PROMPT.match(payload.get("prompt", "")):
+                # Typed by the human, not pasted by the watcher: what `afk land` takes for their approval.
+                changes["last_human_prompt_at"] = self.clock()
+                if waiting_on_human(status):
+                    # The human answered or nudged it, so it's working again. Time spent waiting on them isn't the
+                    # worker's: its phase clock restarts, and its limits apply afresh.
+                    changes.update(state="working", message="", idle=False, phase_started_at=self.clock())
             return changes
 
         self.update_status(changes)
@@ -723,6 +726,9 @@ class Afk:
 
 
 REPORT_STATES = ("done", "blocked", "question")
+
+# A prompt afk sent the worker, a phase or guide-mode prompt, perhaps after its task type's skill: never the human's.
+AFK_PROMPT = re.compile(r"\s*(?:/\S+\s+)?AFK (?:phase:|guide mode)")
 
 AGENTS = ("claude",)
 

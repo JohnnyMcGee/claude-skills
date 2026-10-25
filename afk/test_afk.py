@@ -2895,6 +2895,33 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertEqual([c[3] for c in self.run_fake.find("gh", "pr", "view")], ["afk/widgets-04"])
 
 
+class ApprovalTest(WorkerTestCase):
+    INIT = ("--land", "local", "--target", "widgets-v2")
+
+    def prompt(self, text):
+        payload = {"session_id": "s", "transcript_path": str(self.transcript()), "hook_event_name": "UserPromptSubmit",
+                   "prompt": text}
+        self.afk("hook", "prompt", stdin=json.dumps(payload), env=self.worker_env())
+
+    def test_a_prompt_the_human_types_is_recorded_as_their_last(self):
+        self.now += 300
+
+        self.prompt("lgtm, land it")
+
+        self.assertEqual(self.status()["last_human_prompt_at"], self.now)
+
+    def test_a_phase_prompt_the_watcher_pasted_is_not_the_humans(self):
+        self.prompt("lgtm, land it")
+        approved = self.now
+        self.now += 300
+        self.finish_phase()
+
+        self.prompt(self.prompts_sent()[-1])  # the verify prompt, as the watcher pasted it
+        self.prompt("/tdd AFK phase: implement — ticket 03 (x)\n\nImplement it.")  # the first, with its skill
+
+        self.assertEqual(self.status()["last_human_prompt_at"], approved)
+
+
 class LimitsTest(unittest.TestCase):
     """Runaway limits, one pure tick() at a time with an injected clock."""
 
