@@ -217,6 +217,9 @@ class Afk:
             raise SystemExit(f"afk: ticket {ticket.id} would use agent '{choices['agent']}'; supported: {', '.join(AGENTS)}")
         task_type = task_types.get(type_name, {})
         base = repo_config.get("base", "main")
+        landing = config.get("landing", {})
+        # Recorded in its status, so a change to the project's landing never strands a running worker.
+        mode, target = landing.get("mode", "pr"), landing.get("target") or base
         # A hitl ticket is the human's: its worker guides them and is never driven through the phases.
         phase, state = ("hitl", "yours") if type_name == HITL else ("implement", "working")
         slot = self.claim_worker(worker_dir, counted=phase != "hitl")
@@ -226,7 +229,7 @@ class Afk:
         try:
             tracker.claim(ticket)
             undo.append(lambda: tracker.release(ticket))
-            self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), base])
+            self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), target])
             undo.append(lambda: self.run(["git", "-C", str(clone), "branch", "-D", branch]))
             undo.append(lambda: self.run(["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)]))
             self.prepare_worktree(clone, worktree, repo_config, slot_env)
@@ -250,7 +253,7 @@ class Afk:
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "title": ticket.title, "phase": phase, "state": state, "message": "",
                  "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "repo": repo, **choices,
-                 "started_at": self.clock(), "phase_started_at": self.clock()},
+                 "landing": mode, "target": target, "started_at": self.clock(), "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:

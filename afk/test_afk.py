@@ -949,6 +949,44 @@ class RepoConfigStartTest(AfkTestCase):
         self.assertFalse((self.project_dir / "workers" / "03").exists())
 
 
+class LandingStartTest(AfkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI")
+
+    def worktree_base(self):
+        [add] = self.run_fake.find("git", "-C", str(self.repo), "worktree", "add")
+        return add[-1]
+
+    def status(self):
+        return json.loads((self.project_dir / "workers" / "03" / "status.json").read_text())
+
+    def test_a_local_mode_worktree_branches_from_the_integration_branch_and_its_status_records_it(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("start", "03")
+
+        self.assertEqual(self.worktree_base(), "widgets-v2")
+        self.assertEqual((self.status()["landing"], self.status()["target"]), ("local", "widgets-v2"))
+
+    def test_a_local_mode_project_without_a_target_lands_on_the_repos_base(self):
+        self.repo_config('base = "develop"')
+        self.afk("init", str(self.scratch), "--land", "local")
+
+        self.afk("start", "03")
+
+        self.assertEqual(self.worktree_base(), "develop")
+        self.assertEqual((self.status()["landing"], self.status()["target"]), ("local", "develop"))
+
+    def test_a_pr_mode_worker_lands_by_pr_on_base(self):
+        self.afk("init", str(self.scratch))
+
+        self.afk("start", "03")
+
+        self.assertEqual(self.worktree_base(), "main")
+        self.assertEqual((self.status()["landing"], self.status()["target"]), ("pr", "main"))
+
+
 TASK_TYPES = """
 default_type = "backend"
 
