@@ -742,8 +742,8 @@ LANDING_MODES = ("pr", "local")
 # Runaway limits; a project's config.toml [limits] table overrides any of them.
 LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
 
-# Each landing mode's phases: a local-mode worker never opens a PR.
-PHASES = {"pr": ("implement", "verify", "prepr", "pr", "review"), "local": ("implement", "verify", "prepr", "review")}
+# Each landing mode's phases: a local-mode worker never opens a PR, so its reviewer CLIs critique the branch instead.
+PHASES = {"pr": ("implement", "verify", "prepr", "pr", "review"), "local": ("implement", "verify", "prepr", "critique", "review")}
 
 PR_POLL_SECONDS = 60
 NO_PR = "no PR found for its branch"

@@ -2831,15 +2831,15 @@ class WatchTest(WorkerTestCase):
 class LocalLandingWatchTest(WorkerTestCase):
     INIT = ("--land", "local", "--target", "widgets-v2")
 
-    def test_each_done_phase_advances_to_the_next_skipping_pr(self):
-        for _ in range(3):
+    def test_each_done_phase_advances_to_the_next_critiquing_instead_of_opening_a_pr(self):
+        for _ in range(4):
             self.finish_phase()
 
         self.assertEqual(self.phase(), "review")
         self.assertEqual(self.status()["state"], "review")
         self.assertEqual(
             [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()],
-            ["AFK phase: verify", "AFK phase: prepr", "AFK phase: review"],
+            ["AFK phase: verify", "AFK phase: prepr", "AFK phase: critique", "AFK phase: review"],
         )
 
     def test_prepr_checks_for_merge_conflicts_against_the_local_target(self):
@@ -2854,7 +2854,7 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertNotIn("{{", prepr)
 
     def test_a_worker_in_review_is_never_looked_up_on_github(self):
-        for _ in range(3):
+        for _ in range(4):
             self.finish_phase()
 
         for _ in range(3):
@@ -2865,7 +2865,7 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertEqual(self.status()["state"], "review")
 
     def test_a_worker_in_review_whose_ticket_is_closed_ends_without_a_pr_until_it_is_reopened(self):
-        for _ in range(3):
+        for _ in range(4):
             self.finish_phase()
         self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
         self.run_fake.responses[("git", "-C", str(self.project_dir / "worktrees" / "03"), "log")] = "abc1234 Widget UI\n"
