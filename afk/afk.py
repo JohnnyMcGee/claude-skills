@@ -1224,6 +1224,11 @@ class GithubTracker:
     def complete(self, ticket, landed=None):
         """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it. Landed, as the
         (sha, target) it landed as: no PR will close it, so it is closed here."""
+        if landed:
+            repo, number = self.locate(ticket.id)
+            sha, target = landed
+            self.run(["gh", "issue", "close", number, "--repo", repo, "--reason", "completed",
+                      "--comment", f"Landed in {sha} on {target}"])
 
     def blockers(self, ticket):
         """Native blocked-by dependencies; failing those, the issues the body's "Blocked by" section names."""

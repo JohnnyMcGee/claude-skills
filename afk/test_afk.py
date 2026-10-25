@@ -687,6 +687,31 @@ class GithubStartTest(GithubTestCase):
         )
 
 
+class GithubCompleteTest(GithubTestCase):
+    def test_a_landed_ticket_is_closed_as_completed_naming_where_it_landed(self):
+        self.issue(4, "Widget API")
+        self.issue(9, "Widget page", repo="acme/web")
+        tracker = afk.GithubTracker(self.run_fake, self.SPEC)
+
+        tracker.complete(tracker.get("4"), landed=("3f2a9c1e", "widgets-v2"))
+        tracker.complete(tracker.get("web#9"), landed=("8b7d6e5f", "main"))
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "close"), [
+            ["gh", "issue", "close", "4", "--repo", "acme/widgets", "--reason", "completed",
+             "--comment", "Landed in 3f2a9c1e on widgets-v2"],
+            ["gh", "issue", "close", "9", "--repo", "acme/web", "--reason", "completed",
+             "--comment", "Landed in 8b7d6e5f on main"],
+        ])
+
+    def test_a_merged_ticket_is_left_for_its_pr_to_close(self):
+        self.issue(4, "Widget API")
+        tracker = afk.GithubTracker(self.run_fake, self.SPEC)
+
+        tracker.complete(tracker.get("4"))
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "close"), [])
+
+
 class FrontierTest(AfkTestCase):
     def test_frontier_lists_open_tickets_whose_blockers_are_all_done(self):
         self.ticket("01-schema", "Widget schema", status="resolved")
