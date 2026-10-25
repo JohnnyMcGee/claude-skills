@@ -2800,6 +2800,17 @@ class LocalLandingWatchTest(WorkerTestCase):
             ["AFK phase: verify", "AFK phase: prepr", "AFK phase: review"],
         )
 
+    def test_prepr_checks_for_merge_conflicts_against_the_local_target(self):
+        for _ in range(2):
+            self.finish_phase()
+
+        prepr = self.prompts_sent()[-1]
+        self.assertTrue(prepr.startswith("AFK phase: prepr"), prepr)
+        self.assertIn("git merge widgets-v2", prepr)
+        self.assertIn("git diff widgets-v2...HEAD", prepr)
+        self.assertNotIn("git fetch", prepr)
+        self.assertNotIn("{{", prepr)
+
     def test_a_worker_in_review_is_never_looked_up_on_github(self):
         for _ in range(3):
             self.finish_phase()

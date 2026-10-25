@@ -247,7 +247,7 @@ class Afk:
                 "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
                 *[arg for key in ("model", "effort") if choices[key] for arg in (f"--{key}", choices[key])],
-                self.first_prompt(ticket, phase, task_type, clone),
+                self.first_prompt(ticket, phase, task_type, clone, mode, target),
             ]
             write_json(
                 worker_dir / "status.json",
@@ -497,8 +497,9 @@ class Afk:
     def perform(self, kind, *args):
         if kind == "prompt":
             ticket_id, pane, phase = args
-            repo = read_json(self.workers_dir() / ticket_id / "status.json").get("repo")
-            self.send_prompt(ticket_id, pane, self.phase_prompt(ticket_id, phase, self.clone(repo)))
+            status = read_json(self.workers_dir() / ticket_id / "status.json")
+            prompt = self.phase_prompt(ticket_id, phase, self.clone(status.get("repo")), status.get("landing", "pr"), status.get("target"))
+            self.send_prompt(ticket_id, pane, prompt)
         elif kind == "window":
             # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
             pane, name, state = args
@@ -580,18 +581,22 @@ class Afk:
         except (OSError, subprocess.CalledProcessError):
             pass
 
-    def phase_prompt(self, ticket_id, phase, clone):
+    def phase_prompt(self, ticket_id, phase, clone, landing="pr", target=None):
+        """The phase's prompt for the worker's landing mode: phase-<phase>-<landing>.md where the mode has its own."""
         ticket = self.tracker().get(ticket_id)
+        base = self.repo_config(clone).get("base", "main")
+        template = SKILL_DIR / f"phase-{phase}-{landing}.md"
         return render(
-            SKILL_DIR / f"phase-{phase}.md",
+            template if template.is_file() else SKILL_DIR / f"phase-{phase}.md",
             ticket=ticket.id,
             ticket_path=ticket.path,
-            base=self.repo_config(clone).get("base", "main"),
+            base=base,
+            target=target or base,
         )
 
-    def first_prompt(self, ticket, phase, task_type, clone):
+    def first_prompt(self, ticket, phase, task_type, clone, landing="pr", target=None):
         """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
-        prompt = self.phase_prompt(ticket.id, phase, clone)
+        prompt = self.phase_prompt(ticket.id, phase, clone, landing, target)
         if "prompt" in task_type:
             template = clone / task_type["prompt"]
             prompt += "\n" + render(template, ticket=ticket.id, ticket_path=ticket.path)
