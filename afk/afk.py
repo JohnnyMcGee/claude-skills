@@ -396,7 +396,12 @@ class Afk:
         committed = git("log", "-1", "--no-merges", "--format=%ct", "HEAD", "--not", ref)
         if not committed:
             raise SystemExit(f"afk: nothing to land: the branch has no commits of its own on top of {target}")
-        if status.get("last_human_prompt_at", float("-inf")) < int(committed) + 1:
+        approved = status.get("last_human_prompt_at", float("-inf"))
+        # A merge of the target git made unaided keeps the approval; one whose conflicts the worker resolved is its own
+        # work, as is any change slipped into a merge.
+        merges = (line.split() for line in git("log", "--merges", "--format=%ct %H", "HEAD", "--not", ref).splitlines())
+        changed = [int(committed), *(int(at) for at, merge in merges if not self.clean_merge(worktree, merge))]
+        if approved < max(changed) + 1:
             raise SystemExit("afk: no approval since the branch's last commit: the human must approve it as it stands, "
                              "in this pane")
         old = git("rev-parse", ref)
@@ -404,6 +409,17 @@ class Afk:
         git("update-ref", ref, new, old)
         self.update_status(lambda status: dict(ended="landed", landed_sha=new))
         self.out(f"landed {new[:7]} on {target}")
+
+    def clean_merge(self, worktree, merge):
+        """Whether the merge commit is exactly what git merges its two parents to, without conflicts."""
+        parents = self.run(["git", "-C", worktree, "log", "-1", "--format=%P", merge]).split()
+        if len(parents) != 2:
+            return False
+        try:
+            tree = self.run(["git", "-C", worktree, "merge-tree", "--write-tree", *parents]).split("\n", 1)[0]
+        except subprocess.CalledProcessError:
+            return False  # conflicts
+        return tree == self.run(["git", "-C", worktree, "rev-parse", f"{merge}^{{tree}}"]).strip()
 
     def cmd_hook(self, event):
         payload = json.loads(self.stdin.read() or "{}")

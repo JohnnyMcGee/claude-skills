@@ -2982,6 +2982,13 @@ class LandTestCase(WorkerTestCase):
         """The worker commits on its branch, a minute ago."""
         return self.commit(name, text, message, cwd=self.worktree, at=self.now - 60)
 
+    def other_checkout(self):
+        """A second worktree on the target, standing in for another worker that lands on it."""
+        path = self.tmp / "other"
+        if not path.exists():
+            self.git("worktree", "add", "-q", str(path), "widgets-v2")
+        return path
+
     def tip(self, branch, cwd=None):
         return self.git("rev-parse", branch, cwd=cwd)
 
@@ -3009,6 +3016,19 @@ class LandTest(LandTestCase):
         self.assertEqual(self.git("log", "-1", "--format=%B", landed), "feat(widgets): add the widget\n\nA widget.\n\nTicket: 03")
         self.assertEqual((self.status()["ended"], self.status()["landed_sha"]), ("landed", landed))
         self.assertIn(landed[:7], out)
+
+
+    def test_a_conflict_free_merge_of_the_target_after_approval_keeps_it(self):
+        self.work()
+        self.commit("other.py", "other = 1\n", "Another ticket landed", cwd=self.other_checkout())
+        self.prompt("lgtm")
+        self.now += 120
+        self.git("merge", "-q", "--no-edit", "widgets-v2", cwd=self.worktree, at=self.now - 60)
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.git("ls-tree", "--name-only", "widgets-v2").split(), ["README.md", "other.py", "widget.py"])
 
 
 class LandRefusalTest(LandTestCase):
@@ -3053,12 +3073,18 @@ class LandRefusalTest(LandTestCase):
 
         self.assertRefused("target moved; merge it, re-run pre-PR, land again")
 
-    def other_checkout(self):
-        """A second worktree on the target, standing in for another worker that lands on it."""
-        path = self.tmp / "other"
-        if not path.exists():
-            self.git("worktree", "add", "-q", str(path), "widgets-v2")
-        return path
+
+    def test_a_merge_of_the_target_with_resolved_conflicts_after_approval_needs_a_new_one(self):
+        self.work("README.md", "widgets, by 03\n", "Retitle the readme")
+        self.commit("README.md", "widgets, by another\n", "Another ticket landed", cwd=self.other_checkout())
+        self.prompt("lgtm")
+        self.now += 120
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.git("merge", "widgets-v2", cwd=self.worktree)
+        (self.worktree / "README.md").write_text("widgets, by 03 and another\n")
+        self.git("commit", "-q", "-am", "Merge widgets-v2", cwd=self.worktree, at=self.now - 60)
+
+        self.assertRefused("no approval since")
 
 
 class LandPrModeTest(LandTestCase):
