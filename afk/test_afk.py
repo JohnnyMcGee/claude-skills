@@ -3148,8 +3148,10 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertIn('afk land "', prompt)
         self.assertIn("type(scope): summary", prompt)
         self.assertIn("Ticket: 04", prompt)
-        self.assertIn("widgets-v2", prompt)
-        self.assertIn("confirm", prompt)
+        self.assertIn("squashes the branch onto `widgets-v2`", prompt)
+        self.assertIn("if you committed anything since their request, show the human what will land and ask them to confirm", prompt)
+        self.assertIn("in a plain reply, and end your turn", prompt)  # a question tool's answer isn't a typed prompt
+        self.assertIn("against `widgets-v2`", prompt)
         self.assertNotIn("{{", prompt)
 
 
@@ -3565,6 +3567,18 @@ class HitlLandTest(LandTestCase):
         landed = self.tip("widgets-v2")
         self.assertEqual(self.git("rev-parse", f"{landed}^"), before)
         self.assertEqual((self.status()["ended"], self.status()["landed_sha"]), ("landed", landed))
+
+    def test_the_guide_mode_prompt_afk_launches_it_with_is_not_the_humans_approval(self):
+        launch = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])[-1]
+        self.assertTrue(launch.startswith("AFK guide mode"), launch)
+        self.work()
+        self.prompt(launch)
+        self.prompt("/tdd " + launch)  # as launched when the repo gives hitl a skill
+
+        code, out = self.land()
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("no approval since the branch's last commit", out)
 
     def test_a_commit_made_after_the_request_needs_the_human_to_confirm(self):
         self.prompt("land it")
