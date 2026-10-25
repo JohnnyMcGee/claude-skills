@@ -3443,7 +3443,7 @@ class LandedCleanupTest(LandTestCase):
         self.assertFalse(self.worktree.exists())
         self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
         self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "done")
-        self.assertIn("03 landed and cleaned up", self.run_fake.find("notify-send")[-1][-1])
+        self.assertIn("03 landed and cleaned up", " ".join(c[-1] for c in self.run_fake.find("notify-send")))
 
 
     def test_a_landed_worker_with_a_busy_shell_waits_for_it_to_go_idle(self):
