@@ -190,6 +190,35 @@ class LandingInitTest(AfkTestCase):
         self.assertIn("--target needs --land local", out.getvalue())
         self.assertFalse(self.project_dir.exists())
 
+    def test_local_landing_warns_when_the_repo_has_no_reviewers(self):
+        self.repo_config('base = "main"')
+
+        output = self.afk("init", str(self.scratch), "--land", "local")
+
+        self.assertIn(f"warning: no reviewers in {self.repo}", output)
+
+    def test_local_landing_is_quiet_about_a_repo_with_reviewers(self):
+        self.repo_config('reviewers = ["copilot -p \'review git diff {{target}}...HEAD\'"]')
+
+        output = self.afk("init", str(self.scratch), "--land", "local")
+
+        self.assertNotIn("reviewers", output)
+
+    def test_pr_landing_does_not_ask_for_reviewers(self):
+        self.repo_config('base = "main"')
+
+        output = self.afk("init", str(self.scratch))
+
+        self.assertNotIn("reviewers", output)
+
+    def test_pr_landing_does_not_read_the_repo_config(self):
+        self.repo_config('base = "main"')
+        self.repo_config("base = ", name="afk.local.md")
+
+        output = self.afk("init", str(self.scratch))
+
+        self.assertIn("bound to tmux session", output)
+
     def test_view_shows_the_landing(self):
         self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
 
@@ -347,6 +376,29 @@ class InitReposTest(GithubTestCase):
 
         self.assertNotIn("repos", self.config())
         self.assertIn("no local clone of acme/web", output)
+
+    def test_local_landing_names_only_the_repos_with_no_reviewers(self):
+        self.repo_config('reviewers = ["coderabbit review --plain --base {{target}}"]')
+        web = self.clone(self.tmp / "web", "git@github.com:acme/web.git")
+        api = self.clone(self.tmp / "api", "git@github.com:acme/api.git")
+        (web / "docs" / "agents").mkdir(parents=True)
+        (web / "docs" / "agents" / "afk.md").write_text('+++\nbase = "main"\n+++\n')
+        self.issue(4, "Widget page", repo="acme/web")
+        self.issue(5, "Widget endpoints", repo="acme/api")
+
+        output = self.afk("init", self.SPEC, "--land", "local")
+
+        [warning] = [line for line in output.splitlines() if "reviewers" in line]
+        self.assertIn("acme/web", warning)
+        self.assertIn("acme/api", warning)
+        self.assertNotIn(str(self.repo), warning)
+
+    def test_local_landing_names_the_spec_repo_by_owner_and_name(self):
+        self.issue(4, "Widget page")
+
+        output = self.afk("init", self.SPEC, "--land", "local")
+
+        self.assertIn("warning: no reviewers in acme/widgets,", output)
 
     def test_reinit_without_a_spec_refreshes_repos_and_keeps_limits_overrides_and_hand_added_repos(self):
         self.afk("init", self.SPEC)

@@ -1,6 +1,6 @@
 ---
 name: afk-setup
-description: Onboard this repo for AFK workers — write docs/agents/afk.md, create a pre-PR skill if missing, and prove the config in a scratch worktree. First run on a machine also sets up tmux, notifications and the `afk` CLI.
+description: Onboard this repo for AFK workers — write docs/agents/afk.md, create a pre-PR skill if missing, configure reviewer CLIs, and prove the config in a scratch worktree. First run on a machine also sets up tmux, notifications and the `afk` CLI.
 disable-model-invocation: true
 ---
 
@@ -57,17 +57,34 @@ Otherwise create `.claude/skills/pre-pr/SKILL.md` from [pre-pr-template.md](pre-
 
 Done when the skill exists, afk.md names it, and each command in it exits 0 on the base branch (or fails for a reason the user confirms is pre-existing).
 
-## 5. Prove it
+## 5. Reviewers
+
+A project in local landing mode opens no PR, so its critique phase runs the repo's `reviewers` commands instead of bot reviews (see [repo-config.md](../afk/repo-config.md#reviewers)). Configure them from the reviewer CLIs installed here. Never install one yourself.
+
+1. **Detect.** `command -v coderabbit` and `command -v copilot`. For each one missing, give the user its install hint and leave it out:
+   - CodeRabbit: `brew install coderabbit` (or its install script, from https://www.coderabbit.ai/cli), then `coderabbit auth login`.
+   - Copilot: `npm install -g @github/copilot` (or `brew install copilot-cli`), then `copilot login`.
+2. **Propose** a command for each one found. Each runs headless, prints plain-text findings, and reviews `git diff {{target}}...HEAD` with nothing that can write: no file edits, no pushes, no PR or issue comments.
+   - CodeRabbit: `NO_COLOR=1 coderabbit review --committed --base {{target}}`. Its default mode is plain text, and `NO_COLOR` guards against colour codes. Each finding's `file:line` still comes wrapped in a terminal-hyperlink escape, which nothing turns off; readers can ignore it. Its `--agent` mode prints JSON lines instead, so it isn't the plain text critique expects.
+   - Copilot: `copilot -p "Review this branch's diff, below, as a code reviewer; read the repo's files for context. Print each finding as plain text: file:line, severity, the problem in one line, the fix in one line. Print 'No findings.' if there are none. Don't change any file. $(git diff {{target}}...HEAD)" -s --no-color --no-ask-user --disable-builtin-mcps --deny-tool shell --deny-tool write`. Your shell runs `git diff` and passes the diff in the prompt, so Copilot needs no shell of its own: `--deny-tool shell --deny-tool write` leaves it only reading files, and `--disable-builtin-mcps` drops the GitHub MCP server. Keep `{{target}}` inside the `$(…)` only. Elsewhere in the double-quoted prompt, a branch name with a backtick or `$` in it would be run by the shell.
+
+   Keep any `reviewers` afk.md already has; show the user the proposals, with the missing CLIs and their hints, and take their edits.
+3. **Write** the approved commands to `reviewers` in afk.md's frontmatter. With none approved, leave the key out: critique falls back to a code-review subagent.
+
+Done when `afk check` prints `is valid` with no reviewer warnings and afk.md holds the approved commands. They are proven in step 6.
+
+## 6. Prove it
 
 Run the proof in one pass, recording each step as ok or failed:
 
 1. `afk trial` — creates a scratch worktree from base on branch `afk/trial`, copies the files and runs bootstrap on trial slot 9, printing each step. Its last line gives the worktree and the `AFK_SLOT`/`AFK_PORT_BASE` to export.
-2. **Dev server up.** In that worktree with those variables exported, start the server exactly as afk.md's `## Dev server` says, in the background with its output to a log file. Done when its port answers (`curl -s -o /dev/null -w '%{http_code}' localhost:<port>`) within two minutes.
+2. **Dev server up.** In that worktree with those variables exported, start the server exactly as afk.md's `## Dev server` says, in the background with its output to a log file. Done when its port answers (`curl -s -o /dev/null -w '%{http_code}' localhost:<port>`) within two minutes. Skip this step and the next when afk.md says there is no dev server.
 3. **Dev server down.** Stop it as afk.md says. Done when the port no longer answers and no process from the worktree is left.
-4. `afk trial --teardown` — removes the worktree and branch.
+4. **Reviewers.** Skip when afk.md has no `reviewers`. In the worktree, commit a small trial diff on `afk/trial`: a new file of a few lines with an obvious bug, such as an off-by-one. Run each command with `{{target}}` replaced by base, its stdin from `/dev/null`, under a 15-minute timeout (CodeRabbit says a review can take that long; most take one or two minutes). Done for a command when it exits 0 without prompting, prints its findings or says it found none, and leaves `git status` clean with HEAD unchanged; nothing in it pushes or comments, as the commands were written not to in the Reviewers step.
+5. `afk trial --teardown` — removes the worktree and branch, with the trial commit.
 
-On a failure, stop the server if it is up, run step 4, and report exactly which step failed with the last lines of its output. Fix the cause in afk.md, bootstrap or the repo with the user, then rerun the whole proof. The proof passes when all four steps are ok in a single run.
+On a failure, stop the server if it is up, run `afk trial --teardown`, and report exactly which step failed with the last lines of its output. Fix the cause in afk.md, bootstrap or the repo with the user, then rerun the whole proof. A reviewer that can't be made to pass comes out of `reviewers`, with the user's agreement. The proof passes when every step is ok or skipped in a single run.
 
-## 6. Hand off
+## 7. Hand off
 
-Show the user `git status` and the diff of afk.md, `.gitignore` and the pre-PR skill, with the proof result. Commit only when they approve. Then they can start a project with `/afk init <spec>`.
+Show the user `git status` and the diff of afk.md, `.gitignore` and the pre-PR skill, with the proof result and any reviewer CLIs left out for not being installed. Commit only when they approve. Then they can start a project with `/afk init <spec>`.

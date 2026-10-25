@@ -103,10 +103,18 @@ class Afk:
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
         for name, clone in repos.items():
             self.out(f"  {name}  {clone}")
+        # Only local landing reads the clones' configs, so a pr-mode init never trips on one that afk check would flag.
+        clones = {c: reduce(deep_merge, [*repo_config_layers(Path(c)), config.get("overrides", {})], {})
+                  for c in dict.fromkeys([str(repo), *repos.values()])} if landing else {}
+        names = {c: c for c in clones} | ({str(repo): own} if own else {}) | {c: name for name, c in repos.items()}
+        unreviewed = [names[c] for c, repo_config in clones.items() if not repo_config.get("reviewers")]
+        if unreviewed:
+            self.out(f"warning: no reviewers in {', '.join(unreviewed)}, so critique there is a code-review subagent; "
+                     f"run /afk-setup in each to add them")
         target = landing.get("target")
-        for clone in dict.fromkeys([str(repo), *repos.values()]) if target else ():
+        for clone, repo_config in clones.items() if target else ():
             # An integration branch: started from each clone's base, then left alone, as it holds landed work.
-            base = reduce(deep_merge, [*repo_config_layers(Path(clone)), config.get("overrides", {})], {}).get("base", "main")
+            base = repo_config.get("base", "main")
             if target != base and not self.branch_exists(clone, target):
                 self.run(["git", "-C", clone, "branch", target, base])
                 self.out(f"created branch {target} from {base} in {clone}")
