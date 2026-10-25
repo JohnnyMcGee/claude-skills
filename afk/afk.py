@@ -745,9 +745,9 @@ class Afk:
 
     def cmd_status(self):
         rows = [read_json(p) for p in sorted((self.project_dir(self.current_project()) / "workers").glob("*/status.json"))]
-        self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<10}MESSAGE")
+        self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<17}MESSAGE")
         for s in rows:
-            self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<10}{s.get('message', '')}".rstrip())
+            self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<17}{s.get('message', '')}".rstrip())
 
     def cmd_view(self):
         """The current project's config.toml, headed by its path."""
@@ -991,7 +991,9 @@ def enter_review(ticket, status, now, effects):
     # The PR's URL is whatever the last poll found by branch, never taken from a report.
     status = {**status, "phase": "review", "state": "review", "message": "", "idle": False, "phase_started_at": now}
     pr = status.get("pr")
-    return status, effects + [("notify", f"{ticket} PR ready for review" + (f": {pr}" if pr else ""))]
+    # A local-mode worker has no PR: its branch is reviewed in its pane.
+    ready = "PR" if status.get("landing", "pr") == "pr" else "branch"
+    return status, effects + [("notify", f"{ticket} {ready} ready for review" + (f": {pr}" if pr else ""))]
 
 
 def enforce(ticket, status, now, limits, last_activity):
@@ -1356,10 +1358,10 @@ def worker_settings(base, target=None):
 
 
 def dashboard(statuses, now):
-    yield f"{'TICKET':<8}{'PHASE':<11}{'STATE':<11}{'ELAPSED':<9}PR"
+    yield f"{'TICKET':<8}{'PHASE':<11}{'STATE':<17}{'ELAPSED':<9}PR"  # wide enough for cleanup-pending
     for s in statuses:
         elapsed = duration(now - s.get("phase_started_at", now))
-        yield f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<11}{elapsed:<9}{s.get('pr', '-')}"
+        yield f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<17}{elapsed:<9}{s.get('pr', '-')}"
 
 
 def duration(seconds):

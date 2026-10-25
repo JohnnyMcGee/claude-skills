@@ -1705,6 +1705,9 @@ class WorkerTestCase(AfkTestCase):
     def status(self, ticket="03"):
         return json.loads((self.project_dir / "workers" / ticket / "status.json").read_text())
 
+    def desktop_notifications(self):
+        return [" ".join(c[1:]) for c in self.run_fake.calls[self.calls_before :] if c[0] == "notify-send"]
+
     def finish_phase(self, message="Done"):
         self.report("done", message)
         self.stop()
@@ -1749,9 +1752,6 @@ class WatchTest(WorkerTestCase):
             [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()],
             ["AFK phase: verify", "AFK phase: prepr", "AFK phase: pr", "AFK phase: review"],
         )
-
-    def desktop_notifications(self):
-        return [" ".join(c[1:]) for c in self.run_fake.calls[self.calls_before :] if c[0] == "notify-send"]
 
     def test_question_and_blocked_reports_notify_once_without_advancing(self):
         for state, message in [("question", "Which database?"), ("blocked", "CI is down")]:
@@ -2329,6 +2329,16 @@ class WatchTest(WorkerTestCase):
         self.assertIn("03", notification)
         self.assertIn("vim", notification)
         self.assertEqual(len(self.desktop_notifications()), 2)  # PR ready, then cleanup pending
+
+    def test_a_cleanup_pending_worker_keeps_its_columns_apart_on_the_dashboard_and_in_status(self):
+        self.reach_review()
+        self.merge(shell="vim")
+
+        dashboard = self.afk("tick").splitlines()
+
+        self.assertEqual(dashboard[1].split()[:3], ["03", "review", "cleanup-pending"])
+        self.assertEqual(self.afk("status").splitlines()[1].split(None, 3),
+                         ["03", "review", "cleanup-pending", "its shell pane is running vim"])
 
     def test_merged_pr_with_uncommitted_changes_is_left_cleanup_pending_and_notifies(self):
         self.reach_review()
@@ -2913,6 +2923,13 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertIn("git diff widgets-v2...HEAD", prepr)
         self.assertNotIn("git fetch", prepr)
         self.assertNotIn("{{", prepr)
+
+    def test_reaching_review_notifies_that_the_branch_is_ready(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        self.assertIn("03 branch ready for review", self.desktop_notifications()[-1])
+        self.assertNotIn("PR", self.desktop_notifications()[-1])
 
     def test_the_review_prompt_lands_on_approval_and_never_pushes(self):
         for _ in range(3):
