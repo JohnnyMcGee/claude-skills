@@ -133,6 +133,39 @@ class InitTest(AfkTestCase):
         )
 
 
+class LandingInitTest(AfkTestCase):
+    def config(self):
+        return tomllib.loads((self.project_dir / "config.toml").read_text())
+
+    def test_init_with_local_landing_records_the_mode_and_target(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.assertEqual(self.config()["landing"], {"mode": "local", "target": "widgets-v2"})
+
+    def test_init_without_flags_lands_by_pr_as_before(self):
+        self.afk("init", str(self.scratch))
+
+        self.assertNotIn("landing", self.config())
+
+    def test_an_unknown_landing_mode_fails_before_anything_is_written(self):
+        out = io.StringIO()
+
+        code = afk.main(["init", str(self.scratch), "--land", "yolo"], run=self.run_fake, env=self.env,
+                        stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("unknown landing mode 'yolo'", out.getvalue())
+        self.assertFalse(self.project_dir.exists())
+        self.assertEqual(self.run_fake.find("tmux", "set-option"), [])
+
+    def test_reinit_without_arguments_keeps_the_landing(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("init")
+
+        self.assertEqual(self.config()["landing"], {"mode": "local", "target": "widgets-v2"})
+
+
 class ViewTest(AfkTestCase):
     def test_view_shows_the_current_project_config_and_its_path(self):
         self.afk("init", str(self.scratch))
@@ -191,6 +224,11 @@ class GithubTestCase(AfkTestCase):
             "repository_url": f"https://api.github.com/repos/{repo}",
         }
 
+    def clone(self, path, remote):
+        (path / ".git").mkdir(parents=True)
+        self.run_fake.responses[("git", "-C", str(path), "remote", "-v")] = f"origin\t{remote} (fetch)\norigin\t{remote} (push)\n"
+        return path
+
     @property
     def project_dir(self):
         return self.state_home / "afk" / "widgets-2"
@@ -210,13 +248,44 @@ class GithubInitTest(GithubTestCase):
         )
 
 
+class IntegrationBranchTest(GithubTestCase):
+    """init in local mode creates a missing integration branch from each clone's base, under the same name."""
+
+    def missing(self, clone, branch):
+        def rev_parse(cmd):
+            if cmd[-1] == f"{branch}^{{commit}}":
+                raise subprocess.CalledProcessError(1, cmd)
+            return ""
+
+        self.run_fake.responses[("git", "-C", str(clone), "rev-parse")] = rev_parse
+
+    def branches_created(self):
+        return [(c[2], c[4:]) for c in self.run_fake.find("git", "-C") if c[3] == "branch"]
+
+    def test_a_missing_integration_branch_is_created_from_base_in_every_clone_and_an_existing_one_left_alone(self):
+        api = self.clone(self.repo / "api", "https://github.com/acme/api")
+        web = self.clone(self.repo / "web", "https://github.com/acme/web")
+        (api / "docs" / "agents").mkdir(parents=True)
+        (api / "docs" / "agents" / "afk.md").write_text('+++\nbase = "develop"\n+++\n')
+        self.issue(4, "Widget endpoints", repo="acme/api")
+        self.issue(5, "Widget page", repo="acme/web")
+        self.missing(self.repo, "widgets-v2")
+        self.missing(api, "widgets-v2")
+
+        self.afk("init", self.SPEC, "--land", "local", "--target", "widgets-v2")
+
+        self.assertEqual(self.branches_created(), [(str(self.repo), ["widgets-v2", "main"]), (str(api), ["widgets-v2", "develop"])])
+
+    def test_a_project_landing_on_base_creates_no_branch(self):
+        self.missing(self.repo, "main")
+
+        self.afk("init", self.SPEC, "--land", "local")
+
+        self.assertEqual(self.branches_created(), [])
+
+
 class InitReposTest(GithubTestCase):
     """init finds the clones of the repos the sub-issues live in, and re-running it refreshes the project."""
-
-    def clone(self, path, remote):
-        (path / ".git").mkdir(parents=True)
-        self.run_fake.responses[("git", "-C", str(path), "remote", "-v")] = f"origin\t{remote} (fetch)\norigin\t{remote} (push)\n"
-        return path
 
     def config(self):
         return tomllib.loads((self.project_dir / "config.toml").read_text())

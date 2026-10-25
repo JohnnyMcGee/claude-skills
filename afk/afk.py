@@ -48,8 +48,20 @@ class Afk:
     def project_dir(self, project):
         return self.state_root() / project
 
-    def cmd_init(self, spec=None):
-        """Create the project, or refresh it: re-running keeps its limits, overrides and hand-added repos."""
+    def cmd_init(self, *args):
+        """Create the project, or refresh it: re-running keeps its landing, limits, overrides and hand-added repos."""
+        spec, options = None, {}
+        args = list(args)
+        while args:
+            arg = args.pop(0)
+            if arg in INIT_OPTIONS and args:
+                options[arg[2:]] = args.pop(0)
+            elif arg.startswith("--") or spec is not None:
+                raise SystemExit("afk: usage: afk init [<spec>] [--land <pr|local>] [--target <branch>]")
+            else:
+                spec = arg
+        if options.get("land", "pr") not in LANDING_MODES:
+            raise SystemExit(f"afk: unknown landing mode '{options['land']}'; supported: {', '.join(LANDING_MODES)}")
         if spec is None:
             spec = self.config()["spec"]  # re-init the current session's project
         issue = GITHUB_ISSUE.match(spec)
@@ -66,9 +78,19 @@ class Afk:
             tickets = LocalTracker(spec)
         session = self.run(["tmux", "display-message", "-p", "#{session_name}"]).strip()
         pdir = self.project_dir(project)
-        pdir.mkdir(parents=True, exist_ok=True)
         path = pdir / "config.toml"
         config = tomllib.loads(path.read_text()) if path.exists() else {}
+        # Flags change the landing re-init keeps; without a target, each repo's work lands on its base.
+        landing = {**config.pop("landing", {}), **({"mode": options["land"]} if "land" in options else {})}
+        if landing.get("mode") == "pr":
+            landing = {}
+        if "target" in options:
+            if not landing:
+                raise SystemExit("afk: --target needs --land local")
+            landing["target"] = options["target"]
+        if landing:
+            config["landing"] = landing
+        pdir.mkdir(parents=True, exist_ok=True)
         own = getattr(tickets, "repo", None)
         wanted = [r for r in tickets.repos() if not (own and same(r, own))]
         found = self.find_clones(repo, wanted)
@@ -81,6 +103,13 @@ class Afk:
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
         for name, clone in repos.items():
             self.out(f"  {name}  {clone}")
+        target = landing.get("target")
+        for clone in dict.fromkeys([str(repo), *repos.values()]) if target else ():
+            # An integration branch: started from each clone's base, then left alone, as it holds landed work.
+            base = reduce(deep_merge, [*repo_config_layers(Path(clone)), config.get("overrides", {})], {}).get("base", "main")
+            if target != base and not self.branch_exists(clone, target):
+                self.run(["git", "-C", clone, "branch", target, base])
+                self.out(f"created branch {target} from {base} in {clone}")
         missing = [r for r in wanted if not any(same(r, k) for k in repos)]
         if missing:
             self.out(f"no local clone of {', '.join(missing)}: clone it next to {repo} (or as a submodule) and run "
@@ -690,6 +719,11 @@ FRONTIER_POLL = 60  # seconds between the watcher's reads of the tracker
 
 # Corrections the user can make at Gate 1, each a `afk start` option.
 START_OPTIONS = ("--type", "--agent", "--model", "--effort", "--repo")
+
+INIT_OPTIONS = ("--land", "--target")
+
+# How a project's work reaches its target branch: by a PR the human merges, or landed by the worker once approved.
+LANDING_MODES = ("pr", "local")
 
 # Runaway limits; a project's config.toml [limits] table overrides any of them.
 LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
