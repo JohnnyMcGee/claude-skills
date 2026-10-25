@@ -61,7 +61,9 @@ target = "widgets-v2"  # optional; without it, each repo's work lands on its own
 
 ## Phases
 
-The watcher drives each worker through `implement → verify → prepr → pr → review` (in local mode `implement → verify → prepr → review`: there is no `pr` phase), pasting the next phase's prompt (`phase-<name>.md` in this folder, or `phase-<name>-local.md` where local mode has its own) into the worker's pane. Prompts get `{{ticket}}`, `{{ticket_path}}`, `{{base}}` and `{{target}}` filled in. It sends a prompt only after the worker has reported `done` *and* its session has stopped, so it never types into a busy worker. If the repo sets `verify_concurrency`, a worker due to verify while the slots are full waits with state `queued` and is started when one frees. Reaching `review` means the PR is Ready; the review prompt gives standing instructions for handling feedback the user types into the pane.
+The watcher drives each worker through `implement → verify → prepr → pr → review` (in local mode `implement → verify → prepr → critique → review`: there is no `pr` phase), pasting the next phase's prompt (`phase-<name>.md` in this folder, or `phase-<name>-local.md` where local mode has its own) into the worker's pane. Prompts get `{{ticket}}`, `{{ticket_path}}`, `{{base}}`, `{{target}}` and `{{reviewers}}` filled in. It sends a prompt only after the worker has reported `done` *and* its session has stopped, so it never types into a busy worker. If the repo sets `verify_concurrency`, a worker due to verify while the slots are full waits with state `queued` and is started when one frees. Reaching `review` means the PR is Ready; the review prompt gives standing instructions for handling feedback the user types into the pane.
+
+**Critique** (local mode only) stands in for the bot reviewers a PR would get. The worker runs each of the repo's `reviewers` commands (see [repo-config.md](repo-config.md#reviewers)) over `git diff <target>...HEAD`, skipping and naming any whose binary is missing, or a code-review subagent when there are none. It sorts the findings as `/open-pr` sorts bot comments: valid, in-scope ones fixed and committed, the rest rejected with a one-line reason. Each prompt is one round. A round that fixed anything ends with `afk report done "round: …"`, and the watcher sends the critique prompt again so the fixes are critiqued too; a round with nothing to fix ends with a plain `done`, counting the rejected findings, and moves the worker to `review`. More rounds than `critique_rounds` allows make it `stuck` (see [Limits](#limits)). In local mode the review prompt's standing instructions also critique the diff again after addressing the user's feedback, and land the branch with `afk land` once the user approves it.
 
 ## HITL tickets
 
@@ -90,9 +92,10 @@ max_workers = 3     # `afk start` refuses beyond this; workers in review and hit
 phase_minutes = 90  # wall-clock in one phase while working
 idle_minutes = 20   # working, but its transcript hasn't changed
 fix_loops = 3       # review rounds (feedback → fix → done) before stopping to look
+critique_rounds = 3 # local mode: critique rounds that still found something to fix, before stopping to look
 ```
 
-A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops`, where it has already stopped, nor for a worker that stopped without reporting: only `idle_minutes` applies to it, and once it trips the worker is marked `attention` instead), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A limit trips at most once per phase clock. A stuck worker that reports `done` moves on as usual. One the user nudges in its pane gets a fresh clock, so a limit can trip again only if it runs away again.
+A tripped limit interrupts the worker (Escape in its pane; not for `fix_loops` or `critique_rounds`, where it has already stopped, nor for a worker that stopped without reporting: only `idle_minutes` applies to it, and once it trips the worker is marked `attention` instead), marks it `stuck` with the reason (window suffix `!`) and notifies. Nothing is killed: the session stays open for the user or `/afk next` triage. A limit trips at most once per phase clock. A stuck worker that reports `done` moves on as usual. One the user nudges in its pane gets a fresh clock, so a limit can trip again only if it runs away again.
 
 ## Setup
 
