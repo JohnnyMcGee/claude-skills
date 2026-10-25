@@ -2915,6 +2915,21 @@ class LocalLandingWatchTest(WorkerTestCase):
             ["AFK phase: critique", "AFK phase: critique", "AFK phase: review"],
         )
 
+    def test_review_feedback_is_critiqued_again_and_approval_lands_without_pushing(self):
+        self.repo_config('reviewers = ["coderabbit review --base {{target}} --plain"]')
+        for _ in range(4):
+            self.finish_phase()
+
+        review = self.prompts_sent()[-1]
+        self.assertTrue(review.startswith("AFK phase: review"), review)
+        self.assertIn("`coderabbit review --base widgets-v2 --plain`", review)
+        self.assertIn("git merge widgets-v2", review)
+        self.assertIn('afk land "', review)
+        self.assertIn("Ticket: 03", review)
+        self.assertIn("Never push", review)
+        self.assertNotIn("origin/", review)
+        self.assertNotIn("{{", review)
+
     def test_a_worker_in_review_is_never_looked_up_on_github(self):
         for _ in range(4):
             self.finish_phase()
