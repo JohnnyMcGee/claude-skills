@@ -744,7 +744,10 @@ INIT_OPTIONS = ("--land", "--target")
 LANDING_MODES = ("pr", "local")
 
 # Runaway limits; a project's config.toml [limits] table overrides any of them.
-LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
+LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3, "critique_rounds": 3}
+
+# Marks a critique round's done report: it fixed findings, so the fixes need a round of their own.
+CRITIQUE_ROUND = "round:"
 
 # Each landing mode's phases: a local-mode worker never opens a PR, so its reviewer CLIs critique the branch instead.
 PHASES = {"pr": ("implement", "verify", "prepr", "pr", "review"), "local": ("implement", "verify", "prepr", "critique", "review")}
@@ -885,6 +888,14 @@ def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=Non
                 return {**status, "state": "stuck", "message": reason, "fix_loops": 0}, [("notify", f"{ticket} stuck: {reason}")]
             status = {**status, "state": "review", "fix_loops": loops}
             return status, [("notify", f"{ticket} addressed review feedback: {message}")]
+        if phase == "critique" and message.startswith(CRITIQUE_ROUND):
+            rounds = status.get("critique_rounds", 0) + 1
+            if rounds >= limits["critique_rounds"]:
+                # As with fix loops, it has already stopped, and counting restarts for after the human has looked.
+                reason = f"over {limits['critique_rounds']} critique rounds"
+                return {**status, "state": "stuck", "message": reason, "critique_rounds": 0}, [("notify", f"{ticket} stuck: {reason}")]
+            status = {**status, "state": "working", "message": "", "idle": False, "phase_started_at": now, "critique_rounds": rounds}
+            return status, [("prompt", ticket, status["pane"], "critique")]
         phases = PHASES[status.get("landing", "pr")]  # workers started before landing modes landed by PR
         phase = phases[phases.index(phase) + 1]
         if phase == "verify" and not may_verify:

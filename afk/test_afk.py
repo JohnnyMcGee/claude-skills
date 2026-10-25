@@ -2898,6 +2898,23 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertIn("code-review subagent", critique)
         self.assertNotIn("{{", critique)
 
+    def test_a_critique_round_that_fixed_findings_is_followed_by_another_until_one_finds_nothing(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        self.finish_phase("round: fixed a missing null check")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("critique", "working"))
+        self.assertTrue(self.prompts_sent()[-1].startswith("AFK phase: critique"))
+
+        self.finish_phase("Critique clean; rejected 2 findings")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+        self.assertEqual(
+            [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()][-3:],
+            ["AFK phase: critique", "AFK phase: critique", "AFK phase: review"],
+        )
+
     def test_a_worker_in_review_is_never_looked_up_on_github(self):
         for _ in range(4):
             self.finish_phase()
@@ -3032,6 +3049,42 @@ class LimitsTest(unittest.TestCase):
         status, _ = self.review_round(status, now=4)
 
         self.assertEqual(status["state"], "review")
+
+
+    def critique_round(self, status, now, message="round: fixed a finding"):
+        """The worker finishes a critique round, reports done and stops."""
+        return afk.tick("03", {**status, "state": "done", "message": message, "idle": True}, now,
+                        limits={**self.limits, "critique_rounds": 2})
+
+    def test_critique_rounds_past_the_limit_are_marked_stuck_and_notified(self):
+        status, effects = self.critique_round(self.worker(phase="critique", landing="local"), now=1)
+        self.assertEqual((status["phase"], status["state"]), ("critique", "working"))
+        self.assertIn(("prompt", "03", "%5", "critique"), effects)
+
+        status, effects = self.critique_round(status, now=3)
+
+        self.assertEqual((status["phase"], status["state"]), ("critique", "stuck"))
+        self.assertIn("2 critique rounds", status["message"])
+        [(_, notification)] = [e for e in effects if e[0] == "notify"]
+        self.assertIn("stuck", notification)
+        self.assertFalse([e for e in effects if e[0] in ("prompt", "interrupt")])
+
+    def test_a_worker_stuck_on_critique_rounds_gets_more_rounds_after_the_human_looks(self):
+        status = self.worker(phase="critique", landing="local")
+        for round in range(2):
+            status, _ = self.critique_round(status, now=round)
+        self.assertEqual(status["state"], "stuck")
+
+        status, effects = self.critique_round({**status, "state": "working"}, now=4)
+
+        self.assertEqual((status["phase"], status["state"]), ("critique", "working"))
+        self.assertIn(("prompt", "03", "%5", "critique"), effects)
+
+    def test_a_critique_round_that_finds_nothing_to_fix_moves_on_to_review(self):
+        status, effects = self.critique_round(self.worker(phase="critique", landing="local"), now=1, message="Clean")
+
+        self.assertEqual((status["phase"], status["state"]), ("review", "review"))
+        self.assertIn(("prompt", "03", "%5", "review"), effects)
 
 
 class NextTest(AfkTestCase):
