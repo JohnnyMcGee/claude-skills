@@ -592,7 +592,9 @@ class Afk:
             return None
 
     def agent_running(self, pane):
-        return self.pane_command(pane) == "claude"
+        # Claude Code sets its process title to its version (e.g. "2.1.310"), so tmux may report that instead.
+        command = self.pane_command(pane)
+        return command == "claude" or bool(command and re.fullmatch(r"\d+\.\d+\.\d+", command))
 
     def pane_command(self, pane):
         """The pane's foreground command, or None if the pane is gone.

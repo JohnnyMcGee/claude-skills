@@ -1830,6 +1830,17 @@ class WatchTest(AfkTestCase):
         self.assertIn("03", notification)
         self.assertIn("claude", notification)
 
+    def test_claude_named_by_its_version_still_counts_as_running(self):
+        # Claude Code sets its process title to its version, so tmux reports e.g. "2.1.310" rather than "claude".
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = "2.1.310\n"
+        self.report("done", "Implemented")
+        self.stop()
+
+        self.afk("tick")
+
+        self.assertEqual(self.phase(), "verify")
+        self.assertEqual(len(self.prompts_sent()), 1)
+
     def limit(self, **limits):
         with open(self.project_dir / "config.toml", "a") as config:
             config.write("\n[limits]\n" + "".join(f"{k} = {v}\n" for k, v in limits.items()))
