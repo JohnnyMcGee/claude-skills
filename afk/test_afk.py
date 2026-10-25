@@ -3087,6 +3087,25 @@ class LandRefusalTest(LandTestCase):
         self.assertRefused("no approval since")
 
 
+    def test_a_land_that_loses_the_race_to_move_the_target_changes_nothing(self):
+        self.work()
+        self.prompt("lgtm")
+        theirs = self.git("commit-tree", "widgets-v2^{tree}", "-p", "widgets-v2", "-m", "Another ticket landed")
+
+        def another_worker_lands_first(cmd):
+            if "update-ref" in cmd and self.tip("widgets-v2") != theirs:
+                self.git("update-ref", "refs/heads/widgets-v2", theirs)
+
+        self.run_fake.responses[("git", "before")] = another_worker_lands_first
+        status = self.status()
+        code, out = self.land()
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("target moved; merge it, re-run pre-PR, land again", out)
+        self.assertEqual(self.tip("widgets-v2"), theirs)
+        self.assertEqual(self.status(), status)
+
+
 class LandPrModeTest(LandTestCase):
     INIT = ()
 

@@ -386,27 +386,31 @@ class Afk:
         ref = f"refs/heads/{target}"
         worktree = str(self.worktree(status["ticket"]))
         git = lambda *args, input=None: self.run(["git", "-C", worktree, *args], input=input).strip()
+        # Each read once, so whatever moves meanwhile, the checks hold for exactly what lands, on exactly what it replaces.
+        old, head = git("rev-parse", ref), git("rev-parse", "HEAD")
         try:
-            git("merge-base", "--is-ancestor", ref, "HEAD")
+            git("merge-base", "--is-ancestor", old, head)
         except subprocess.CalledProcessError:
             raise SystemExit(f"afk: {target} moved since the branch last merged it: target moved; merge it, re-run "
                              "pre-PR, land again")
         # The branch's own work, not what it merged from the target. Git keeps whole seconds, so an approval in the
         # same second as the last commit can't be told to come after it.
-        committed = git("log", "-1", "--no-merges", "--format=%ct", "HEAD", "--not", ref)
+        committed = git("log", "-1", "--no-merges", "--format=%ct", head, "--not", old)
         if not committed:
             raise SystemExit(f"afk: nothing to land: the branch has no commits of its own on top of {target}")
         approved = status.get("last_human_prompt_at", float("-inf"))
         # A merge of the target git made unaided keeps the approval; one whose conflicts the worker resolved is its own
         # work, as is any change slipped into a merge.
-        merges = (line.split() for line in git("log", "--merges", "--format=%ct %H", "HEAD", "--not", ref).splitlines())
+        merges = (line.split() for line in git("log", "--merges", "--format=%ct %H", head, "--not", old).splitlines())
         changed = [int(committed), *(int(at) for at, merge in merges if not self.clean_merge(worktree, merge))]
         if approved < max(changed) + 1:
             raise SystemExit("afk: no approval since the branch's last commit: the human must approve it as it stands, "
                              "in this pane")
-        old = git("rev-parse", ref)
-        new = git("commit-tree", "HEAD^{tree}", "-p", old, "-F", "-", input=message)
-        git("update-ref", ref, new, old)
+        new = git("commit-tree", f"{head}^{{tree}}", "-p", old, "-F", "-", input=message)
+        try:
+            git("update-ref", ref, new, old)  # compare-and-swap, so a worker landing at the same time can't be clobbered
+        except subprocess.CalledProcessError:
+            raise SystemExit(f"afk: {target} moved while landing: target moved; merge it, re-run pre-PR, land again")
         self.update_status(lambda status: dict(ended="landed", landed_sha=new))
         self.out(f"landed {new[:7]} on {target}")
 
