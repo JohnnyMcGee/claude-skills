@@ -1,0 +1,3 @@
+# Local landing mode lands work without a PR or CI
+
+An afk project can run in local landing mode: workers run the repo's pre-PR skill and reviewer CLIs locally instead of opening a PR, and once the human approves in the worker's session, `afk land` squashes the branch into the target branch. We accept losing CI and PR review per ticket to save wall-clock time, tokens and GitHub Actions minutes. The pre-PR skill, which `/afk-setup` derives from the repo's CI jobs, stands in for CI. To keep that trade-off contained, afk pushes an integration branch after each land but never pushes the base branch. Getting work onto base stays the human's call, normally through one PR for the whole integration branch, where CI and bot review run once.
