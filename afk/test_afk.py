@@ -2914,6 +2914,17 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertNotIn("git fetch", prepr)
         self.assertNotIn("{{", prepr)
 
+    def test_the_review_prompt_lands_on_approval_and_never_pushes(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        review = self.prompts_sent()[-1]
+        self.assertTrue(review.startswith("AFK phase: review"), review)
+        for instruction in ["git merge widgets-v2", "afk report done", "Ticket: 03", 'afk land "', "type(scope): summary"]:
+            self.assertIn(instruction, review)
+        self.assertNotIn("Push", review)
+        self.assertNotIn("{{", review)
+
     def test_a_worker_in_review_is_never_looked_up_on_github(self):
         for _ in range(3):
             self.finish_phase()
