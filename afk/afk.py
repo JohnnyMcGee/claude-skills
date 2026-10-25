@@ -406,6 +406,12 @@ class Afk:
         if approved < max(changed) + 1:
             raise SystemExit("afk: no approval since the branch's last commit: the human must approve it as it stands, "
                              "in this pane")
+        # Moving a branch checked out in a worktree leaves that worktree's files behind, so they move with it.
+        checkout = next((path for path, branch in self.worktrees(worktree) if branch == ref), None)
+        # Untracked files don't count: the clone's own .scratch is one, and git refuses to overwrite any.
+        if checkout and self.run(["git", "-C", checkout, "status", "--porcelain", "--untracked-files=no"]).strip():
+            raise SystemExit(f"afk: {target} is checked out in {checkout} with uncommitted changes; commit or stash "
+                             "them there, then land again")
         new = git("commit-tree", f"{head}^{{tree}}", "-p", old, "-F", "-", input=message)
         try:
             git("update-ref", ref, new, old)  # compare-and-swap, so a worker landing at the same time can't be clobbered
@@ -413,6 +419,16 @@ class Afk:
             raise SystemExit(f"afk: {target} moved while landing: target moved; merge it, re-run pre-PR, land again")
         self.update_status(lambda status: dict(ended="landed", landed_sha=new))
         self.out(f"landed {new[:7]} on {target}")
+        if checkout:
+            # What `git checkout` does: update the files the land changed, refusing to overwrite any changed since.
+            self.run(["git", "-C", checkout, "read-tree", "-m", "-u", old, new])
+
+    def worktrees(self, repo):
+        """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD."""
+        listing = self.run(["git", "-C", repo, "worktree", "list", "--porcelain"])
+        for block in listing.strip().split("\n\n"):
+            fields = dict(line.partition(" ")[::2] for line in block.splitlines())
+            yield fields["worktree"], fields.get("branch")
 
     def clean_merge(self, worktree, merge):
         """Whether the merge commit is exactly what git merges its two parents to, without conflicts."""

@@ -3031,6 +3031,20 @@ class LandTest(LandTestCase):
         self.assertEqual(self.git("ls-tree", "--name-only", "widgets-v2").split(), ["README.md", "other.py", "widget.py"])
 
 
+    def test_a_target_checked_out_in_a_clean_worktree_is_fast_forwarded_there(self):
+        checkout = self.other_checkout()
+        (checkout / "notes.txt").write_text("untracked, so nothing landing can lose\n")
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.tip("HEAD", cwd=checkout), self.tip("widgets-v2"))
+        self.assertEqual((checkout / "widget.py").read_text(), "widget = 1\n")
+        self.assertEqual(self.git("status", "--porcelain", cwd=checkout), "?? notes.txt")
+
+
 class LandRefusalTest(LandTestCase):
     def assertRefused(self, message, land_message=None):
         """afk land fails with `message`, leaving the target and the worker's status as they were."""
@@ -3104,6 +3118,16 @@ class LandRefusalTest(LandTestCase):
         self.assertIn("target moved; merge it, re-run pre-PR, land again", out)
         self.assertEqual(self.tip("widgets-v2"), theirs)
         self.assertEqual(self.status(), status)
+
+
+    def test_a_target_checked_out_in_a_worktree_with_uncommitted_changes_is_refused_naming_it(self):
+        checkout = self.other_checkout()
+        (checkout / "README.md").write_text("widgets, half edited\n")
+        self.work()
+        self.prompt("lgtm")
+
+        self.assertRefused(f"widgets-v2 is checked out in {checkout} with uncommitted changes")
+        self.assertEqual((checkout / "README.md").read_text(), "widgets, half edited\n")
 
 
 class LandPrModeTest(LandTestCase):
