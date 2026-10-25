@@ -593,7 +593,9 @@ class Afk:
         started = {s["ticket"] for s in statuses}
         if now - seen.get("polled_at", float("-inf")) >= FRONTIER_POLL:
             seen.update(polled_at=now, unblocked=[t.id for t in self.tracker().frontier()], landed=self.landed(statuses))
-        landed = None if statuses else seen.get("landed")
+        if statuses:
+            seen["landed"] = None  # a worker means a ticket is open again, whatever the last poll found
+        landed = seen.get("landed")
         if landed:
             self.out(landed)
             if not seen.get("landed_notified"):
@@ -615,14 +617,21 @@ class Afk:
 
     def landed(self, statuses):
         """The human's next step once every ticket of a project landing on an integration branch has landed, else None:
-        no ticket open or claimed, and no worker left."""
-        landing = self.config().get("landing", {})
-        base = self.repo_config().get("base", "main")
-        if landing.get("mode") != "local" or landing.get("target", base) == base or statuses:
+        no ticket open or claimed, and no worker left.
+
+        As at init, the target is an integration branch in each clone whose base it isn't, so the human takes it to
+        each such base.
+        """
+        config = self.config()
+        landing, clones = config.get("landing", {}), [config["repo"], *config.get("repos", {}).values()]
+        target = landing.get("target")
+        bases = dict.fromkeys(self.repo_config(c).get("base", "main") for c in clones)
+        bases.pop(target, None)
+        if landing.get("mode") != "local" or not target or not bases or statuses:
             return None
         tickets = self.tracker().tickets()
         if tickets and all(t.done for t in tickets):
-            return f"all tickets landed on {landing['target']}; open a PR to {base} when ready"
+            return f"all tickets landed on {target}; open a PR to {' and '.join(bases)} when ready"
         return None
 
     def perform(self, kind, *args):

@@ -3894,6 +3894,35 @@ class ProjectLandedTest(AfkTestCase):
 
         self.assertNotIn("all tickets landed", output)
         self.assertEqual(notifications, [])
+        self.assertNotIn("all tickets landed", self.afk("status"))
+
+    def test_a_ticket_started_and_dropped_between_polls_does_not_count_as_landed(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        self.tick()
+        self.ticket("07-import", "Widget import")
+        self.afk("start", "07")
+        self.now += 10
+        self.tick()
+
+        shutil.rmtree(self.project_dir / "workers" / "07")  # dropped, its ticket back on the frontier
+        self.now += 10
+        output, notifications = self.tick()
+
+        self.assertNotIn("all tickets landed", output)
+        self.assertNotIn(f"afk: widgets {self.LANDED}", notifications)
+
+    def test_a_target_that_is_only_the_project_clones_base_is_still_an_integration_branch_in_another_clone(self):
+        self.repo_config('base = "widgets-v2"')
+        api = self.tmp / "api"
+        (api / "docs" / "agents").mkdir(parents=True)
+        (api / "docs" / "agents" / "afk.md").write_text('+++\nbase = "main"\n+++\n')
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write(f'\n[repos]\n"acme/api" = "{api}"\n')
+
+        output, _ = self.tick()
+
+        self.assertIn(self.LANDED, output.splitlines())
 
     def test_status_shows_the_notice_while_every_ticket_has_landed(self):
         self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
