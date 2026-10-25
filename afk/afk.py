@@ -245,7 +245,7 @@ class Afk:
             shell = self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree), "-P", "-F", "#{pane_id}"]).strip()
 
             settings = worker_dir / "settings.json"
-            settings.write_text(json.dumps(worker_settings(base), indent=2) + "\n")
+            settings.write_text(json.dumps(worker_settings(base, target if mode == "local" else None), indent=2) + "\n")
             launch = [
                 "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
@@ -376,6 +376,101 @@ class Afk:
             return 2
         self.update_status(lambda status: dict(state=state, message=message, idle=False, reports=status.get("reports", 0) + 1))
 
+    def cmd_land(self, message=""):
+        """Squash the worker's branch onto its target branch as one commit with the message."""
+        status = read_json(self.worker_status_path())
+        if status.get("landing") != "local":
+            raise SystemExit("afk: this worker lands by PR, not with `afk land`; see its project's [landing]")
+        if not message.strip():
+            raise SystemExit('afk: land needs a commit message: afk land "<type(scope): summary>"')
+        if status.get("landed_sha"):
+            raise SystemExit(f"afk: already landed as {status['landed_sha'][:7]} on {status['target']}; afk cleans this "
+                             "worker up next")
+        target = status["target"]
+        ref = f"refs/heads/{target}"
+        worktree = str(self.worktree(status["ticket"]))
+        git = lambda *args, input=None: self.run(["git", "-C", worktree, *args], input=input).strip()
+        # Each read once, so whatever moves meanwhile, the checks hold for exactly what lands, on exactly what it replaces.
+        old, head = git("rev-parse", ref), git("rev-parse", "HEAD")
+        try:
+            git("merge-base", "--is-ancestor", old, head)
+        except subprocess.CalledProcessError:
+            raise SystemExit(f"afk: {target} moved since the branch last merged it: target moved; merge it, re-run "
+                             "pre-PR, land again")
+        # The branch's own work, not what it merged from the target. Git keeps whole seconds, so an approval in the
+        # same second as the last commit can't be told to come after it.
+        committed = git("log", "-1", "--no-merges", "--format=%ct", head, "--not", old)
+        if not committed:
+            raise SystemExit(f"afk: nothing to land: the branch has no commits of its own on top of {target}")
+        approved = status.get("last_human_prompt_at", float("-inf"))
+        # A merge of the target git made unaided keeps the approval; one whose conflicts the worker resolved is its own
+        # work, as is any change slipped into a merge, and anything merged from elsewhere, which the human never saw.
+        merges = (line.split() for line in git("log", "--merges", "--format=%ct %H", head, "--not", old).splitlines())
+        changed = [int(committed), *(int(at) for at, merge in merges if not self.clean_merge(worktree, merge, old))]
+        if approved < max(changed) + 1:
+            raise SystemExit("afk: no approval since the branch's last commit: the human must approve it as it stands, "
+                             "in this pane")
+        new = git("commit-tree", f"{head}^{{tree}}", "-p", old, "-F", "-", input=message)
+
+        def warn(message):
+            self.out(message)
+            self.notify(message)
+
+        # One land at a time in a repo, so a land can't update a checkout of the target to a commit already replaced.
+        with locked(Path(git("rev-parse", "--path-format=absolute", "--git-common-dir")), "afk-land.lock"):
+            # Moving a branch checked out in a worktree leaves that worktree's files behind, so they move with it.
+            checkout = next((path for path, branch in self.worktrees(worktree) if branch == ref), None)
+            # Untracked files don't count: the clone's own .scratch is one, and git refuses to overwrite any.
+            if checkout and self.run(["git", "-C", checkout, "status", "--porcelain", "--untracked-files=no"]).strip():
+                raise SystemExit(f"afk: {target} is checked out in {checkout} with uncommitted changes; commit or stash "
+                                 "them there, then land again")
+            try:
+                git("update-ref", ref, new, old)  # compare-and-swap, so a worker landing at the same time can't be clobbered
+            except subprocess.CalledProcessError:
+                raise SystemExit(f"afk: {target} moved while landing: target moved; merge it, re-run pre-PR, land again")
+            self.update_status(lambda status: dict(landed_sha=new))  # landed: never again, whatever fails from here
+            self.out(f"landed {new[:7]} on {target}")
+            if checkout:
+                try:
+                    # What `git checkout` does: update the files the land changed, refusing to overwrite any changed since.
+                    self.run(["git", "-C", checkout, "read-tree", "-m", "-u", old, new])
+                except subprocess.CalledProcessError as error:
+                    warn(f"{status['ticket']} landed on {target}, but {checkout} still has the files of {old[:7]}: "
+                         f"{(error.stderr or '').strip()}")
+        # An integration branch is pushed, so it's safe off this machine; base never is: taking work there is the human's.
+        if target != self.repo_config(self.clone(status.get("repo"))).get("base", "main"):
+            try:
+                git("push", "origin", f"{new}:{ref}")  # never forced, so only ever a fast-forward
+            except subprocess.CalledProcessError as error:
+                warn(f"{status['ticket']} landed on {target}, but pushing it failed: {(error.stderr or '').strip()}")
+        # Last, as the watcher then cleans the worker up, which mustn't cut the land short.
+        self.update_status(lambda status: dict(ended="landed"))
+
+    def worktrees(self, repo):
+        """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD. One whose
+        directory is gone, which git calls prunable, has no files to keep up to date, so it isn't listed."""
+        listing = self.run(["git", "-C", repo, "worktree", "list", "--porcelain"])
+        for block in listing.strip().split("\n\n"):
+            fields = dict(line.partition(" ")[::2] for line in block.splitlines())
+            if "prunable" not in fields:
+                yield fields["worktree"], fields.get("branch")
+
+    def clean_merge(self, worktree, merge, target):
+        """Whether the merge commit merged the target, at or before commit `target`, and is exactly what git merges
+        its two parents to, without conflicts."""
+        parents = self.run(["git", "-C", worktree, "log", "-1", "--format=%P", merge]).split()
+        if len(parents) != 2:
+            return False
+        try:
+            self.run(["git", "-C", worktree, "merge-base", "--is-ancestor", parents[1], target])
+        except subprocess.CalledProcessError:
+            return False  # merged from elsewhere
+        try:
+            tree = self.run(["git", "-C", worktree, "merge-tree", "--write-tree", *parents]).split("\n", 1)[0]
+        except subprocess.CalledProcessError:
+            return False  # conflicts
+        return tree == self.run(["git", "-C", worktree, "rev-parse", f"{merge}^{{tree}}"]).strip()
+
     def cmd_hook(self, event):
         payload = json.loads(self.stdin.read() or "{}")
 
@@ -393,10 +488,13 @@ class Afk:
                 # About to use a tool, so no longer stopped: it resumed, say when a background task it waited on
                 # landed. Nothing may be pasted into it until it stops again.
                 changes["idle"] = False
-            elif event == "prompt" and waiting_on_human(status):
-                # The human answered or nudged it, so it's working again. Time spent waiting on them isn't the
-                # worker's: its phase clock restarts, and its limits apply afresh.
-                changes.update(state="working", message="", idle=False, phase_started_at=self.clock())
+            elif event == "prompt" and not MACHINE_PROMPT.search(payload.get("prompt", "")):
+                # Typed by the human, not pasted by the watcher: what `afk land` takes for their approval.
+                changes["last_human_prompt_at"] = self.clock()
+                if waiting_on_human(status):
+                    # The human answered or nudged it, so it's working again. Time spent waiting on them isn't the
+                    # worker's: its phase clock restarts, and its limits apply afresh.
+                    changes.update(state="working", message="", idle=False, phase_started_at=self.clock())
             return changes
 
         self.update_status(changes)
@@ -520,7 +618,8 @@ class Afk:
     def cleanup_blocker(self, status, ended):
         """Why cleaning up this worker could lose the human's work, or None if it's safe.
 
-        Unless it merged, its branch may hold commits that were never pushed, which deleting the branch would lose.
+        Unless it merged or landed, its branch may hold commits that were never pushed, which deleting the branch would
+        lose.
         A worktree already gone, as after a cleanup that failed partway, holds nothing left to lose.
         """
         worktree = self.worktree(status["ticket"])
@@ -535,14 +634,14 @@ class Afk:
         # A submodule set to ignore=all would otherwise hide its changes, which the forced removal would then delete.
         if self.run(["git", "-C", worktree, "status", "--porcelain", "--ignore-submodules=none"]).strip():
             return "its worktree has uncommitted changes"
-        if ended != "merged" and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
+        if ended not in ("merged", "landed") and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
             return "its branch has unpushed commits"
         return None
 
     def clean_up(self, ticket_id, pane, ended):
         """Remove an ended worker's window, worktree, local branch and state; removing its dir frees its slot.
 
-        A merged ticket is completed. One whose PR was closed unmerged is released, back onto the frontier. A closed
+        A merged or landed ticket is completed. One whose PR was closed unmerged is released, back onto the frontier. A closed
         ticket is left as it is, as is one gone from the tracker.
 
         Removing the worker's dir is the commit point, so each step before it tolerates having been done by a cleanup
@@ -550,10 +649,13 @@ class Afk:
         human: cleanup_blocker has already checked it holds nothing unpushed.
         """
         project = self.current_project()
-        repo = str(self.clone(read_json(self.workers_dir() / ticket_id / "status.json").get("repo")))
+        status = read_json(self.workers_dir() / ticket_id / "status.json")
+        repo = str(self.clone(status.get("repo")))
         tracker, ticket = self.tracker(), self.find_ticket(ticket_id)
         if ticket and ended == "merged":
             tracker.complete(ticket)
+        elif ticket and ended == "landed":
+            tracker.complete(ticket, landed=(status["landed_sha"], status["target"]))
         elif ticket and ended == "closed":
             tracker.release(ticket)
         self.best_effort(["tmux", "kill-window", "-t", pane])
@@ -665,9 +767,9 @@ class Afk:
 
     def cmd_status(self):
         rows = [read_json(p) for p in sorted((self.project_dir(self.current_project()) / "workers").glob("*/status.json"))]
-        self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<10}MESSAGE")
+        self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<17}MESSAGE")
         for s in rows:
-            self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<10}{s.get('message', '')}".rstrip())
+            self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<17}{s.get('message', '')}".rstrip())
 
     def cmd_view(self):
         """The current project's config.toml, headed by its path."""
@@ -727,6 +829,12 @@ class Afk:
 
 
 REPORT_STATES = ("done", "blocked", "question")
+
+# A prompt no human typed: afk's own phase or guide-mode prompt, perhaps after its task type's skill, or pasted, as the
+# watcher sends them (Claude Code hands the hook a paste wrapped in a <pasted_content> tag, after whatever was typed
+# before it); or Claude Code's notice that a background task finished, which it submits as a prompt.
+MACHINE_PROMPT = re.compile(
+    r"\A\s*(?:/\S+\s+)?AFK (?:phase:|guide mode)|<pasted_content[^>]*>\s*AFK (?:phase:|guide mode)|\A\s*<task-notification>")
 
 AGENTS = ("claude",)
 
@@ -793,11 +901,15 @@ def waiting_on_human(status):
 
 
 def ending(status, polled, pr_state, ticket_closed=False):
-    """How the worker's work ended: its PR "merged" or "closed", or its "ticket closed"; None while it goes on.
+    """How the worker's work ended: "landed" by `afk land`, its PR "merged" or "closed", or its "ticket closed"; None
+    while it goes on.
 
-    A closed ticket outranks a closed PR, so cleanup never releases a ticket that is already closed. A pending
-    worker keeps its ending between polls; a fresh poll decides it again, as a closed PR or ticket can be reopened.
+    Landing is final, as its work is in the target. A closed ticket outranks a closed PR, so cleanup never releases a
+    ticket that is already closed. A pending worker keeps its ending between polls; a fresh poll decides it again, as a
+    closed PR or ticket can be reopened.
     """
+    if status.get("ended") == "landed":
+        return "landed"
     if status["state"] == "cleanup-pending" and not polled:
         return status.get("ended", "merged")  # workers left pending before closed PRs were cleaned up had merged
     if pr_state == "MERGED":
@@ -915,7 +1027,9 @@ def enter_review(ticket, status, now, effects):
     # The PR's URL is whatever the last poll found by branch, never taken from a report.
     status = {**status, "phase": "review", "state": "review", "message": "", "idle": False, "phase_started_at": now}
     pr = status.get("pr")
-    return status, effects + [("notify", f"{ticket} PR ready for review" + (f": {pr}" if pr else ""))]
+    # A local-mode worker has no PR: its branch is reviewed in its pane.
+    ready = "PR" if status.get("landing", "pr") == "pr" else "branch"
+    return status, effects + [("notify", f"{ticket} {ready} ready for review" + (f": {pr}" if pr else ""))]
 
 
 def enforce(ticket, status, now, limits, last_activity):
@@ -1033,8 +1147,8 @@ class LocalTracker:
     def release(self, ticket):
         pass
 
-    def complete(self, ticket):
-        """Merged: mark it done, as GitHub closes an issue, so the frontier doesn't offer it again."""
+    def complete(self, ticket, landed=None):
+        """Merged or landed: mark it done, as GitHub closes an issue, so the frontier doesn't offer it again."""
         ticket.path.write_text(set_field(ticket.path.read_text(), "Status", "done"))
 
     def split(self, ticket, parts):
@@ -1149,8 +1263,14 @@ class GithubTracker:
         repo, number = self.locate(ticket.id)
         self.run(["gh", "issue", "edit", number, "--repo", repo, "--remove-assignee", "@me"])
 
-    def complete(self, ticket):
-        """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it."""
+    def complete(self, ticket, landed=None):
+        """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it. Landed, as the
+        (sha, target) it landed as: no PR will close it, so it is closed here."""
+        if landed:
+            repo, number = self.locate(ticket.id)
+            sha, target = landed
+            self.run(["gh", "issue", "close", number, "--repo", repo, "--reason", "completed",
+                      "--comment", f"Landed in {sha} on {target}"])
 
     def blockers(self, ticket):
         """Native blocked-by dependencies; failing those, the issues the body's "Blocked by" section names."""
@@ -1240,9 +1360,23 @@ def window_name(ticket):
     return f"{ticket.id}-{abbrev}"
 
 
-def worker_settings(base):
-    """Per-session Claude settings: status hooks plus a deny list against irreversible damage."""
+def worker_settings(base, target=None):
+    """Per-session Claude settings: status hooks plus a deny list against irreversible damage.
+
+    A local-mode worker's target is moved only by `afk land`, so the worker is denied moving it, or checking it out,
+    by hand. Best-effort: a worker in auto permission mode can find another way.
+    """
     hook = lambda event: [{"hooks": [{"type": "command", "command": f"{shlex.quote(AFK_BIN)} hook {event}"}]}]
+    pushes = lambda branch: [f"Bash(git push * {branch})", f"Bash(git push * HEAD:{branch})", f"Bash(git push * *:{branch})"]
+    landing = [
+        *(pushes(target) if target != base else []),
+        f"Bash(git update-ref *refs/heads/{target})",
+        f"Bash(git update-ref *refs/heads/{target} *)",
+        f"Bash(git checkout {target})",
+        f"Bash(git checkout * {target})",
+        f"Bash(git switch {target})",
+        f"Bash(git switch * {target})",
+    ] if target else []
     return {
         "permissions": {
             "deny": [
@@ -1250,9 +1384,8 @@ def worker_settings(base):
                 "Bash(git push * -f)",
                 "Bash(git push * -f *)",
                 "Bash(git push * +*)",
-                f"Bash(git push * {base})",
-                f"Bash(git push * HEAD:{base})",
-                f"Bash(git push * *:{base})",
+                *pushes(base),
+                *landing,
                 "Bash(gh pr merge *)",
                 "Bash(git worktree remove *)",
                 "Bash(git worktree prune *)",
@@ -1269,10 +1402,10 @@ def worker_settings(base):
 
 
 def dashboard(statuses, now):
-    yield f"{'TICKET':<8}{'PHASE':<11}{'STATE':<11}{'ELAPSED':<9}PR"
+    yield f"{'TICKET':<8}{'PHASE':<11}{'STATE':<17}{'ELAPSED':<9}PR"  # wide enough for cleanup-pending
     for s in statuses:
         elapsed = duration(now - s.get("phase_started_at", now))
-        yield f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<11}{elapsed:<9}{s.get('pr', '-')}"
+        yield f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<17}{elapsed:<9}{s.get('pr', '-')}"
 
 
 def duration(seconds):
@@ -1403,9 +1536,10 @@ def section(markdown, heading):
 
 
 @contextmanager
-def locked(worker_dir):
-    """Serialise read-modify-writes of one worker's status between the watcher, its hooks and its reports."""
-    with open(worker_dir / "lock", "w") as lock:
+def locked(directory, name="lock"):
+    """Hold the lock file `name` in `directory`: it serialises read-modify-writes of one worker's status between the
+    watcher, its hooks and its reports, and the lands in one repo."""
+    with open(directory / name, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
@@ -1474,7 +1608,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|status|view|hook|check|trial> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|land|status|view|hook|check|trial> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)

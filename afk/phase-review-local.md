@@ -14,7 +14,8 @@ When it's review feedback:
 When it's approval of the branch as it stands ("approve", "land it", "lgtm"):
 
 1. Write a conventional commit message for the whole branch: a `type(scope): summary` line, a body summing up the change, and a `Ticket: {{ticket}}` trailer.
-2. Run `afk land "<message>"`. It squashes the branch onto `{{target}}`. If it refuses, do what it says, or ask the human.
+2. Run `afk land "<message>"`. It squashes the branch onto `{{target}}` as that one commit, and afk cleans up this worker once it has landed. Don't run `afk report`.
+3. If it refuses because the target moved, merge `{{target}}`, re-run the pre-PR skill, commit, and run `afk land` again. If it refuses for want of approval, run `afk report question "<why it needs approving again>"`. Never move `{{target}}` yourself.
 
 When it's unclear which it is, ask, and don't land.
 
