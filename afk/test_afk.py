@@ -2853,6 +2853,27 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertNotIn("git fetch", prepr)
         self.assertNotIn("{{", prepr)
 
+    def test_critique_runs_each_of_the_repos_reviewers_over_the_diff_against_the_target(self):
+        self.repo_config('reviewers = ["coderabbit review --base {{target}} --plain", "copilot -p \'review git diff {{target}}...HEAD\'"]')
+        for _ in range(3):
+            self.finish_phase()
+
+        critique = self.prompts_sent()[-1]
+        self.assertTrue(critique.startswith("AFK phase: critique"), critique)
+        self.assertIn("`coderabbit review --base widgets-v2 --plain`", critique)
+        self.assertIn("`copilot -p 'review git diff widgets-v2...HEAD'`", critique)
+        self.assertIn("git diff widgets-v2...HEAD", critique)
+        self.assertNotIn("{{", critique)
+
+    def test_critique_without_reviewers_is_a_code_review_subagent(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        critique = self.prompts_sent()[-1]
+        self.assertIn("No reviewers are configured", critique)
+        self.assertIn("code-review subagent", critique)
+        self.assertNotIn("{{", critique)
+
     def test_a_worker_in_review_is_never_looked_up_on_github(self):
         for _ in range(4):
             self.finish_phase()

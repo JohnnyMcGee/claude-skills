@@ -587,14 +587,17 @@ class Afk:
     def phase_prompt(self, ticket_id, phase, clone, landing="pr", target=None):
         """The phase's prompt for the worker's landing mode: phase-<phase>-<landing>.md where the mode has its own."""
         ticket = self.tracker().get(ticket_id)
-        base = self.repo_config(clone).get("base", "main")
+        repo_config = self.repo_config(clone)
+        base = repo_config.get("base", "main")
+        target = target or base
         template = SKILL_DIR / f"phase-{phase}-{landing}.md"
         return render(
             template if template.is_file() else SKILL_DIR / f"phase-{phase}.md",
             ticket=ticket.id,
             ticket_path=ticket.path,
             base=base,
-            target=target or base,
+            target=target,
+            reviewers=reviewer_list(repo_config.get("reviewers", []), target),
         )
 
     def first_prompt(self, ticket, phase, task_type, clone, landing="pr", target=None):
@@ -1206,6 +1209,13 @@ def launch_choices(ticket, default_type, task_types, corrections):
     choices = {"type": type_name, "agent": task_type.get("agent", "claude"), "model": task_type.get("model"),
                "effort": task_type.get("effort")}
     return {**choices, **{k: v for k, v in corrections.items() if k != "type"}}
+
+
+def reviewer_list(reviewers, target):
+    """The critique prompt's list of the repo's reviewer commands, each with its {{target}} filled in."""
+    if not reviewers:
+        return "No reviewers are configured, so a code-review subagent is the critique."
+    return "\n".join(f"- `{command.replace('{{target}}', shlex.quote(target))}`" for command in reviewers)
 
 
 def slug(title):

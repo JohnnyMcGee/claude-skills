@@ -2,7 +2,7 @@ AFK phase: critique — ticket {{ticket}} ({{ticket_path}})
 
 The branch passes pre-PR. No PR will be opened, so critique it locally the way bot reviewers would on a PR. This prompt is one critique round: afk sends it again for the next.
 
-The repo's reviewers, from the `reviewers` key in `docs/agents/afk.md`:
+The repo's reviewers, from `reviewers` in `docs/agents/afk.md`:
 
 {{reviewers}}
 
