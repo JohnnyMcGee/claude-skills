@@ -573,17 +573,24 @@ class Afk:
             raise failures[0]
 
     def surface_unblocked(self, statuses, now):
-        """The Gate 1 judgment point: unblocked tickets and a free worker slot. The user decides with /afk next.
+        """The Gate 1 judgment point: unblocked tickets and a free worker slot. The user decides with /afk next. And
+        the end of a project landing on an integration branch: every ticket landed, so the human takes it to base.
 
         The tracker is polled at most every FRONTIER_POLL seconds, as a GitHub frontier costs a request per ticket,
-        and the user is notified once per newly unblocked ticket, not every tick.
+        and the user is notified once per newly unblocked ticket, and once per project landed, not every tick.
         """
         path = self.project_dir(self.current_project()) / "frontier.json"
         seen = read_json(path) if path.exists() else {}
         before = dict(seen)
         started = {s["ticket"] for s in statuses}
         if now - seen.get("polled_at", float("-inf")) >= FRONTIER_POLL:
-            seen.update(polled_at=now, unblocked=[t.id for t in self.tracker().frontier()])
+            seen.update(polled_at=now, unblocked=[t.id for t in self.tracker().frontier()], landed=self.landed(statuses))
+        landed = None if statuses else seen.get("landed")
+        if landed:
+            self.out(landed)
+            if not seen.get("landed_notified"):
+                self.notify(landed)
+                seen["landed_notified"] = True
         candidates = [t for t in seen["unblocked"] if t not in started]
         # A ticket that drops out, say blocked again, counts as newly unblocked when it returns.
         seen["notified"] = [t for t in seen.get("notified", []) if t in candidates]
@@ -595,6 +602,18 @@ class Afk:
                 seen["notified"] = candidates
         if seen != before:
             write_json(path, seen)
+
+    def landed(self, statuses):
+        """The human's next step once every ticket of a project landing on an integration branch has landed, else None:
+        no ticket open or claimed, and no worker left."""
+        landing = self.config().get("landing", {})
+        base = self.repo_config().get("base", "main")
+        if landing.get("mode") != "local" or landing.get("target", base) == base or statuses:
+            return None
+        tickets = self.tracker().tickets()
+        if tickets and all(t.done for t in tickets):
+            return f"all tickets landed on {landing['target']}; open a PR to {base} when ready"
+        return None
 
     def perform(self, kind, *args):
         if kind == "prompt":

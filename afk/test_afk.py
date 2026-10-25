@@ -3779,6 +3779,34 @@ class UnblockedTest(AfkTestCase):
         self.assertNotIn("unblocked", output)
 
 
+class ProjectLandedTest(AfkTestCase):
+    """A local-mode project landing on an integration branch tells the human once all its tickets have landed there."""
+
+    LANDED = "all tickets landed on widgets-v2; open a PR to main when ready"
+
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI", status="done")
+        self.ticket("05-export", "Widget export", status="closed")
+
+    def tick(self):
+        calls_before = len(self.run_fake.calls)
+        output = self.afk("tick")
+        notifications = [" ".join(c[1:]) for c in self.run_fake.calls[calls_before:] if c[0] == "notify-send"]
+        return output, notifications
+
+    def test_every_ticket_landed_notifies_once(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        output, notifications = self.tick()
+
+        self.assertEqual(notifications, [f"afk: widgets {self.LANDED}"])
+        self.assertIn(self.LANDED, output.splitlines())
+        self.now += 120
+        _, later = self.tick()
+        self.assertEqual(later, [])
+
+
 class ApprovedStartTest(AfkTestCase):
     """Starting the tickets approved at Gate 1: within max_workers, with the user's corrections."""
 
