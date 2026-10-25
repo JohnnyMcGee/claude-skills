@@ -464,11 +464,21 @@ class Afk:
                 commits = int(self.run(["git", "-C", worktree, "rev-list", "--count", "HEAD", "--not",
                                         f"refs/heads/{status['target']}"]))
                 lost = f"{commits} unlanded commit{'s' * (commits != 1)}"
+                # What cleanup otherwise waits out, which dropping deletes too: the human's edits and whatever they run.
+                if self.run(["git", "-C", worktree, "status", "--porcelain", "--ignore-submodules=none"]).strip():
+                    lost += " and its worktree's uncommitted changes"
+                command = self.pane_command(status["shell_pane"]) if "shell_pane" in status else None
+                busy = command is not None and command not in SHELLS
                 if "--discard" not in options:
-                    raise SystemExit(f"afk: dropping {ticket_id} would delete {lost}; run `afk drop {ticket_id} "
-                                     "--discard` to drop it anyway")
-                self.clean_up(ticket_id, status["pane"], "dropped")
-        self.out(f"dropped {ticket_id}: deleted {lost}; its ticket is back on the frontier")
+                    raise SystemExit(f"afk: dropping {ticket_id} would delete {lost}"
+                                     + (f", and end {command} in its shell pane" if busy else "")
+                                     + f"; run `afk drop {ticket_id} --discard` to drop it anyway")
+                ticket = self.find_ticket(ticket_id)
+                released = bool(ticket and not ticket.done)
+                # A closed ticket is left as it is, as cleanup leaves one after it ends a worker.
+                self.clean_up(ticket_id, status["pane"], "dropped" if released else "ticket closed")
+        self.out(f"dropped {ticket_id}: deleted {lost}" + (f", and ended {command} in its shell pane" if busy else "")
+                 + ("; its ticket is back on the frontier" if released else ""))
 
     def worktrees(self, repo):
         """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD. One whose
@@ -658,8 +668,15 @@ class Afk:
         # A submodule set to ignore=all would otherwise hide its changes, which the forced removal would then delete.
         if self.run(["git", "-C", worktree, "status", "--porcelain", "--ignore-submodules=none"]).strip():
             return "its worktree has uncommitted changes"
-        if ended not in ("merged", "landed") and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
-            return "its branch has unpushed commits"
+        if ended in ("merged", "landed"):
+            return None
+        unpushed = ["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]
+        if status.get("landing", "pr") == "pr":
+            return "its branch has unpushed commits" if self.run(unpushed).strip() else None
+        # A local-mode branch is never pushed, and work landed on its target, pushed or not, isn't lost with it, so
+        # what's left goes only when the human drops it.
+        if self.run([*unpushed, f"refs/heads/{status['target']}"]).strip():
+            return f"its branch has unpushed commits; `afk drop {status['ticket']} --discard` deletes them"
         return None
 
     def clean_up(self, ticket_id, pane, ended):

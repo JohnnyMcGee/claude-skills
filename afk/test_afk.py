@@ -688,6 +688,39 @@ class GithubStartTest(GithubTestCase):
         )
 
 
+class GithubDropTest(GithubTestCase):
+    def setUp(self):
+        super().setUp()
+        self.issue(4, "Widget API")
+        self.afk("init", self.SPEC, "--land", "local")
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+        self.afk("start", "4")
+        self.run_fake.responses[("git", "-C", str(self.project_dir / "worktrees" / "4"), "rev-list")] = "1\n"
+
+    def test_a_dropped_workers_issue_is_unassigned_back_onto_the_frontier(self):
+        self.afk("drop", "4", "--discard")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [
+            ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--add-assignee", "@me"],
+            ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--remove-assignee", "@me"],
+        ])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
+                         [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-2-4"]])
+        self.assertFalse((self.project_dir / "workers" / "4").exists())
+
+    def test_a_dropped_worker_whose_issue_is_closed_leaves_it_as_it_is(self):
+        self.issues[4]["state"] = "closed"
+
+        out = self.afk("drop", "4", "--discard")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [
+            ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--add-assignee", "@me"],
+        ])
+        self.assertNotIn("frontier", out)
+        self.assertFalse((self.project_dir / "workers" / "4").exists())
+
+
 class GithubCompleteTest(GithubTestCase):
     def test_a_landed_ticket_is_closed_as_completed_naming_where_it_landed(self):
         self.issue(4, "Widget API")
@@ -3539,6 +3572,60 @@ class DropTest(DropTestCase):
             self.assertEqual(code, 1, out)
             self.assertIn(f"afk: no worker for ticket {ticket}", out)
         self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+    def test_without_discard_a_busy_shell_pane_or_uncommitted_changes_are_refused_too(self):
+        self.work()
+        (self.worktree / "widget.py").write_text("widget = 2\n")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "vim\n"
+
+        self.assertRefused("dropping 03 would delete 1 unlanded commit and its worktree's uncommitted changes, and "
+                           "end vim in its shell pane; run `afk drop 03 --discard`", "03")
+        self.assertEqual((self.worktree / "widget.py").read_text(), "widget = 2\n")
+
+    def test_with_discard_uncommitted_changes_are_deleted_too_and_it_says_so(self):
+        (self.worktree / "widget.py").write_text("widget = 2\n")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "vim\n"
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 0 unlanded commits and its worktree's uncommitted changes, and ended vim in its shell "
+                      "pane", out)
+        self.assertFalse(self.worktree.exists())
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+    def close_ticket_in_review(self):
+        for _ in range(4):
+            self.finish_phase()
+        path = self.scratch / "issues" / "03-ui.md"
+        path.write_text(path.read_text().replace("**Status:** ready-for-agent", "**Status:** closed"))
+        self.now += afk.PR_POLL_SECONDS
+        self.afk("tick")
+        return path
+
+    def test_a_worker_whose_ticket_is_closed_waits_on_its_unlanded_commits_until_it_is_dropped(self):
+        self.work()
+
+        path = self.close_ticket_in_review()
+
+        message = "its branch has unpushed commits; `afk drop 03 --discard` deletes them"
+        self.assertEqual((self.status()["state"], self.status()["message"]), ("cleanup-pending", message))
+        self.assertIn(message, self.desktop_notifications()[-1])
+        self.assertTrue(self.worktree.exists())
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+        self.assertIn("**Status:** closed", path.read_text())  # left as it is
+
+    def test_a_worker_whose_ticket_is_closed_holding_only_the_targets_work_is_cleaned_up(self):
+        self.commit("other.py", "other = 1\n", "Another ticket landed", cwd=self.other_checkout())
+        self.git("merge", "-q", "widgets-v2", cwd=self.worktree)  # landed, so in the target, though never pushed
+
+        self.close_ticket_in_review()
+
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
 
 
 class DropPrModeTest(DropTestCase):
