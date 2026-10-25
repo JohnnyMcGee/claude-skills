@@ -3843,6 +3843,16 @@ class ProjectLandedTest(AfkTestCase):
         self.assertNotIn("all tickets landed", output)
         self.assertEqual(notifications, [])
 
+    def test_status_shows_the_notice_while_every_ticket_has_landed(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        landed = self.afk("status").splitlines()
+        self.ticket("07-import", "Widget import")
+        reopened = self.afk("status").splitlines()
+
+        self.assertEqual(landed[-1], self.LANDED)
+        self.assertNotIn(self.LANDED, reopened)
+
 
 class ApprovedStartTest(AfkTestCase):
     """Starting the tickets approved at Gate 1: within max_workers, with the user's corrections."""

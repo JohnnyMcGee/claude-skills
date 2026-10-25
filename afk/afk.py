@@ -791,6 +791,9 @@ class Afk:
         self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<17}MESSAGE")
         for s in rows:
             self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<17}{s.get('message', '')}".rstrip())
+        landed = self.landed(rows)
+        if landed:
+            self.out(landed)
 
     def cmd_view(self):
         """The current project's config.toml, headed by its path."""
