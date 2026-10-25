@@ -3011,6 +3011,57 @@ class LandTest(LandTestCase):
         self.assertIn(landed[:7], out)
 
 
+class LandRefusalTest(LandTestCase):
+    def assertRefused(self, message, land_message=None):
+        """afk land fails with `message`, leaving the target and the worker's status as they were."""
+        before, status = self.tip("widgets-v2"), self.status()
+        code, out = self.land(*(() if land_message is None else (land_message,)))
+        self.assertEqual(code, 1, out)
+        self.assertIn(message, out)
+        self.assertEqual(self.tip("widgets-v2"), before)
+        self.assertEqual(self.status(), status)
+
+    def test_an_empty_message_is_refused(self):
+        self.work()
+        self.prompt("lgtm")
+
+        self.assertRefused("afk land needs a commit message", "  \n")
+
+
+    def test_a_branch_the_human_has_not_approved_is_refused(self):
+        self.work()
+
+        self.assertRefused("no approval since")
+
+    def test_an_approval_followed_by_a_commit_of_the_workers_own_is_stale(self):
+        self.prompt("lgtm")
+        self.now += 120
+        self.work()  # a fix, a minute after the human approved
+
+        self.assertRefused("no approval since")
+
+    def test_a_branch_with_nothing_to_land_is_refused(self):
+        self.prompt("lgtm")
+
+        self.assertRefused("nothing to land")
+
+
+class LandPrModeTest(LandTestCase):
+    INIT = ()
+
+    def test_a_worker_landing_by_pr_is_refused(self):
+        self.work()
+        self.prompt("lgtm")
+        before = self.tip("main")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("lands by PR", out)
+        self.assertEqual(self.tip("main"), before)
+        self.assertNotIn("ended", self.status())
+
+
 class LimitsTest(unittest.TestCase):
     """Runaway limits, one pure tick() at a time with an injected clock."""
 

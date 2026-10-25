@@ -375,13 +375,25 @@ class Afk:
             return 2
         self.update_status(lambda status: dict(state=state, message=message, idle=False, reports=status.get("reports", 0) + 1))
 
-    def cmd_land(self, message):
+    def cmd_land(self, message=""):
         """Squash the worker's branch onto its target branch as one commit with the message."""
         status = read_json(self.worker_status_path())
+        if status.get("landing") != "local":
+            raise SystemExit("afk: this worker lands by PR, not with `afk land`; see its project's [landing]")
+        if not message.strip():
+            raise SystemExit('afk land needs a commit message: afk land "<type(scope): summary>"')
         target = status["target"]
         ref = f"refs/heads/{target}"
         worktree = str(self.worktree(status["ticket"]))
         git = lambda *args, input=None: self.run(["git", "-C", worktree, *args], input=input).strip()
+        # The branch's own work, not what it merged from the target. Git keeps whole seconds, so an approval in the
+        # same second as the last commit can't be told to come after it.
+        committed = git("log", "-1", "--no-merges", "--format=%ct", "HEAD", "--not", ref)
+        if not committed:
+            raise SystemExit(f"afk: nothing to land: the branch has no commits of its own on top of {target}")
+        if status.get("last_human_prompt_at", float("-inf")) < int(committed) + 1:
+            raise SystemExit("afk: no approval since the branch's last commit: the human must approve it as it stands, "
+                             "in this pane")
         old = git("rev-parse", ref)
         new = git("commit-tree", "HEAD^{tree}", "-p", old, "-F", "-", input=message)
         git("update-ref", ref, new, old)
