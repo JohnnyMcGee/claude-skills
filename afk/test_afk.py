@@ -3046,6 +3046,21 @@ class LandRefusalTest(LandTestCase):
         self.assertRefused("nothing to land")
 
 
+    def test_a_target_that_moved_since_the_branch_last_merged_it_is_refused(self):
+        self.work()
+        self.commit("other.py", "other = 1\n", "Another ticket landed", cwd=self.other_checkout())
+        self.prompt("lgtm")
+
+        self.assertRefused("target moved; merge it, re-run pre-PR, land again")
+
+    def other_checkout(self):
+        """A second worktree on the target, standing in for another worker that lands on it."""
+        path = self.tmp / "other"
+        if not path.exists():
+            self.git("worktree", "add", "-q", str(path), "widgets-v2")
+        return path
+
+
 class LandPrModeTest(LandTestCase):
     INIT = ()
 

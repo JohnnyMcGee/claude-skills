@@ -386,6 +386,11 @@ class Afk:
         ref = f"refs/heads/{target}"
         worktree = str(self.worktree(status["ticket"]))
         git = lambda *args, input=None: self.run(["git", "-C", worktree, *args], input=input).strip()
+        try:
+            git("merge-base", "--is-ancestor", ref, "HEAD")
+        except subprocess.CalledProcessError:
+            raise SystemExit(f"afk: {target} moved since the branch last merged it: target moved; merge it, re-run "
+                             "pre-PR, land again")
         # The branch's own work, not what it merged from the target. Git keeps whole seconds, so an approval in the
         # same second as the last commit can't be told to come after it.
         committed = git("log", "-1", "--no-merges", "--format=%ct", "HEAD", "--not", ref)
