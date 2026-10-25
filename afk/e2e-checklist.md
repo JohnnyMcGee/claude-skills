@@ -265,7 +265,7 @@ Split the window as in step 3. Everything below runs in this session.
 
 **Feedback leaves the approval stale**
 
-- [ ] Type "approve" in 01's agent pane, but while it is still busy (before it runs `afk land`) interrupt with Escape, then type "also return `Content-Length`". It fixes, commits, re-runs the pre-PR skill, merges `afk-e2e-int`, critiques the changed diff and reports `done`. Expect it not to land: the approval predates its new commit. If it runs `afk land` anyway, expect a refusal that the branch has no commit approved since its last one, with `afk-e2e-int` unmoved.
+- [ ] Type "approve" in 01's agent pane, but while it is still busy (before it runs `afk land`) interrupt with Escape, then type "also return `Content-Length`". It fixes, commits, re-runs the pre-PR skill, merges `afk-e2e-int`, critiques the changed diff and reports `done`. Expect it not to land: the approval predates its new commit. If it runs `afk land` anyway, expect a refusal "no approval since the branch's last commit", with `afk-e2e-int` unmoved.
 
 **Approval, then `afk land`**
 
