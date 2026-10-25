@@ -1107,6 +1107,16 @@ class LandingStartTest(AfkTestCase):
         self.assertFalse(denied("git update-ref refs/heads/afk/domain-03 3f2a9c1"))
         self.assertFalse(denied("git update-ref refs/heads/maintenance 3f2a9c1"))
 
+    def test_a_worker_is_denied_dropping_any_ticket_which_is_the_humans_call(self):
+        self.afk("init", str(self.scratch), "--land", "local")
+
+        self.afk("start", "03")
+
+        denied = lambda command: any(fnmatch.fnmatchcase(f"Bash({command})", rule) for rule in self.deny())
+        self.assertTrue(denied("afk drop 03 --discard"))
+        self.assertTrue(denied(f"{shlex.quote(afk.AFK_BIN)} drop 04 --discard"))
+        self.assertFalse(denied("afk report done 'Dropped the unused helper'"))
+
     def test_a_pr_mode_worker_is_denied_nothing_about_its_target_beyond_pushing_base(self):
         self.afk("init", str(self.scratch))
 

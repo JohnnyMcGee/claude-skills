@@ -682,8 +682,8 @@ class Afk:
     def clean_up(self, ticket_id, pane, ended):
         """Remove an ended worker's window, worktree, local branch and state; removing its dir frees its slot.
 
-        A merged or landed ticket is completed. One whose PR was closed unmerged is released, back onto the frontier. A closed
-        ticket is left as it is, as is one gone from the tracker.
+        A merged or landed ticket is completed. One whose PR was closed unmerged, or that the human dropped, is released,
+        back onto the frontier. A closed ticket is left as it is, as is one gone from the tracker.
 
         Removing the worker's dir is the commit point, so each step before it tolerates having been done by a cleanup
         that failed partway, and a branch git won't delete, say one checked out in another worktree, is left for the
@@ -1430,6 +1430,9 @@ def worker_settings(base, target=None):
                 "Bash(gh pr merge *)",
                 "Bash(git worktree remove *)",
                 "Bash(git worktree prune *)",
+                # Dropping a ticket deletes its work, which is the human's call.
+                "Bash(afk drop *)",
+                f"Bash({shlex.quote(AFK_BIN)} drop *)",
             ]
         },
         "hooks": {
@@ -1649,7 +1652,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|land|status|view|hook|check|trial> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|land|drop|status|view|hook|check|trial> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)
