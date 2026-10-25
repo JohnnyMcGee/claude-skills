@@ -3082,6 +3082,25 @@ class ApprovalTest(WorkerTestCase):
 
         self.assertEqual(self.status()["last_human_prompt_at"], approved)
 
+    def test_a_background_task_landing_is_not_the_humans(self):
+        self.prompt("lgtm")
+        approved = self.now
+        self.now += 300
+
+        self.prompt("<task-notification>\n<task-id>bsscixg0x</task-id>\n<status>completed</status>\n</task-notification>")
+
+        self.assertEqual(self.status()["last_human_prompt_at"], approved)
+
+    def test_a_phase_prompt_pasted_after_half_typed_text_is_not_the_humans(self):
+        self.prompt("lgtm")
+        approved = self.now
+        self.now += 300
+        self.finish_phase()
+
+        self.prompt(f'lg\n\n<pasted_content id="7eeb">\n{self.prompts_sent()[-1]}</pasted_content id="7eeb">\n')
+
+        self.assertEqual(self.status()["last_human_prompt_at"], approved)
+
 
 class GitRun(FakeRun):
     """FakeRun, except git, which runs for real: landing is git's work, so it is checked against real repos."""
