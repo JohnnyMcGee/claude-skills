@@ -2853,6 +2853,8 @@ class WatchTest(WorkerTestCase):
         self.assertTrue(prompt.startswith("AFK guide mode — ticket 04"), prompt)
         self.assertIn(str(self.scratch / "issues" / "04-spike.md"), prompt)
         self.assertNotIn("AFK phase: implement", prompt)
+        self.assertIn("opens a PR from this branch against `main`", prompt)
+        self.assertNotIn("afk land", prompt)  # a project landing by PR lands hitl tickets by PR too
 
     def test_the_watcher_never_drives_a_hitl_worker_and_shows_it_as_the_users(self):
         self.start_hitl()
@@ -3121,6 +3123,21 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.afk("tick")
 
         self.assertEqual([c[3] for c in self.run_fake.find("gh", "pr", "view")], ["afk/widgets-04"])
+
+    def test_the_guide_mode_prompt_lands_on_the_humans_request_after_committing_and_confirming(self):
+        self.ticket("04-spike", "Widget spike", type="hitl")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.afk("start", "04")
+
+        launch = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])
+        prompt = launch[-1]
+        self.assertTrue(prompt.startswith("AFK guide mode — ticket 04"), prompt)
+        self.assertIn('afk land "', prompt)
+        self.assertIn("type(scope): summary", prompt)
+        self.assertIn("Ticket: 04", prompt)
+        self.assertIn("widgets-v2", prompt)
+        self.assertIn("confirm", prompt)
+        self.assertNotIn("{{", prompt)
 
 
 class ApprovalTest(WorkerTestCase):
