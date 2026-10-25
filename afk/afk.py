@@ -381,7 +381,7 @@ class Afk:
         if status.get("landing") != "local":
             raise SystemExit("afk: this worker lands by PR, not with `afk land`; see its project's [landing]")
         if not message.strip():
-            raise SystemExit('afk land needs a commit message: afk land "<type(scope): summary>"')
+            raise SystemExit('afk: land needs a commit message: afk land "<type(scope): summary>"')
         if status.get("ended") == "landed":
             raise SystemExit(f"afk: already landed as {status['landed_sha'][:7]} on {status['target']}; afk cleans this "
                              "worker up next")

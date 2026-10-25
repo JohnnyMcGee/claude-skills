@@ -3165,7 +3165,7 @@ class LandRefusalTest(LandTestCase):
         self.work()
         self.prompt("lgtm")
 
-        self.assertRefused("afk land needs a commit message", "  \n")
+        self.assertRefused("afk: land needs a commit message", "  \n")
 
 
     def test_a_branch_the_human_has_not_approved_is_refused(self):
