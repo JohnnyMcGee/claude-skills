@@ -3,7 +3,7 @@ base = "main"
 default_type = "skill"
 reviewers = [
   "NO_COLOR=1 coderabbit review --committed --base {{target}}",
-  """copilot -p "Review the changes in git diff {{target}}...HEAD as a code reviewer. Print each finding as plain text: file:line, severity, the problem in one line, the fix in one line. Print 'No findings.' if there are none. Don't change any file." -s --no-color --no-ask-user --disable-builtin-mcps --allow-tool 'shell(git diff:*)' --allow-tool 'shell(git log:*)' --allow-tool 'shell(git show:*)' --deny-tool write""",
+  """copilot -p "Review this branch's diff, below, as a code reviewer; read the repo's files for context. Print each finding as plain text: file:line, severity, the problem in one line, the fix in one line. Print 'No findings.' if there are none. Don't change any file. $(git diff {{target}}...HEAD)" -s --no-color --no-ask-user --disable-builtin-mcps --deny-tool shell --deny-tool write""",
 ]
 
 [task_types.skill]
