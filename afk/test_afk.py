@@ -740,6 +740,39 @@ class GithubStartTest(GithubTestCase):
         )
 
 
+class GithubDropTest(GithubTestCase):
+    def setUp(self):
+        super().setUp()
+        self.issue(4, "Widget API")
+        self.afk("init", self.SPEC, "--land", "local")
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+        self.afk("start", "4")
+        self.run_fake.responses[("git", "-C", str(self.repo), "rev-list")] = "1\n"
+
+    def test_a_dropped_workers_issue_is_unassigned_back_onto_the_frontier(self):
+        self.afk("drop", "4", "--discard")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [
+            ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--add-assignee", "@me"],
+            ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--remove-assignee", "@me"],
+        ])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
+                         [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-2-4"]])
+        self.assertFalse((self.project_dir / "workers" / "4").exists())
+
+    def test_a_dropped_worker_whose_issue_is_closed_leaves_it_as_it_is(self):
+        self.issues[4]["state"] = "closed"
+
+        out = self.afk("drop", "4", "--discard")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [
+            ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--add-assignee", "@me"],
+        ])
+        self.assertNotIn("frontier", out)
+        self.assertFalse((self.project_dir / "workers" / "4").exists())
+
+
 class GithubCompleteTest(GithubTestCase):
     def test_a_landed_ticket_is_closed_as_completed_naming_where_it_landed(self):
         self.issue(4, "Widget API")
@@ -1125,6 +1158,16 @@ class LandingStartTest(AfkTestCase):
         self.assertTrue(denied("git update-ref -d refs/heads/main"))
         self.assertFalse(denied("git update-ref refs/heads/afk/domain-03 3f2a9c1"))
         self.assertFalse(denied("git update-ref refs/heads/maintenance 3f2a9c1"))
+
+    def test_a_worker_is_denied_dropping_any_ticket_which_is_the_humans_call(self):
+        self.afk("init", str(self.scratch), "--land", "local")
+
+        self.afk("start", "03")
+
+        denied = lambda command: any(fnmatch.fnmatchcase(f"Bash({command})", rule) for rule in self.deny())
+        self.assertTrue(denied("afk drop 03 --discard"))
+        self.assertTrue(denied(f"{shlex.quote(afk.AFK_BIN)} drop 04 --discard"))
+        self.assertFalse(denied("afk report done 'Dropped the unused helper'"))
 
     def test_a_pr_mode_worker_is_denied_nothing_about_its_target_beyond_pushing_base(self):
         self.afk("init", str(self.scratch))
@@ -3531,6 +3574,173 @@ class LandPrModeTest(LandTestCase):
         self.assertIn("lands by PR", out)
         self.assertEqual(self.tip("main"), before)
         self.assertNotIn("ended", self.status())
+
+
+class DropTestCase(LandTestCase):
+    """Worker 03 of a local-mode project, as in LandTestCase, with an idle shell pane, for the human to drop."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "zsh\n"  # an idle shell pane
+
+    def drop(self, *args):
+        """`afk drop` run by the human from the project's session, as (exit code, output)."""
+        out = io.StringIO()
+        code = afk.main(["drop", *args], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+        return code, out.getvalue()
+
+    def assertRefused(self, message, *args):
+        """afk drop fails with `message`, leaving the worker, its worktree and its branch as they were."""
+        status, head = self.status(), self.tip("HEAD", cwd=self.worktree)
+        code, out = self.drop(*args)
+        self.assertEqual(code, 1, out)
+        self.assertIn(message, out)
+        self.assertEqual(self.status(), status)
+        self.assertEqual(self.tip("afk/widgets-03"), head)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+
+class DropTest(DropTestCase):
+    def test_a_dropped_worker_is_cleaned_up_with_its_unlanded_commits_and_its_ticket_offered_again(self):
+        self.work()
+        self.work("widget_test.py", "assert widget\n", "Test the widget")
+        before = self.tip("widgets-v2")
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 2 unlanded commits", out)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%5"]])
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
+        self.assertFalse((self.project_dir / "workers" / "03").exists())  # its slot is free
+        self.assertEqual(self.tip("widgets-v2"), before)
+        self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "ready-for-agent")
+        self.assertEqual([t["id"] for t in json.loads(self.afk("next"))["tickets"]], ["03"])
+
+    def test_without_discard_it_refuses_saying_how_many_unlanded_commits_would_be_lost(self):
+        self.work()
+        self.work("widget_test.py", "assert widget\n", "Test the widget")
+
+        self.assertRefused("dropping 03 would delete 2 unlanded commits; run `afk drop 03 --discard`", "03")
+
+    def test_a_ticket_without_a_worker_is_refused(self):
+        self.ticket("04-api", "Widget API")
+
+        for ticket in ("04", "99"):
+            code, out = self.drop(ticket, "--discard")
+
+            self.assertEqual(code, 1, out)
+            self.assertIn(f"afk: no worker for ticket {ticket}", out)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+    def test_without_discard_a_busy_shell_pane_or_uncommitted_changes_are_refused_too(self):
+        self.work()
+        (self.worktree / "widget.py").write_text("widget = 2\n")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "vim\n"
+
+        self.assertRefused("dropping 03 would delete 1 unlanded commit and its worktree's uncommitted changes, and "
+                           "end vim in its shell pane; run `afk drop 03 --discard`", "03")
+        self.assertEqual((self.worktree / "widget.py").read_text(), "widget = 2\n")
+
+    def test_with_discard_uncommitted_changes_are_deleted_too_and_it_says_so(self):
+        (self.worktree / "widget.py").write_text("widget = 2\n")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "vim\n"
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 0 unlanded commits and its worktree's uncommitted changes, and ended vim in its shell "
+                      "pane", out)
+        self.assertFalse(self.worktree.exists())
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+    def close_ticket_in_review(self):
+        for _ in range(4):
+            self.finish_phase()
+        path = self.scratch / "issues" / "03-ui.md"
+        path.write_text(path.read_text().replace("**Status:** ready-for-agent", "**Status:** closed"))
+        self.now += afk.PR_POLL_SECONDS
+        self.afk("tick")
+        return path
+
+    def test_a_worker_whose_ticket_is_closed_waits_on_its_unlanded_commits_until_it_is_dropped(self):
+        self.work()
+
+        path = self.close_ticket_in_review()
+
+        message = "its branch has unpushed commits; `afk drop 03 --discard` deletes them"
+        self.assertEqual((self.status()["state"], self.status()["message"]), ("cleanup-pending", message))
+        self.assertIn(message, self.desktop_notifications()[-1])
+        self.assertTrue(self.worktree.exists())
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+        self.assertIn("**Status:** closed", path.read_text())  # left as it is
+
+    def test_a_landed_worker_waiting_on_its_cleanup_is_refused_as_its_work_is_in_the_target(self):
+        self.work()
+        self.prompt("lgtm")
+        self.assertEqual(self.land()[0], 0)
+
+        self.assertRefused("03 has landed on widgets-v2", "03", "--discard")
+        self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "ready-for-agent")
+
+    def test_a_worker_whose_worktree_is_gone_is_still_dropped(self):
+        self.work()
+        shutil.rmtree(self.worktree)
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 1 unlanded commit;", out)
+        self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+    def test_a_worker_whose_target_is_gone_waits_on_its_commits_and_is_still_dropped(self):
+        self.work()
+        self.git("branch", "-D", "widgets-v2")
+
+        self.close_ticket_in_review()  # the tick doesn't fail
+
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        code, out = self.drop("03", "--discard")
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 1 unlanded commit", out)
+
+    def test_misplaced_or_unknown_options_are_refused_with_usage(self):
+        for args in (("03", "--discard", "--force"), ("--discard", "03")):
+            self.assertRefused("afk: usage: afk drop <ticket> [--discard]", *args)
+
+    def test_a_worker_is_refused_dropping_a_ticket(self):
+        status = self.status()
+        out = io.StringIO()
+        code = afk.main(["drop", "03", "--discard"], run=self.run_fake, env={**self.env, **self.worker_env()},
+                        stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("afk drop is the human's", out.getvalue())
+        self.assertEqual(self.status(), status)
+
+    def test_a_worker_whose_ticket_is_closed_holding_only_the_targets_work_is_cleaned_up(self):
+        self.commit("other.py", "other = 1\n", "Another ticket landed", cwd=self.other_checkout())
+        self.git("merge", "-q", "widgets-v2", cwd=self.worktree)  # landed, so in the target, though never pushed
+
+        self.close_ticket_in_review()
+
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+
+class DropPrModeTest(DropTestCase):
+    INIT = ()
+
+    def test_a_worker_landing_by_pr_is_refused_as_closing_its_pr_drops_it(self):
+        self.work()
+
+        self.assertRefused("03 lands by PR: close its PR instead", "03", "--discard")
 
 
 class LimitsTest(unittest.TestCase):
