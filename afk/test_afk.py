@@ -3115,14 +3115,27 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertEqual(self.status()["state"], "review")
         self.assertNotIn("ended", self.status())
 
-    def test_a_hitl_workers_pr_is_still_found_by_its_branch(self):
+    def test_a_hitl_workers_pr_is_still_found_by_its_branch_and_cleaned_up_once_merged(self):
         self.ticket("04-spike", "Widget spike", type="hitl")
         self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.run_fake.responses[("tmux", "split-window")] = "%8\n"
         self.afk("start", "04")
 
         self.afk("tick")
 
         self.assertEqual([c[3] for c in self.run_fake.find("gh", "pr", "view")], ["afk/widgets-04"])
+        self.assertEqual(self.status("04")["state"], "yours")
+
+        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-04")] = pr_view("MERGED")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%8")] = "bash\n"
+        self.run_fake.responses[("git", "-C", str(self.project_dir / "worktrees" / "04"), "status")] = ""
+        self.now += afk.PR_POLL_SECONDS
+        self.afk("tick")
+
+        self.assertIn(["tmux", "kill-window", "-t", "%7"], self.run_fake.find("tmux", "kill-window"))
+        self.assertIn(["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-04"], self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"))
+        self.assertFalse((self.project_dir / "workers" / "04").exists())
+        self.assertIn("04 merged and cleaned up", " ".join(self.desktop_notifications()))
 
     def test_the_guide_mode_prompt_lands_on_the_humans_request_after_committing_and_confirming(self):
         self.ticket("04-spike", "Widget spike", type="hitl")
