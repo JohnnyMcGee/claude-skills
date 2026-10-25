@@ -454,9 +454,14 @@ class Afk:
         # Last, as the watcher then cleans the worker up, which mustn't cut the land short.
         self.update_status(lambda status: dict(ended="landed"))
 
-    def cmd_drop(self, ticket_id, *options):
+    def cmd_drop(self, *args):
         """Abandon a local-mode worker: release its ticket back onto the frontier and clean it up, deleting its
         unlanded commits."""
+        if self.env.get("AFK_TICKET"):
+            raise SystemExit("afk: afk drop is the human's: run it from the project's session, not from a worker")
+        if not args or args[0].startswith("-") or set(args[1:]) - {"--discard"}:
+            raise SystemExit("afk: usage: afk drop <ticket> [--discard]")
+        ticket_id, discard = args[0], "--discard" in args[1:]
         worker_dir = self.workers_dir() / ticket_id
         self.workers_dir().mkdir(parents=True, exist_ok=True)
         # Under the tick lock, then the worker's, as a tick takes them, so the watcher can't act on it meanwhile.
@@ -468,16 +473,22 @@ class Afk:
                 if status.get("landing", "pr") != "local":
                     raise SystemExit(f"afk: {ticket_id} lands by PR: close its PR instead, and afk cleans it up and "
                                      "releases its ticket")
-                worktree = str(self.worktree(ticket_id))
-                commits = int(self.run(["git", "-C", worktree, "rev-list", "--count", "HEAD", "--not",
-                                        f"refs/heads/{status['target']}"]))
+                # Its work is safe, so its ticket is completed, not released, once cleanup is safe too.
+                if status.get("landed_sha") or status.get("ended") == "merged":
+                    ended = f"landed on {status['target']}" if status.get("landed_sha") else "merged"
+                    raise SystemExit(f"afk: {ticket_id} has {ended}; afk cleans it up once that's safe: see `afk status`")
+                # From the clone, as a cleanup that failed partway may have removed the worktree, or even the branch.
+                clone, branch = str(self.clone(status.get("repo"))), f"refs/heads/afk/{self.current_project()}-{ticket_id}"
+                commits = int(self.run(["git", "-C", clone, "rev-list", "--count", *self.unsaved(clone, branch, status["target"])])
+                              if self.branch_exists(clone, branch) else 0)
                 lost = f"{commits} unlanded commit{'s' * (commits != 1)}"
                 # What cleanup otherwise waits out, which dropping deletes too: the human's edits and whatever they run.
-                if self.run(["git", "-C", worktree, "status", "--porcelain", "--ignore-submodules=none"]).strip():
+                worktree = self.worktree(ticket_id)
+                if worktree.exists() and self.run(["git", "-C", str(worktree), "status", "--porcelain", "--ignore-submodules=none"]).strip():
                     lost += " and its worktree's uncommitted changes"
                 command = self.pane_command(status["shell_pane"]) if "shell_pane" in status else None
                 busy = command is not None and command not in SHELLS
-                if "--discard" not in options:
+                if not discard:
                     raise SystemExit(f"afk: dropping {ticket_id} would delete {lost}"
                                      + (f", and end {command} in its shell pane" if busy else "")
                                      + f"; run `afk drop {ticket_id} --discard` to drop it anyway")
@@ -487,6 +498,11 @@ class Afk:
                 self.clean_up(ticket_id, status["pane"], "dropped" if released else "ticket closed")
         self.out(f"dropped {ticket_id}: deleted {lost}" + (f", and ended {command} in its shell pane" if busy else "")
                  + ("; its ticket is back on the frontier" if released else ""))
+
+    def unsaved(self, repo, rev, target):
+        """`git rev-list` arguments for the commits of `rev` that deleting its branch would lose: those on no remote,
+        nor on the target, while the target still exists."""
+        return [rev, "--not", "--remotes", *([f"refs/heads/{target}"] if self.branch_exists(repo, f"refs/heads/{target}") else [])]
 
     def worktrees(self, repo):
         """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD. One whose
@@ -678,12 +694,12 @@ class Afk:
             return "its worktree has uncommitted changes"
         if ended in ("merged", "landed"):
             return None
-        unpushed = ["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]
         if status.get("landing", "pr") == "pr":
-            return "its branch has unpushed commits" if self.run(unpushed).strip() else None
+            unpushed = self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip()
+            return "its branch has unpushed commits" if unpushed else None
         # A local-mode branch is never pushed, and work landed on its target, pushed or not, isn't lost with it, so
         # what's left goes only when the human drops it.
-        if self.run([*unpushed, f"refs/heads/{status['target']}"]).strip():
+        if self.run(["git", "-C", worktree, "log", "--oneline", *self.unsaved(worktree, "HEAD", status["target"])]).strip():
             return f"its branch has unpushed commits; `afk drop {status['ticket']} --discard` deletes them"
         return None
 
