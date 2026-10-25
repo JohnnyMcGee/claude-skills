@@ -3246,6 +3246,40 @@ class LandTest(LandTestCase):
         self.assertIn("push", self.run_fake.find("notify-send")[-1][-1])
 
 
+    def test_the_watcher_leaves_a_landing_worker_alone_until_its_land_has_finished(self):
+        self.work()
+        self.prompt("lgtm")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "zsh\n"  # an idle shell
+        during = []
+
+        def watcher_ticks_mid_push(cmd):
+            if "push" in cmd and not during:
+                during.append(None)
+                self.afk("tick")
+                during[0] = (self.project_dir / "workers" / "03").exists()
+
+        self.run_fake.responses[("git", "before")] = watcher_ticks_mid_push
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(during, [True])
+        self.assertEqual(self.tip("widgets-v2", cwd=self.origin), self.status()["landed_sha"])
+        self.assertEqual(self.status()["ended"], "landed")
+
+    def test_a_checkout_of_the_target_that_cannot_be_updated_notifies_without_undoing_the_land(self):
+        checkout = self.other_checkout()
+        (checkout / "widget.py").write_text("untracked, in the way\n")
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.status()["ended"], "landed")
+        self.assertEqual((checkout / "widget.py").read_text(), "untracked, in the way\n")
+        self.assertIn(f"{checkout} still has", self.run_fake.find("notify-send")[-1][-1])
+
+
 class LandOnBaseTest(LandTestCase):
     INIT = ("--land", "local")
 

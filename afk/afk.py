@@ -383,7 +383,7 @@ class Afk:
             raise SystemExit("afk: this worker lands by PR, not with `afk land`; see its project's [landing]")
         if not message.strip():
             raise SystemExit('afk: land needs a commit message: afk land "<type(scope): summary>"')
-        if status.get("ended") == "landed":
+        if status.get("landed_sha"):
             raise SystemExit(f"afk: already landed as {status['landed_sha'][:7]} on {status['target']}; afk cleans this "
                              "worker up next")
         target = status["target"]
@@ -410,30 +410,41 @@ class Afk:
         if approved < max(changed) + 1:
             raise SystemExit("afk: no approval since the branch's last commit: the human must approve it as it stands, "
                              "in this pane")
-        # Moving a branch checked out in a worktree leaves that worktree's files behind, so they move with it.
-        checkout = next((path for path, branch in self.worktrees(worktree) if branch == ref), None)
-        # Untracked files don't count: the clone's own .scratch is one, and git refuses to overwrite any.
-        if checkout and self.run(["git", "-C", checkout, "status", "--porcelain", "--untracked-files=no"]).strip():
-            raise SystemExit(f"afk: {target} is checked out in {checkout} with uncommitted changes; commit or stash "
-                             "them there, then land again")
         new = git("commit-tree", f"{head}^{{tree}}", "-p", old, "-F", "-", input=message)
-        try:
-            git("update-ref", ref, new, old)  # compare-and-swap, so a worker landing at the same time can't be clobbered
-        except subprocess.CalledProcessError:
-            raise SystemExit(f"afk: {target} moved while landing: target moved; merge it, re-run pre-PR, land again")
-        self.update_status(lambda status: dict(ended="landed", landed_sha=new))
-        self.out(f"landed {new[:7]} on {target}")
-        if checkout:
-            # What `git checkout` does: update the files the land changed, refusing to overwrite any changed since.
-            self.run(["git", "-C", checkout, "read-tree", "-m", "-u", old, new])
+
+        def warn(message):
+            self.out(message)
+            self.notify(message)
+
+        # One land at a time in a repo, so a land can't update a checkout of the target to a commit already replaced.
+        with locked(Path(git("rev-parse", "--path-format=absolute", "--git-common-dir")), "afk-land.lock"):
+            # Moving a branch checked out in a worktree leaves that worktree's files behind, so they move with it.
+            checkout = next((path for path, branch in self.worktrees(worktree) if branch == ref), None)
+            # Untracked files don't count: the clone's own .scratch is one, and git refuses to overwrite any.
+            if checkout and self.run(["git", "-C", checkout, "status", "--porcelain", "--untracked-files=no"]).strip():
+                raise SystemExit(f"afk: {target} is checked out in {checkout} with uncommitted changes; commit or stash "
+                                 "them there, then land again")
+            try:
+                git("update-ref", ref, new, old)  # compare-and-swap, so a worker landing at the same time can't be clobbered
+            except subprocess.CalledProcessError:
+                raise SystemExit(f"afk: {target} moved while landing: target moved; merge it, re-run pre-PR, land again")
+            self.update_status(lambda status: dict(landed_sha=new))  # landed: never again, whatever fails from here
+            self.out(f"landed {new[:7]} on {target}")
+            if checkout:
+                try:
+                    # What `git checkout` does: update the files the land changed, refusing to overwrite any changed since.
+                    self.run(["git", "-C", checkout, "read-tree", "-m", "-u", old, new])
+                except subprocess.CalledProcessError as error:
+                    warn(f"{status['ticket']} landed on {target}, but {checkout} still has the files of {old[:7]}: "
+                         f"{(error.stderr or '').strip()}")
         # An integration branch is pushed, so it's safe off this machine; base never is: taking work there is the human's.
         if target != self.repo_config(self.clone(status.get("repo"))).get("base", "main"):
             try:
                 git("push", "origin", f"{new}:{ref}")  # never forced, so only ever a fast-forward
             except subprocess.CalledProcessError as error:
-                failed = f"{status['ticket']} landed on {target}, but pushing it failed: {(error.stderr or '').strip()}"
-                self.out(failed)
-                self.notify(failed)
+                warn(f"{status['ticket']} landed on {target}, but pushing it failed: {(error.stderr or '').strip()}")
+        # Last, as the watcher then cleans the worker up, which mustn't cut the land short.
+        self.update_status(lambda status: dict(ended="landed"))
 
     def worktrees(self, repo):
         """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD."""
@@ -1522,9 +1533,10 @@ def section(markdown, heading):
 
 
 @contextmanager
-def locked(worker_dir):
-    """Serialise read-modify-writes of one worker's status between the watcher, its hooks and its reports."""
-    with open(worker_dir / "lock", "w") as lock:
+def locked(directory, name="lock"):
+    """Hold the lock file `name` in `directory`: it serialises read-modify-writes of one worker's status between the
+    watcher, its hooks and its reports, and the lands in one repo."""
+    with open(directory / name, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
