@@ -3538,7 +3538,7 @@ class LandedCleanupTest(LandTestCase):
         self.assertFalse(self.worktree.exists())
         self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
         self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "done")
-        self.assertIn("03 landed and cleaned up", self.run_fake.find("notify-send")[-1][-1])
+        self.assertIn("03 landed and cleaned up", " ".join(c[-1] for c in self.run_fake.find("notify-send")))
 
 
     def test_a_landed_worker_with_a_busy_shell_waits_for_it_to_go_idle(self):
@@ -4039,6 +4039,110 @@ class UnblockedTest(AfkTestCase):
 
         self.assertEqual(notifications, [])
         self.assertNotIn("unblocked", output)
+
+
+class ProjectLandedTest(AfkTestCase):
+    """A local-mode project landing on an integration branch tells the human once all its tickets have landed there."""
+
+    LANDED = "all tickets landed on widgets-v2; open a PR to main when ready"
+
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI", status="done")
+        self.ticket("05-export", "Widget export", status="closed")
+
+    def tick(self):
+        calls_before = len(self.run_fake.calls)
+        output = self.afk("tick")
+        notifications = [" ".join(c[1:]) for c in self.run_fake.calls[calls_before:] if c[0] == "notify-send"]
+        return output, notifications
+
+    def test_every_ticket_landed_notifies_once(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        output, notifications = self.tick()
+
+        self.assertEqual(notifications, [f"afk: widgets {self.LANDED}"])
+        self.assertIn(self.LANDED, output.splitlines())
+        self.now += 120
+        _, later = self.tick()
+        self.assertEqual(later, [])
+
+    def test_a_ticket_added_later_reopens_the_project_until_it_too_lands(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        self.tick()
+        self.ticket("07-import", "Widget import")
+
+        self.now += 60
+        output, reopened = self.tick()
+        self.ticket("07-import", "Widget import", status="done")
+        self.now += 60
+        _, landed = self.tick()
+
+        self.assertNotIn(f"afk: widgets {self.LANDED}", reopened)
+        self.assertNotIn(self.LANDED, output.splitlines())
+        self.assertEqual(landed, [f"afk: widgets {self.LANDED}"])
+
+    def test_no_notice_in_pr_mode_or_when_the_target_is_base(self):
+        for init in [(), ("--land", "local"), ("--land", "local", "--target", "main")]:
+            with self.subTest(init=init):
+                shutil.rmtree(self.project_dir, ignore_errors=True)
+                self.afk("init", str(self.scratch), *init)
+
+                output, notifications = self.tick()
+
+                self.assertNotIn("all tickets landed", output)
+                self.assertEqual(notifications, [])
+
+    def test_no_notice_while_a_worker_is_left(self):
+        self.ticket("07-import", "Widget import")
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        self.afk("start", "07")
+        self.ticket("07-import", "Widget import", status="closed")  # closed by hand, its worker not yet cleaned up
+
+        output, notifications = self.tick()
+
+        self.assertNotIn("all tickets landed", output)
+        self.assertEqual(notifications, [])
+        self.assertNotIn("all tickets landed", self.afk("status"))
+
+    def test_a_ticket_started_and_dropped_between_polls_does_not_count_as_landed(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        self.tick()
+        self.ticket("07-import", "Widget import")
+        self.afk("start", "07")
+        self.now += 10
+        self.tick()
+
+        shutil.rmtree(self.project_dir / "workers" / "07")  # dropped, its ticket back on the frontier
+        self.now += 10
+        output, notifications = self.tick()
+
+        self.assertNotIn("all tickets landed", output)
+        self.assertNotIn(f"afk: widgets {self.LANDED}", notifications)
+
+    def test_a_target_that_is_only_the_project_clones_base_is_still_an_integration_branch_in_another_clone(self):
+        self.repo_config('base = "widgets-v2"')
+        api = self.tmp / "api"
+        (api / "docs" / "agents").mkdir(parents=True)
+        (api / "docs" / "agents" / "afk.md").write_text('+++\nbase = "main"\n+++\n')
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write(f'\n[repos]\n"acme/api" = "{api}"\n')
+
+        output, _ = self.tick()
+
+        self.assertIn(self.LANDED, output.splitlines())
+
+    def test_status_shows_the_notice_while_every_ticket_has_landed(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        landed = self.afk("status").splitlines()
+        self.ticket("07-import", "Widget import")
+        reopened = self.afk("status").splitlines()
+
+        self.assertEqual(landed[-1], self.LANDED)
+        self.assertNotIn(self.LANDED, reopened)
 
 
 class ApprovedStartTest(AfkTestCase):
