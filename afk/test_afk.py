@@ -189,6 +189,13 @@ class LandingInitTest(AfkTestCase):
         self.assertIn("--target needs --land local", out.getvalue())
         self.assertFalse(self.project_dir.exists())
 
+    def test_local_landing_warns_when_the_repo_has_no_reviewers(self):
+        self.repo_config('base = "main"')
+
+        output = self.afk("init", str(self.scratch), "--land", "local")
+
+        self.assertIn(f"warning: no reviewers in {self.repo}", output)
+
     def test_view_shows_the_landing(self):
         self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
 
