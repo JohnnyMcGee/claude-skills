@@ -591,6 +591,8 @@ class Afk:
             if not seen.get("landed_notified"):
                 self.notify(landed)
                 seen["landed_notified"] = True
+        else:
+            seen.pop("landed_notified", None)  # a ticket added later reopens the project, to land again
         candidates = [t for t in seen["unblocked"] if t not in started]
         # A ticket that drops out, say blocked again, counts as newly unblocked when it returns.
         seen["notified"] = [t for t in seen.get("notified", []) if t in candidates]

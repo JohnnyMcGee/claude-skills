@@ -3806,6 +3806,21 @@ class ProjectLandedTest(AfkTestCase):
         _, later = self.tick()
         self.assertEqual(later, [])
 
+    def test_a_ticket_added_later_reopens_the_project_until_it_too_lands(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        self.tick()
+        self.ticket("07-import", "Widget import")
+
+        self.now += 60
+        output, reopened = self.tick()
+        self.ticket("07-import", "Widget import", status="done")
+        self.now += 60
+        _, landed = self.tick()
+
+        self.assertNotIn(f"afk: widgets {self.LANDED}", reopened)
+        self.assertNotIn(self.LANDED, output.splitlines())
+        self.assertEqual(landed, [f"afk: widgets {self.LANDED}"])
+
 
 class ApprovedStartTest(AfkTestCase):
     """Starting the tickets approved at Gate 1: within max_workers, with the user's corrections."""
