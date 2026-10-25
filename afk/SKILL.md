@@ -79,7 +79,7 @@ In local mode the human approves a worker's branch in its pane, and the worker l
 - the target isn't an ancestor of the branch: "target moved; merge it, re-run pre-PR, land again";
 - the target is checked out in a worktree with uncommitted changes to tracked files (often `main` in the clone), naming its path.
 
-Otherwise it builds one commit with the message and the branch's tree on top of the target, and moves the target to it by compare-and-swap (`git update-ref <ref> <new> <old>`). Of two workers landing at once, one wins and the other refuses with "target moved", leaving nothing changed. A clean worktree with the target checked out is fast-forwarded to it. An integration branch is then pushed (fast-forward only); base never is. A failed push notifies and doesn't undo the land. The worker's status records `ended = "landed"` and `landed_sha`.
+Otherwise it builds one commit with the message and the branch's tree on top of the target, and moves the target to it by compare-and-swap (`git update-ref <ref> <new> <old>`). Of two workers landing at once, one wins and the other refuses with "target moved", leaving nothing changed. A clean worktree with the target checked out is fast-forwarded to it, one land in a repo at a time. An integration branch is then pushed (fast-forward only); base never is. A failed push, or a checkout git won't update (say an untracked file is in the way), notifies and doesn't undo the land. The worker's status records `landed_sha` as soon as the target moves, so the land is never repeated, and `ended = "landed"` once it has finished, so the watcher never cleans up a worker mid-land.
 
 ## HITL tickets
 

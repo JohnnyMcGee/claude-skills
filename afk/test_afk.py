@@ -1,3 +1,4 @@
+import fnmatch
 import io
 import json
 import os
@@ -1055,13 +1056,23 @@ class LandingStartTest(AfkTestCase):
             "Bash(git push * widgets-v2)",
             "Bash(git push * HEAD:widgets-v2)",
             "Bash(git push * *:widgets-v2)",
-            "Bash(git update-ref *widgets-v2*)",
             "Bash(git checkout widgets-v2)",
             "Bash(git checkout * widgets-v2)",
             "Bash(git switch widgets-v2)",
             "Bash(git switch * widgets-v2)",
         ]:
             self.assertIn(rule, self.deny())
+
+    def test_a_local_mode_worker_is_denied_moving_its_target_but_not_a_branch_whose_name_holds_it(self):
+        self.afk("init", str(self.scratch), "--land", "local")
+
+        self.afk("start", "03")
+
+        denied = lambda command: any(fnmatch.fnmatchcase(f"Bash({command})", rule) for rule in self.deny())
+        self.assertTrue(denied("git update-ref refs/heads/main 3f2a9c1"))
+        self.assertTrue(denied("git update-ref -d refs/heads/main"))
+        self.assertFalse(denied("git update-ref refs/heads/afk/domain-03 3f2a9c1"))
+        self.assertFalse(denied("git update-ref refs/heads/maintenance 3f2a9c1"))
 
     def test_a_pr_mode_worker_is_denied_nothing_about_its_target_beyond_pushing_base(self):
         self.afk("init", str(self.scratch))

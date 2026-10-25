@@ -1370,7 +1370,8 @@ def worker_settings(base, target=None):
     pushes = lambda branch: [f"Bash(git push * {branch})", f"Bash(git push * HEAD:{branch})", f"Bash(git push * *:{branch})"]
     landing = [
         *(pushes(target) if target != base else []),
-        f"Bash(git update-ref *{target}*)",
+        f"Bash(git update-ref *refs/heads/{target})",
+        f"Bash(git update-ref *refs/heads/{target} *)",
         f"Bash(git checkout {target})",
         f"Bash(git checkout * {target})",
         f"Bash(git switch {target})",
