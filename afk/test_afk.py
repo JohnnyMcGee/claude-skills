@@ -380,8 +380,8 @@ class InitReposTest(GithubTestCase):
         output = self.afk("init", self.SPEC, "--land", "local")
 
         [warning] = [line for line in output.splitlines() if "reviewers" in line]
-        self.assertIn(str(web), warning)
-        self.assertIn(str(api), warning)
+        self.assertIn("acme/web", warning)
+        self.assertIn("acme/api", warning)
         self.assertNotIn(str(self.repo), warning)
 
     def test_reinit_without_a_spec_refreshes_repos_and_keeps_limits_overrides_and_hand_added_repos(self):

@@ -105,7 +105,8 @@ class Afk:
             self.out(f"  {name}  {clone}")
         clones = {c: reduce(deep_merge, [*repo_config_layers(Path(c)), config.get("overrides", {})], {})
                   for c in dict.fromkeys([str(repo), *repos.values()])}
-        unreviewed = [c for c, repo_config in clones.items() if not repo_config.get("reviewers")]
+        names = {**{c: c for c in clones}, **{c: name for name, c in repos.items()}}  # owner/name where known
+        unreviewed = [names[c] for c, repo_config in clones.items() if not repo_config.get("reviewers")]
         if landing and unreviewed:
             self.out(f"warning: no reviewers in {', '.join(unreviewed)}, so critique there is a code-review subagent; "
                      f"run /afk-setup in each to add them")
