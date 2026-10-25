@@ -13,4 +13,4 @@ When the human asks you to land the branch ("land it", "ship it"), their request
 
 When it's unclear whether they're asking you to land, ask, and don't land.
 
-The human may open a PR from this branch against `{{target}}` instead. When it is merged or closed, the worker is cleaned up. Closing the ticket ends it too, but while the branch has commits of its own, its cleanup waits on them, so work worth keeping should land first.
+The human may open a PR from this branch against `{{target}}` instead. When it is merged or closed, the worker is cleaned up. Closing the ticket ends it too, but while the branch has commits of its own, its cleanup waits on them, so work worth keeping should land first. Work that won't land is the human's to abandon, from the project's session, with `afk drop {{ticket}} --discard`; never run it yourself.
