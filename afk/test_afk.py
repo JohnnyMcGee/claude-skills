@@ -1543,11 +1543,15 @@ class WorkerStatusTest(AfkTestCase):
         self.assertEqual(self.status_rows()[0], ["03", "implement", "done", "Finished"])
 
 
-class WatchTest(AfkTestCase):
+class WorkerTestCase(AfkTestCase):
+    """A project with worker 03 started, init'd with INIT's extra arguments, and helpers to act as it."""
+
+    INIT = ()
+
     def setUp(self):
         super().setUp()
         self.ticket("03-ui", "Widget UI")
-        self.afk("init", str(self.scratch))
+        self.afk("init", str(self.scratch), *self.INIT)
         self.run_fake.responses[("tmux", "split-window")] = "%6\n"  # the worker's shell pane
         self.afk("start", "03")
         self.calls_before = len(self.run_fake.calls)
@@ -1603,6 +1607,8 @@ class WatchTest(AfkTestCase):
         self.stop()
         self.afk("tick")
 
+
+class WatchTest(WorkerTestCase):
     def test_done_report_then_stop_advances_to_verify_and_sends_its_prompt(self):
         self.report("done", "Implemented")
         self.stop()
@@ -2778,6 +2784,55 @@ class WatchTest(AfkTestCase):
         self.assertFalse((self.project_dir / "workers" / "04").exists())
         self.assertIn("04 ticket closed and cleaned up", self.desktop_notifications()[-1])
         self.assertIn("**Status:** closed", path.read_text())  # the tracker already has it as closed
+
+
+class LocalLandingWatchTest(WorkerTestCase):
+    INIT = ("--land", "local", "--target", "widgets-v2")
+
+    def test_each_done_phase_advances_to_the_next_skipping_pr(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        self.assertEqual(self.phase(), "review")
+        self.assertEqual(self.status()["state"], "review")
+        self.assertEqual(
+            [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()],
+            ["AFK phase: verify", "AFK phase: prepr", "AFK phase: review"],
+        )
+
+    def test_a_worker_in_review_is_never_looked_up_on_github(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        for _ in range(3):
+            self.now += afk.PR_POLL_SECONDS
+            self.afk("tick")
+
+        self.assertEqual(self.run_fake.find("gh", "pr", "view"), [])
+        self.assertEqual(self.status()["state"], "review")
+
+    def test_a_worker_in_review_whose_ticket_is_closed_ends_without_a_pr(self):
+        for _ in range(3):
+            self.finish_phase()
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+        self.run_fake.responses[("git", "-C", str(self.project_dir / "worktrees" / "03"), "log")] = "abc1234 Widget UI\n"
+        path = self.scratch / "issues" / "03-ui.md"
+        path.write_text(path.read_text().replace("**Status:** ready-for-agent", "**Status:** closed"))
+
+        self.afk("tick")
+
+        self.assertEqual(self.run_fake.find("gh", "pr", "view"), [])
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertEqual(self.status()["ended"], "ticket closed")
+
+    def test_a_hitl_workers_pr_is_still_found_by_its_branch(self):
+        self.ticket("04-spike", "Widget spike", type="hitl")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.afk("start", "04")
+
+        self.afk("tick")
+
+        self.assertEqual([c[3] for c in self.run_fake.find("gh", "pr", "view")], ["afk/widgets-04"])
 
 
 class LimitsTest(unittest.TestCase):

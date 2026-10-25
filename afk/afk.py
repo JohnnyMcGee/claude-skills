@@ -438,11 +438,14 @@ class Afk:
                 try:
                     pr_state = pr_url = None
                     pr_ready = ticket_closed = False
-                    if before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
-                        pr_state, pr_url, pr_ready = self.pr_state(before)
+                    polled = before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS
+                    if polled:
+                        # A local-mode worker never opens a PR, but the human may open one for a hitl ticket.
+                        if before["phase"] == "hitl" or before.get("landing", "pr") == "pr":
+                            pr_state, pr_url, pr_ready = self.pr_state(before)
                         ticket = self.find_ticket(before["ticket"])
                         ticket_closed = bool(ticket and ticket.done)
-                    given.update(pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
+                    given.update(polled=polled, pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
                     ended = ending(before, pr_state, ticket_closed)
                     blocker = self.cleanup_blocker(before, ended) if ended else None
                     status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
@@ -731,7 +734,8 @@ LANDING_MODES = ("pr", "local")
 # Runaway limits; a project's config.toml [limits] table overrides any of them.
 LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
 
-PHASES = ("implement", "verify", "prepr", "pr", "review")
+# Each landing mode's phases: a local-mode worker never opens a PR.
+PHASES = {"pr": ("implement", "verify", "prepr", "pr", "review"), "local": ("implement", "verify", "prepr", "review")}
 
 PR_POLL_SECONDS = 60
 NO_PR = "no PR found for its branch"
@@ -788,11 +792,12 @@ def ending(status, pr_state, ticket_closed=False):
 
 
 def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None,
-         pr_state=None, pr_url=None, pr_ready=False, ticket_closed=False, cleanup_blocker=None):
+         polled=False, pr_state=None, pr_url=None, pr_ready=False, ticket_closed=False, cleanup_blocker=None):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
+    polled says this tick polled GitHub and the tracker for the worker, as it does about once a minute.
     pr_state is GitHub's state for the worker's PR when this tick polled it, else None; pr_url is the PR's URL, if any.
     pr_ready says the polled PR carries READY_LABEL.
     ticket_closed says the tracker, polled with the PR, has the worker's ticket closed.
@@ -805,7 +810,7 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
             ("cleanup", ticket, status["pane"], ended),
             ("notify", f"{ticket} {ended} and cleaned up; run `/afk next` to propose the next batch"),
         ]
-    if pr_state is not None:
+    if polled:
         status = {**status, "pr_polled_at": now}
     if pr_url:
         status = {**status, "pr": pr_url}
@@ -866,7 +871,8 @@ def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=Non
                 return {**status, "state": "stuck", "message": reason, "fix_loops": 0}, [("notify", f"{ticket} stuck: {reason}")]
             status = {**status, "state": "review", "fix_loops": loops}
             return status, [("notify", f"{ticket} addressed review feedback: {message}")]
-        phase = PHASES[PHASES.index(phase) + 1]
+        phases = PHASES[status.get("landing", "pr")]  # workers started before landing modes landed by PR
+        phase = phases[phases.index(phase) + 1]
         if phase == "verify" and not may_verify:
             # Stays in its finished phase, so if it needs attention while queued, done still leads to verify.
             return {**status, "state": "queued", "queued_at": now}, []
