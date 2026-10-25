@@ -10,6 +10,7 @@ bootstrap = ["npm ci", "make db"]
 port_base = 4000
 verify_concurrency = 1
 default_type = "backend"
+reviewers = ["coderabbit review --plain --base {{target}}"]
 
 [task_types.backend]
 agent = "claude"
@@ -35,7 +36,7 @@ Run `/pre-pr` …
 …
 ```
 
-`/afk-setup` writes this file. `afk check [<repo>]` validates it as `afk start` will read it (with `afk.local.md` merged in) and warns about missing prose sections; `afk trial [<repo>]` proves it by creating a scratch worktree on branch `afk/trial`, copying files and running bootstrap on slot 9, and `afk trial --teardown` removes it.
+`/afk-setup` writes this file. `afk check [<repo>]` validates it as `afk start` will read it (with `afk.local.md` merged in) and warns about missing prose sections and reviewers whose binary isn't on PATH; `afk trial [<repo>]` proves it by creating a scratch worktree on branch `afk/trial`, copying files and running bootstrap on slot 9, and `afk trial --teardown` removes it.
 
 ## Frontmatter keys
 
@@ -49,6 +50,7 @@ Every key is optional.
 | `port_base` | `4000` | Worker slot `n` gets `AFK_PORT_BASE = port_base + 100·n`. |
 | `verify_concurrency` | unlimited | Most workers in the verify phase at once. Set `1` when dev environments can't be isolated. Extra workers wait with state `queued`, first come first served. |
 | `default_type` | none | Task type for tickets without a `Type:` line. |
+| `reviewers` | `[]` | Shell commands that review the branch in a local-mode project's critique phase: see [Reviewers](#reviewers). |
 | `task_types.<name>` | | How a ticket of this type is launched: see below. |
 
 A task type's keys:
@@ -93,6 +95,12 @@ Later layers win, key by key, so an override only needs the fields it changes:
 ## Target branch
 
 A project in local landing mode (`afk init <spec> --land local`, see [SKILL.md](SKILL.md#landing-mode)) lands each ticket on its target branch, and its worktrees branch from the target instead of `base`. Without `--target`, the target is each repo's `base`. With `--target <branch>`, it is that integration branch in every repo of the project: `afk init` creates it from each clone's `base` where it doesn't exist yet. The target is the project's, stored under `[landing]` in its `config.toml`, not the repo's.
+
+## Reviewers
+
+A project in local landing mode opens no PR, so no bot reviews its work. Its critique phase stands in for them (see [SKILL.md](SKILL.md#phases)): the worker runs each `reviewers` command from the worktree root over `git diff <target>...HEAD`, with `{{target}}` filled in, and fixes what they find. Write each command to review that diff headless and print its findings, as in the example above.
+
+A reviewer whose binary isn't on PATH is skipped and named in the worker's report; `afk check` warns about it. When none runs, because none is configured or all are missing, critique is a code-review subagent. pr mode ignores the key.
 
 ## Repos
 

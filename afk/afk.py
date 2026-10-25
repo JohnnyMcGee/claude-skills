@@ -283,7 +283,8 @@ class Afk:
     def cmd_check(self, repo=None):
         """Validate a repo's docs/agents/afk.md (plus afk.local.md) against what `afk start` reads."""
         repo = Path(repo or self.run(["git", "rev-parse", "--show-toplevel"]).strip()).resolve()
-        errors, warnings = check_repo_config(repo, self.branch_exists)
+        which = lambda binary: shutil.which(binary, path=self.env.get("PATH", os.defpath))
+        errors, warnings = check_repo_config(repo, self.branch_exists, which)
         for warning in warnings:
             self.out(f"warning: {warning}")
         for error in errors:
@@ -671,14 +672,17 @@ class Afk:
     def phase_prompt(self, ticket_id, phase, clone, landing="pr", target=None):
         """The phase's prompt for the worker's landing mode: phase-<phase>-<landing>.md where the mode has its own."""
         ticket = self.tracker().get(ticket_id)
-        base = self.repo_config(clone).get("base", "main")
+        repo_config = self.repo_config(clone)
+        base = repo_config.get("base", "main")
+        target = target or base
         template = SKILL_DIR / f"phase-{phase}-{landing}.md"
         return render(
             template if template.is_file() else SKILL_DIR / f"phase-{phase}.md",
             ticket=ticket.id,
             ticket_path=ticket.path,
             base=base,
-            target=target or base,
+            target=target,
+            reviewers=reviewer_list(repo_config.get("reviewers", []), target),
         )
 
     def first_prompt(self, ticket, phase, task_type, clone, landing="pr", target=None):
@@ -828,10 +832,13 @@ INIT_OPTIONS = ("--land", "--target")
 LANDING_MODES = ("pr", "local")
 
 # Runaway limits; a project's config.toml [limits] table overrides any of them.
-LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
+LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3, "critique_rounds": 3}
 
-# Each landing mode's phases: a local-mode worker never opens a PR.
-PHASES = {"pr": ("implement", "verify", "prepr", "pr", "review"), "local": ("implement", "verify", "prepr", "review")}
+# Marks a critique round's done report: it fixed findings, so the fixes need a round of their own.
+CRITIQUE_ROUND = "round:"
+
+# Each landing mode's phases: a local-mode worker never opens a PR, so its reviewer CLIs critique the branch instead.
+PHASES = {"pr": ("implement", "verify", "prepr", "pr", "review"), "local": ("implement", "verify", "prepr", "critique", "review")}
 
 PR_POLL_SECONDS = 60
 NO_PR = "no PR found for its branch"
@@ -855,6 +862,7 @@ REPO_KEYS = {
     "verify_concurrency": (int, "an integer of at least 1"),
     "default_type": (str, "a string"),
     "task_types": (dict, "a table of task types"),
+    "reviewers": (list, "a list of strings"),
 }
 TASK_TYPE_KEYS = ("agent", "model", "effort", "skill", "prompt")
 
@@ -972,6 +980,14 @@ def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=Non
                 return {**status, "state": "stuck", "message": reason, "fix_loops": 0}, [("notify", f"{ticket} stuck: {reason}")]
             status = {**status, "state": "review", "fix_loops": loops}
             return status, [("notify", f"{ticket} addressed review feedback: {message}")]
+        if phase == "critique" and message.startswith(CRITIQUE_ROUND):
+            rounds = status.get("critique_rounds", 0) + 1
+            if rounds >= limits["critique_rounds"]:
+                # As with fix loops, it has already stopped, and counting restarts for after the human has looked.
+                reason = f"still fixing after {limits['critique_rounds']} critique rounds"
+                return {**status, "state": "stuck", "message": reason, "critique_rounds": 0}, [("notify", f"{ticket} stuck: {reason}")]
+            status = {**status, "state": "working", "message": "", "idle": False, "phase_started_at": now, "critique_rounds": rounds}
+            return status, [("prompt", ticket, status["pane"], "critique")]
         phases = PHASES[status.get("landing", "pr")]  # workers started before landing modes landed by PR
         phase = phases[phases.index(phase) + 1]
         if phase == "verify" and not may_verify:
@@ -1308,6 +1324,13 @@ def launch_choices(ticket, default_type, task_types, corrections):
     return {**choices, **{k: v for k, v in corrections.items() if k != "type"}}
 
 
+def reviewer_list(reviewers, target):
+    """The critique prompt's list of the repo's reviewer commands, each with its {{target}} filled in."""
+    if not reviewers:
+        return "No reviewers are configured, so a code-review subagent is the critique."
+    return "\n".join(f"- `{command.replace('{{target}}', shlex.quote(target))}`" for command in reviewers)
+
+
 def slug(title):
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
 
@@ -1389,8 +1412,8 @@ def repo_config_layers(repo):
     return [frontmatter(p.read_text()) for p in (docs / "afk.md", docs / "afk.local.md") if p.is_file()]
 
 
-def check_repo_config(repo, branch_exists):
-    """(errors, warnings) for a repo's AFK config, as `afk start` would read it."""
+def check_repo_config(repo, branch_exists, which):
+    """(errors, warnings) for a repo's AFK config, as `afk start` would read it; which(binary) finds one on PATH."""
     docs = repo / "docs" / "agents"
     main = docs / "afk.md"
     if not main.is_file():
@@ -1443,6 +1466,18 @@ def check_repo_config(repo, branch_exists):
         for name in config["copy"]:
             if isinstance(name, str) and not (repo / name).is_file():
                 errors.append(f"copy: {name} not found in {repo}")
+    if isinstance(config.get("reviewers"), list):
+        # Critique skips a missing reviewer rather than failing, so a missing binary is a warning.
+        for command in (c for c in config["reviewers"] if isinstance(c, str)):
+            try:
+                binary = next((word for word in shlex.split(command) if not re.match(r"\w+=", word)), None)
+            except ValueError as error:
+                errors.append(f"reviewer `{command}`: {error}")
+                continue
+            if binary is None:
+                errors.append(f"reviewer `{command}` names no command")
+            elif not which(binary):
+                warnings.append(f"reviewer `{command}`: {binary} is not on PATH, so critique will skip it")
     base = config.get("base", "main")
     if isinstance(base, str) and not branch_exists(repo, base):
         errors.append(f"base branch '{base}' does not exist in {repo}")

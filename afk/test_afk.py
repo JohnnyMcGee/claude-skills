@@ -1294,6 +1294,40 @@ class CheckTest(AfkTestCase):
         self.assertEqual(code, 1)
         self.assertIn("base branch 'develop' does not exist", out)
 
+    def test_reviewers_must_be_a_list_of_commands(self):
+        self.repo_config('reviewers = "coderabbit review"', body=PROSE)
+
+        code, out = self.check()
+
+        self.assertEqual(code, 1)
+        self.assertIn("'reviewers' must be a list of strings", out)
+
+    def test_a_reviewer_that_is_not_a_runnable_command_is_an_error(self):
+        self.repo_config('reviewers = ["copilot -p \'unbalanced", "", "FOO=1"]', body=PROSE)
+
+        code, out = self.check()
+
+        self.assertEqual(code, 1)
+        self.assertIn("reviewer `copilot -p 'unbalanced`: No closing quotation", out)
+        self.assertIn("reviewer `` names no command", out)
+        self.assertIn("reviewer `FOO=1` names no command", out)
+
+    def test_a_reviewer_whose_binary_is_not_on_path_warns_without_failing(self):
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "coderabbit").write_text("#!/bin/sh\n")
+        (bin_dir / "coderabbit").chmod(0o755)
+        self.env["PATH"] = str(bin_dir)
+        self.repo_config(
+            'reviewers = ["coderabbit review --base {{target}} --plain", "copilot -p \'review the diff\'"]', body=PROSE
+        )
+
+        code, out = self.check()
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("warning: reviewer `copilot -p 'review the diff'`: copilot is not on PATH", out)
+        self.assertNotIn("coderabbit is not on PATH", out)
+
     def test_missing_prose_sections_warn_without_failing(self):
         self.repo_config('base = "main"', body="# AFK\n\n## Dev server\n\n`npm run dev`\n")
 
@@ -2902,15 +2936,15 @@ class WatchTest(WorkerTestCase):
 class LocalLandingWatchTest(WorkerTestCase):
     INIT = ("--land", "local", "--target", "widgets-v2")
 
-    def test_each_done_phase_advances_to_the_next_skipping_pr(self):
-        for _ in range(3):
+    def test_each_done_phase_advances_to_the_next_critiquing_instead_of_opening_a_pr(self):
+        for _ in range(4):
             self.finish_phase()
 
         self.assertEqual(self.phase(), "review")
         self.assertEqual(self.status()["state"], "review")
         self.assertEqual(
             [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()],
-            ["AFK phase: verify", "AFK phase: prepr", "AFK phase: review"],
+            ["AFK phase: verify", "AFK phase: prepr", "AFK phase: critique", "AFK phase: review"],
         )
 
     def test_prepr_checks_for_merge_conflicts_against_the_local_target(self):
@@ -2925,25 +2959,67 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertNotIn("{{", prepr)
 
     def test_reaching_review_notifies_that_the_branch_is_ready(self):
-        for _ in range(3):
+        for _ in range(4):
             self.finish_phase()
 
         self.assertIn("03 branch ready for review", self.desktop_notifications()[-1])
         self.assertNotIn("PR", self.desktop_notifications()[-1])
 
-    def test_the_review_prompt_lands_on_approval_and_never_pushes(self):
+    def test_critique_runs_each_of_the_repos_reviewers_over_the_diff_against_the_target(self):
+        self.repo_config('reviewers = ["coderabbit review --base {{target}} --plain", "copilot -p \'review git diff {{target}}...HEAD\'"]')
         for _ in range(3):
+            self.finish_phase()
+
+        critique = self.prompts_sent()[-1]
+        self.assertTrue(critique.startswith("AFK phase: critique"), critique)
+        self.assertIn("`coderabbit review --base widgets-v2 --plain`", critique)
+        self.assertIn("`copilot -p 'review git diff widgets-v2...HEAD'`", critique)
+        self.assertIn("git diff widgets-v2...HEAD", critique)
+        self.assertNotIn("{{", critique)
+
+    def test_critique_without_reviewers_is_a_code_review_subagent(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        critique = self.prompts_sent()[-1]
+        self.assertIn("No reviewers are configured", critique)
+        self.assertIn("code-review subagent", critique)
+        self.assertNotIn("{{", critique)
+
+    def test_a_critique_round_that_fixed_findings_is_followed_by_another_until_one_finds_nothing(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        self.finish_phase("round: fixed a missing null check")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("critique", "working"))
+        self.assertTrue(self.prompts_sent()[-1].startswith("AFK phase: critique"))
+
+        self.finish_phase("Critique clean; rejected 2 findings")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+        self.assertEqual(
+            [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()][-3:],
+            ["AFK phase: critique", "AFK phase: critique", "AFK phase: review"],
+        )
+
+    def test_the_review_prompt_critiques_feedback_fixes_and_lands_on_approval_without_pushing(self):
+        self.repo_config('reviewers = ["coderabbit review --base {{target}} --plain"]')
+        for _ in range(4):
             self.finish_phase()
 
         review = self.prompts_sent()[-1]
         self.assertTrue(review.startswith("AFK phase: review"), review)
-        for instruction in ["git merge widgets-v2", "afk report done", "Ticket: 03", 'afk land "', "type(scope): summary"]:
-            self.assertIn(instruction, review)
-        self.assertNotIn("Push", review)
+        self.assertIn("`coderabbit review --base widgets-v2 --plain`", review)
+        self.assertIn("git merge widgets-v2", review)
+        self.assertIn('afk land "', review)
+        self.assertIn("Ticket: 03", review)
+        self.assertIn("Never push", review)
+        self.assertNotIn("origin/", review)
         self.assertNotIn("{{", review)
 
     def test_a_worker_in_review_is_never_looked_up_on_github(self):
-        for _ in range(3):
+        for _ in range(4):
             self.finish_phase()
 
         for _ in range(3):
@@ -2954,7 +3030,7 @@ class LocalLandingWatchTest(WorkerTestCase):
         self.assertEqual(self.status()["state"], "review")
 
     def test_a_worker_in_review_whose_ticket_is_closed_ends_without_a_pr_until_it_is_reopened(self):
-        for _ in range(3):
+        for _ in range(4):
             self.finish_phase()
         self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
         self.run_fake.responses[("git", "-C", str(self.project_dir / "worktrees" / "03"), "log")] = "abc1234 Widget UI\n"
@@ -3411,6 +3487,41 @@ class LimitsTest(unittest.TestCase):
         status, _ = self.review_round(status, now=4)
 
         self.assertEqual(status["state"], "review")
+
+    def critique_round(self, status, now, message="round: fixed a finding"):
+        """The worker finishes a critique round, reports done and stops."""
+        return afk.tick("03", {**status, "state": "done", "message": message, "idle": True}, now,
+                        limits={**self.limits, "critique_rounds": 2})
+
+    def test_critique_rounds_past_the_limit_are_marked_stuck_and_notified(self):
+        status, effects = self.critique_round(self.worker(phase="critique", landing="local"), now=1)
+        self.assertEqual((status["phase"], status["state"]), ("critique", "working"))
+        self.assertIn(("prompt", "03", "%5", "critique"), effects)
+
+        status, effects = self.critique_round(status, now=3)
+
+        self.assertEqual((status["phase"], status["state"]), ("critique", "stuck"))
+        self.assertIn("still fixing after 2 critique rounds", status["message"])
+        [(_, notification)] = [e for e in effects if e[0] == "notify"]
+        self.assertIn("stuck", notification)
+        self.assertFalse([e for e in effects if e[0] in ("prompt", "interrupt")])
+
+    def test_a_worker_stuck_on_critique_rounds_gets_more_rounds_after_the_human_looks(self):
+        status = self.worker(phase="critique", landing="local")
+        for round in range(2):
+            status, _ = self.critique_round(status, now=round)
+        self.assertEqual(status["state"], "stuck")
+
+        status, effects = self.critique_round({**status, "state": "working"}, now=4)
+
+        self.assertEqual((status["phase"], status["state"]), ("critique", "working"))
+        self.assertIn(("prompt", "03", "%5", "critique"), effects)
+
+    def test_a_critique_round_that_finds_nothing_to_fix_moves_on_to_review(self):
+        status, effects = self.critique_round(self.worker(phase="critique", landing="local"), now=1, message="Clean")
+
+        self.assertEqual((status["phase"], status["state"]), ("review", "review"))
+        self.assertIn(("prompt", "03", "%5", "review"), effects)
 
 
 class NextTest(AfkTestCase):
