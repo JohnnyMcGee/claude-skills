@@ -25,7 +25,7 @@ watchlist = ["#incidents", "#deploys"]
 # Gmail, Calendar and Meetings read this account. Profiles naming the same account share one sweep of each.
 account = "me@acme.example"
 # Declining a meeting my manager organizes or attends is never proposed.
-manager = "boss@acme.example"
+manager = "mo@acme.example"
 # Noise mail is filed under this label as it is archived. Create it in Gmail first: triage cannot create labels.
 noise_label = "Noise"
 
@@ -38,12 +38,25 @@ channels = ["#widgets"]
 senders = ["@acme.example"]
 
 [urgency]
-people = ["my-manager"]
+# The only things that interrupt me (proc notify). Everything else waits for the brief.
+# A DM or a mention from these people, by the name each source shows (Slack and Linear name, GitHub login), any case.
+people = ["Mo", "mo-acme"]
+# A mention of me in these Slack channels (glob patterns allowed). Other messages there are not urgent.
+channels = ["#incidents", "#incident-*"]
+# A review request whose PR carries one of these labels.
 labels = ["deploy-blocking"]
 
 [autonomy]
 # Action types promoted from draft to silent, one at a time, once they have been right 10+ times in a row.
 silent = []
+
+[afk]
+# A Todo ticket is trivial enough for an AFK worker when it has one of these estimates or labels, none of the excluded
+# labels, and nothing blocking it. Approved AFK launches run at most max_workers at a time, each opening a draft PR.
+estimates = ["XS", "S"]
+labels = ["Cleanup", "Technical Debt"]
+exclude_labels = ["Decompose", "Needs Design"]
+max_workers = 2
 
 [phases.sweep-github]
 model = "sonnet"
@@ -151,9 +164,25 @@ allowed_tools = [
   "mcp__claude_ai_Google_Calendar__get_event",
 ]
 
+# Next work: read-only, like a sweeper. `process next` ranks what it reads and queues promotions and AFK launches.
+[phases.next-work]
+model = "opus"
+allowed_tools = [
+  "Read",
+  "Bash(date -u:*)",
+  "Bash(process profile:*)",
+  "Bash(process next:*)",
+  "mcp__linear-server__get_user",
+  "mcp__linear-server__list_issues",
+  "mcp__linear-server__get_issue",
+  "mcp__linear-server__get_project",
+]
+
 # The executor: the only phase that may send, and only what I approved (or promoted to silent). It sends and pushes
 # through `process execute` steps, which post exactly the approved text and check the PR is mine, so it holds no GitHub
 # write tool. Each step is named: a bare `process execute` would start a second executor. It reads only its worktree.
+# Its one Linear write moves a ticket whose promotion I approved from Backlog to Todo. AFK launches need no tool here:
+# `process execute` writes the afk spec and starts the worker itself.
 [phases.execute]
 model = "opus"
 allowed_tools = [
@@ -166,6 +195,9 @@ allowed_tools = [
   "Bash(process execute push:*)",
   "Bash(process execute result:*)",
   "mcp__github__pull_request_read",
+  "mcp__linear-server__get_issue",
+  "mcp__linear-server__list_issue_statuses",
+  "mcp__linear-server__save_issue",
 ]
 +++
 
@@ -182,9 +214,11 @@ Free text the sweepers and triage read before every run: what matters on this pr
 - **Slack asks.** An immediate ask (do X today, can you look at Y) becomes a ticket; a question gets a drafted reply. `#incidents` matters even without a mention.
 - **Gmail noise.** Vendor newsletters and CI notification mail are noise. Mail from people at acme.example never is.
 - **Meetings.** Only the Widgets standup and planning meetings have Gemini notes worth reading.
+- **Next work.** Note here which Linear projects or labels matter most this cycle, so ties in the ranking read right.
 - **Volume.** Note the usual daily volume here, so a sweep that finds far more than that is a sign it is re-reading old items.
 
 ## Changelog
 
 - 2026-10-20 — Created with the GitHub and Linear sources.
 - 2026-10-20 — Added the Slack, Gmail, Calendar and Meetings sources.
+- 2026-10-20 — Added next-work and AFK rules.

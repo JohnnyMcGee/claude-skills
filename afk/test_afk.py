@@ -1,3 +1,4 @@
+import fnmatch
 import io
 import json
 import os
@@ -133,6 +134,110 @@ class InitTest(AfkTestCase):
         )
 
 
+class LandingInitTest(AfkTestCase):
+    def config(self):
+        return tomllib.loads((self.project_dir / "config.toml").read_text())
+
+    def test_init_with_local_landing_records_the_mode_and_target(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.assertEqual(self.config()["landing"], {"mode": "local", "target": "widgets-v2"})
+
+    def test_init_without_flags_lands_by_pr_as_before(self):
+        self.afk("init", str(self.scratch))
+
+        self.assertNotIn("landing", self.config())
+
+    def test_an_unknown_landing_mode_fails_before_anything_is_written(self):
+        out = io.StringIO()
+
+        code = afk.main(["init", str(self.scratch), "--land", "yolo"], run=self.run_fake, env=self.env,
+                        stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("unknown landing mode 'yolo'", out.getvalue())
+        self.assertFalse(self.project_dir.exists())
+        self.assertEqual(self.run_fake.find("tmux", "set-option"), [])
+
+    def test_reinit_without_arguments_keeps_the_landing(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("init")
+
+        self.assertEqual(self.config()["landing"], {"mode": "local", "target": "widgets-v2"})
+
+    def test_reinit_with_a_new_target_keeps_local_landing(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("init", "--target", "widgets-v3")
+
+        self.assertEqual(self.config()["landing"], {"mode": "local", "target": "widgets-v3"})
+
+    def test_reinit_with_pr_landing_drops_the_landing(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("init", "--land", "pr")
+
+        self.assertNotIn("landing", self.config())
+
+    def test_a_target_without_local_landing_fails_before_anything_is_written(self):
+        out = io.StringIO()
+
+        code = afk.main(["init", str(self.scratch), "--target", "widgets-v2"], run=self.run_fake, env=self.env,
+                        stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("--target needs --land local", out.getvalue())
+        self.assertFalse(self.project_dir.exists())
+
+    def test_local_landing_warns_when_the_repo_has_no_reviewers(self):
+        self.repo_config('base = "main"')
+
+        output = self.afk("init", str(self.scratch), "--land", "local")
+
+        self.assertIn(f"warning: no reviewers in {self.repo}", output)
+
+    def test_local_landing_is_quiet_about_a_repo_with_reviewers(self):
+        self.repo_config('reviewers = ["copilot -p \'review git diff {{target}}...HEAD\'"]')
+
+        output = self.afk("init", str(self.scratch), "--land", "local")
+
+        self.assertNotIn("reviewers", output)
+
+    def test_pr_landing_does_not_ask_for_reviewers(self):
+        self.repo_config('base = "main"')
+
+        output = self.afk("init", str(self.scratch))
+
+        self.assertNotIn("reviewers", output)
+
+    def test_pr_landing_does_not_read_the_repo_config(self):
+        self.repo_config('base = "main"')
+        self.repo_config("base = ", name="afk.local.md")
+
+        output = self.afk("init", str(self.scratch))
+
+        self.assertIn("bound to tmux session", output)
+
+    def test_view_shows_the_landing(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.assertEqual(tomllib.loads(self.afk("view"))["landing"], {"mode": "local", "target": "widgets-v2"})
+
+
+class ViewTest(AfkTestCase):
+    def test_view_shows_the_current_project_config_and_its_path(self):
+        self.afk("init", str(self.scratch))
+        path = self.project_dir / "config.toml"
+        with path.open("a") as config:
+            config.write("\n[limits]\nmax_workers = 5\n")
+
+        out = self.afk("view")
+
+        self.assertEqual(out.splitlines()[0], f"# {path}")
+        self.assertEqual(tomllib.loads(out), tomllib.loads(path.read_text()))
+
+
 class GithubTestCase(AfkTestCase):
     """A project whose spec is GitHub issue acme/widgets#2 and whose tickets are its sub-issues, all via faked `gh`."""
 
@@ -178,6 +283,11 @@ class GithubTestCase(AfkTestCase):
             "repository_url": f"https://api.github.com/repos/{repo}",
         }
 
+    def clone(self, path, remote):
+        (path / ".git").mkdir(parents=True)
+        self.run_fake.responses[("git", "-C", str(path), "remote", "-v")] = f"origin\t{remote} (fetch)\norigin\t{remote} (push)\n"
+        return path
+
     @property
     def project_dir(self):
         return self.state_home / "afk" / "widgets-2"
@@ -197,13 +307,45 @@ class GithubInitTest(GithubTestCase):
         )
 
 
+class IntegrationBranchTest(GithubTestCase):
+    """init in local mode creates a missing integration branch from each clone's base, under the same name."""
+
+    def missing(self, clone, branch):
+        def rev_parse(cmd):
+            if cmd[-1] == f"{branch}^{{commit}}":
+                raise subprocess.CalledProcessError(1, cmd)
+            return ""
+
+        self.run_fake.responses[("git", "-C", str(clone), "rev-parse")] = rev_parse
+
+    def branches_created(self):
+        return [(c[2], c[4:]) for c in self.run_fake.find("git", "-C") if c[3] == "branch"]
+
+    def test_a_missing_integration_branch_is_created_from_base_in_every_clone_and_an_existing_one_left_alone(self):
+        api = self.clone(self.repo / "api", "https://github.com/acme/api")
+        web = self.clone(self.repo / "web", "https://github.com/acme/web")
+        (api / "docs" / "agents").mkdir(parents=True)
+        (api / "docs" / "agents" / "afk.md").write_text('+++\nbase = "develop"\n+++\n')
+        self.issue(4, "Widget endpoints", repo="acme/api")
+        self.issue(5, "Widget page", repo="acme/web")
+        self.missing(self.repo, "widgets-v2")
+        self.missing(api, "widgets-v2")
+
+        self.afk("init", self.SPEC, "--land", "local", "--target", "widgets-v2")
+
+        self.assertEqual(self.branches_created(), [(str(self.repo), ["widgets-v2", "main"]), (str(api), ["widgets-v2", "develop"])])
+
+    def test_a_project_landing_on_base_creates_no_branch(self):
+        self.missing(self.repo, "main")
+
+        self.afk("init", self.SPEC, "--land", "local")
+        self.afk("init", self.SPEC, "--land", "local", "--target", "main")
+
+        self.assertEqual(self.branches_created(), [])
+
+
 class InitReposTest(GithubTestCase):
     """init finds the clones of the repos the sub-issues live in, and re-running it refreshes the project."""
-
-    def clone(self, path, remote):
-        (path / ".git").mkdir(parents=True)
-        self.run_fake.responses[("git", "-C", str(path), "remote", "-v")] = f"origin\t{remote} (fetch)\norigin\t{remote} (push)\n"
-        return path
 
     def config(self):
         return tomllib.loads((self.project_dir / "config.toml").read_text())
@@ -234,6 +376,29 @@ class InitReposTest(GithubTestCase):
 
         self.assertNotIn("repos", self.config())
         self.assertIn("no local clone of acme/web", output)
+
+    def test_local_landing_names_only_the_repos_with_no_reviewers(self):
+        self.repo_config('reviewers = ["coderabbit review --plain --base {{target}}"]')
+        web = self.clone(self.tmp / "web", "git@github.com:acme/web.git")
+        api = self.clone(self.tmp / "api", "git@github.com:acme/api.git")
+        (web / "docs" / "agents").mkdir(parents=True)
+        (web / "docs" / "agents" / "afk.md").write_text('+++\nbase = "main"\n+++\n')
+        self.issue(4, "Widget page", repo="acme/web")
+        self.issue(5, "Widget endpoints", repo="acme/api")
+
+        output = self.afk("init", self.SPEC, "--land", "local")
+
+        [warning] = [line for line in output.splitlines() if "reviewers" in line]
+        self.assertIn("acme/web", warning)
+        self.assertIn("acme/api", warning)
+        self.assertNotIn(str(self.repo), warning)
+
+    def test_local_landing_names_the_spec_repo_by_owner_and_name(self):
+        self.issue(4, "Widget page")
+
+        output = self.afk("init", self.SPEC, "--land", "local")
+
+        self.assertIn("warning: no reviewers in acme/widgets,", output)
 
     def test_reinit_without_a_spec_refreshes_repos_and_keeps_limits_overrides_and_hand_added_repos(self):
         self.afk("init", self.SPEC)
@@ -545,7 +710,7 @@ class GithubStartTest(GithubTestCase):
         self.afk("tick")
 
         worktree = str(self.project_dir / "worktrees" / "7")
-        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"), [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-2-7"]])
         self.assertFalse((self.project_dir / "workers" / "7").exists())
         # Neither the closed issue nor the open PR is touched: only the claim at start edits GitHub.
@@ -573,6 +738,64 @@ class GithubStartTest(GithubTestCase):
             [c[2] for c in self.run_fake.find("git", "-C") if c[3:5] == ["worktree", "add"]],
             [str(api), str(self.repo)],
         )
+
+
+class GithubDropTest(GithubTestCase):
+    def setUp(self):
+        super().setUp()
+        self.issue(4, "Widget API")
+        self.afk("init", self.SPEC, "--land", "local")
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+        self.afk("start", "4")
+        self.run_fake.responses[("git", "-C", str(self.repo), "rev-list")] = "1\n"
+
+    def test_a_dropped_workers_issue_is_unassigned_back_onto_the_frontier(self):
+        self.afk("drop", "4", "--discard")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [
+            ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--add-assignee", "@me"],
+            ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--remove-assignee", "@me"],
+        ])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
+                         [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-2-4"]])
+        self.assertFalse((self.project_dir / "workers" / "4").exists())
+
+    def test_a_dropped_worker_whose_issue_is_closed_leaves_it_as_it_is(self):
+        self.issues[4]["state"] = "closed"
+
+        out = self.afk("drop", "4", "--discard")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"), [
+            ["gh", "issue", "edit", "4", "--repo", "acme/widgets", "--add-assignee", "@me"],
+        ])
+        self.assertNotIn("frontier", out)
+        self.assertFalse((self.project_dir / "workers" / "4").exists())
+
+
+class GithubCompleteTest(GithubTestCase):
+    def test_a_landed_ticket_is_closed_as_completed_naming_where_it_landed(self):
+        self.issue(4, "Widget API")
+        self.issue(9, "Widget page", repo="acme/web")
+        tracker = afk.GithubTracker(self.run_fake, self.SPEC)
+
+        tracker.complete(tracker.get("4"), landed=("3f2a9c1e", "widgets-v2"))
+        tracker.complete(tracker.get("web#9"), landed=("8b7d6e5f", "main"))
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "close"), [
+            ["gh", "issue", "close", "4", "--repo", "acme/widgets", "--reason", "completed",
+             "--comment", "Landed in 3f2a9c1e on widgets-v2"],
+            ["gh", "issue", "close", "9", "--repo", "acme/web", "--reason", "completed",
+             "--comment", "Landed in 8b7d6e5f on main"],
+        ])
+
+    def test_a_merged_ticket_is_left_for_its_pr_to_close(self):
+        self.issue(4, "Widget API")
+        tracker = afk.GithubTracker(self.run_fake, self.SPEC)
+
+        tracker.complete(tracker.get("4"))
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "close"), [])
 
 
 class FrontierTest(AfkTestCase):
@@ -867,6 +1090,106 @@ class RepoConfigStartTest(AfkTestCase):
         self.assertFalse((self.project_dir / "workers" / "03").exists())
 
 
+class LandingStartTest(AfkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI")
+
+    def worktree_base(self):
+        [add] = self.run_fake.find("git", "-C", str(self.repo), "worktree", "add")
+        return add[-1]
+
+    def status(self):
+        return json.loads((self.project_dir / "workers" / "03" / "status.json").read_text())
+
+    def test_a_local_mode_worktree_branches_from_the_integration_branch_and_its_status_records_it(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("start", "03")
+
+        self.assertEqual(self.worktree_base(), "widgets-v2")
+        self.assertEqual((self.status()["landing"], self.status()["target"]), ("local", "widgets-v2"))
+
+    def test_a_local_mode_project_without_a_target_lands_on_the_repos_base(self):
+        self.repo_config('base = "develop"')
+        self.afk("init", str(self.scratch), "--land", "local")
+
+        self.afk("start", "03")
+
+        self.assertEqual(self.worktree_base(), "develop")
+        self.assertEqual((self.status()["landing"], self.status()["target"]), ("local", "develop"))
+
+    def test_a_pr_mode_worker_lands_by_pr_on_base(self):
+        self.afk("init", str(self.scratch))
+
+        self.afk("start", "03")
+
+        self.assertEqual(self.worktree_base(), "main")
+        self.assertEqual((self.status()["landing"], self.status()["target"]), ("pr", "main"))
+
+    def deny(self):
+        """The deny list the worker's claude was launched with."""
+        return json.loads((self.project_dir / "workers" / "03" / "settings.json").read_text())["permissions"]["deny"]
+
+    def test_a_local_mode_worker_is_denied_moving_or_checking_out_its_target_as_well_as_pushing_base(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        self.afk("start", "03")
+
+        for rule in [
+            "Bash(git push * main)",
+            "Bash(git push * widgets-v2)",
+            "Bash(git push * HEAD:widgets-v2)",
+            "Bash(git push * *:widgets-v2)",
+            "Bash(git checkout widgets-v2)",
+            "Bash(git checkout * widgets-v2)",
+            "Bash(git switch widgets-v2)",
+            "Bash(git switch * widgets-v2)",
+        ]:
+            self.assertIn(rule, self.deny())
+
+    def test_a_local_mode_worker_is_denied_moving_its_target_but_not_a_branch_whose_name_holds_it(self):
+        self.afk("init", str(self.scratch), "--land", "local")
+
+        self.afk("start", "03")
+
+        denied = lambda command: any(fnmatch.fnmatchcase(f"Bash({command})", rule) for rule in self.deny())
+        self.assertTrue(denied("git update-ref refs/heads/main 3f2a9c1"))
+        self.assertTrue(denied("git update-ref -d refs/heads/main"))
+        self.assertFalse(denied("git update-ref refs/heads/afk/domain-03 3f2a9c1"))
+        self.assertFalse(denied("git update-ref refs/heads/maintenance 3f2a9c1"))
+
+    def test_a_worker_is_denied_dropping_any_ticket_which_is_the_humans_call(self):
+        self.afk("init", str(self.scratch), "--land", "local")
+
+        self.afk("start", "03")
+
+        denied = lambda command: any(fnmatch.fnmatchcase(f"Bash({command})", rule) for rule in self.deny())
+        self.assertTrue(denied("afk drop 03 --discard"))
+        self.assertTrue(denied(f"{shlex.quote(afk.AFK_BIN)} drop 04 --discard"))
+        self.assertFalse(denied("afk report done 'Dropped the unused helper'"))
+
+    def test_a_pr_mode_worker_is_denied_nothing_about_its_target_beyond_pushing_base(self):
+        self.afk("init", str(self.scratch))
+
+        self.afk("start", "03")
+
+        self.assertEqual([r for r in self.deny() if "main" in r],
+                         ["Bash(git push * main)", "Bash(git push * HEAD:main)", "Bash(git push * *:main)"])
+
+    def test_an_unknown_landing_mode_in_the_project_config_fails_before_creating_anything(self):
+        self.afk("init", str(self.scratch))
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write('\n[landing]\nmode = "Local"\n')
+        out = io.StringIO()
+
+        code = afk.main(["start", "03"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("unknown landing mode 'Local'", out.getvalue())
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+
 TASK_TYPES = """
 default_type = "backend"
 
@@ -1076,6 +1399,40 @@ class CheckTest(AfkTestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("base branch 'develop' does not exist", out)
+
+    def test_reviewers_must_be_a_list_of_commands(self):
+        self.repo_config('reviewers = "coderabbit review"', body=PROSE)
+
+        code, out = self.check()
+
+        self.assertEqual(code, 1)
+        self.assertIn("'reviewers' must be a list of strings", out)
+
+    def test_a_reviewer_that_is_not_a_runnable_command_is_an_error(self):
+        self.repo_config('reviewers = ["copilot -p \'unbalanced", "", "FOO=1"]', body=PROSE)
+
+        code, out = self.check()
+
+        self.assertEqual(code, 1)
+        self.assertIn("reviewer `copilot -p 'unbalanced`: No closing quotation", out)
+        self.assertIn("reviewer `` names no command", out)
+        self.assertIn("reviewer `FOO=1` names no command", out)
+
+    def test_a_reviewer_whose_binary_is_not_on_path_warns_without_failing(self):
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "coderabbit").write_text("#!/bin/sh\n")
+        (bin_dir / "coderabbit").chmod(0o755)
+        self.env["PATH"] = str(bin_dir)
+        self.repo_config(
+            'reviewers = ["coderabbit review --base {{target}} --plain", "copilot -p \'review the diff\'"]', body=PROSE
+        )
+
+        code, out = self.check()
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("warning: reviewer `copilot -p 'review the diff'`: copilot is not on PATH", out)
+        self.assertNotIn("coderabbit is not on PATH", out)
 
     def test_missing_prose_sections_warn_without_failing(self):
         self.repo_config('base = "main"', body="# AFK\n\n## Dev server\n\n`npm run dev`\n")
@@ -1423,12 +1780,16 @@ class WorkerStatusTest(AfkTestCase):
         self.assertEqual(self.status_rows()[0], ["03", "implement", "done", "Finished"])
 
 
-class WatchTest(AfkTestCase):
+class WorkerTestCase(AfkTestCase):
+    """A project with worker 03 started, init'd with INIT's extra arguments, and helpers to act as it."""
+
+    INIT = ()
+
     def setUp(self):
         super().setUp()
         self.ticket("03-ui", "Widget UI")
         self.ticket("09-docs", "Widget docs", status="claimed")  # someone else's, so the project never finishes
-        self.afk("init", str(self.scratch))
+        self.afk("init", str(self.scratch), *self.INIT)
         self.run_fake.responses[("tmux", "split-window")] = "%6\n"  # the worker's shell pane
         self.afk("start", "03")
         self.calls_before = len(self.run_fake.calls)
@@ -1447,6 +1808,12 @@ class WatchTest(AfkTestCase):
         """The stopped worker's session takes up a tool again, as when a background task it waited on lands."""
         payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "PreToolUse"}
         self.afk("hook", "activity", stdin=json.dumps(payload), env=self.worker_env(ticket))
+
+    def prompt(self, text, ticket="03"):
+        """Text submitted in the worker's pane, typed by the human or pasted by the watcher."""
+        payload = {"session_id": "s", "transcript_path": str(self.transcript(ticket)), "hook_event_name": "UserPromptSubmit",
+                   "prompt": text}
+        self.afk("hook", "prompt", stdin=json.dumps(payload), env=self.worker_env(ticket))
 
     def transcript(self, ticket="03"):
         return self.tmp / f"{ticket}.jsonl"
@@ -1479,11 +1846,16 @@ class WatchTest(AfkTestCase):
     def status(self, ticket="03"):
         return json.loads((self.project_dir / "workers" / ticket / "status.json").read_text())
 
+    def desktop_notifications(self):
+        return [" ".join(c[1:]) for c in self.run_fake.calls[self.calls_before :] if c[0] == "notify-send"]
+
     def finish_phase(self, message="Done"):
         self.report("done", message)
         self.stop()
         self.afk("tick")
 
+
+class WatchTest(WorkerTestCase):
     def test_done_report_then_stop_advances_to_verify_and_sends_its_prompt(self):
         self.report("done", "Implemented")
         self.stop()
@@ -1521,9 +1893,6 @@ class WatchTest(AfkTestCase):
             [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()],
             ["AFK phase: verify", "AFK phase: prepr", "AFK phase: pr", "AFK phase: review"],
         )
-
-    def desktop_notifications(self):
-        return [" ".join(c[1:]) for c in self.run_fake.calls[self.calls_before :] if c[0] == "notify-send"]
 
     def test_question_and_blocked_reports_notify_once_without_advancing(self):
         for state, message in [("question", "Which database?"), ("blocked", "CI is down")]:
@@ -1818,6 +2187,17 @@ class WatchTest(AfkTestCase):
         self.assertIn("03", notification)
         self.assertIn("claude", notification)
 
+    def test_claude_named_by_its_version_still_counts_as_running(self):
+        # Claude Code sets its process title to its version, so tmux reports e.g. "2.1.310" rather than "claude".
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = "2.1.310\n"
+        self.report("done", "Implemented")
+        self.stop()
+
+        self.afk("tick")
+
+        self.assertEqual(self.phase(), "verify")
+        self.assertEqual(len(self.prompts_sent()), 1)
+
     def limit(self, **limits):
         with open(self.project_dir / "config.toml", "a") as config:
             config.write("\n[limits]\n" + "".join(f"{k} = {v}\n" for k, v in limits.items()))
@@ -1964,19 +2344,26 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual(self.status()["state"], "working")
 
+    def pane_gone(self, pane):
+        """tmux no longer has `pane`: older tmux fails to find it, tmux 3.6 prints nothing and exits 0."""
+        def failing(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr=f"can't find pane: {pane}")
+
+        return {"failing": failing, "empty": ""}
+
     def test_a_killed_agent_pane_needs_attention_instead_of_failing_every_tick(self):
-        def pane_gone(cmd):
-            raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %5")
+        for how, response in self.pane_gone("%5").items():
+            with self.subTest(how):
+                self.setUp()
+                self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = response
+                self.report("done", "Implemented")
+                self.stop()
 
-        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = pane_gone
-        self.report("done", "Implemented")
-        self.stop()
+                self.afk("tick")
+                self.afk("tick")
 
-        self.afk("tick")
-        self.afk("tick")
-
-        self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
-        self.assertEqual(len(self.desktop_notifications()), 1)
+                self.assertEqual((self.phase(), self.status()["state"]), ("implement", "attention"))
+                self.assertEqual(len(self.desktop_notifications()), 1)
 
 
     # Merge detection and cleanup
@@ -2050,7 +2437,7 @@ class WatchTest(AfkTestCase):
             self.cleanup_commands(),
             (
                 [["tmux", "kill-window", "-t", "%5"]],
-                [["git", "-C", str(self.repo), "worktree", "remove", worktree]],
+                [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]],
                 [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-03"]],
             ),
         )
@@ -2152,6 +2539,16 @@ class WatchTest(AfkTestCase):
         self.assertIn("vim", notification)
         self.assertEqual(len(self.desktop_notifications()), 2)  # PR ready, then cleanup pending
 
+    def test_a_cleanup_pending_worker_keeps_its_columns_apart_on_the_dashboard_and_in_status(self):
+        self.reach_review()
+        self.merge(shell="vim")
+
+        dashboard = self.afk("tick").splitlines()
+
+        self.assertEqual(dashboard[1].split()[:3], ["03", "review", "cleanup-pending"])
+        self.assertEqual(self.afk("status").splitlines()[1].split(None, 3),
+                         ["03", "review", "cleanup-pending", "its shell pane is running vim"])
+
     def test_merged_pr_with_uncommitted_changes_is_left_cleanup_pending_and_notifies(self):
         self.reach_review()
         self.merge(worktree_status=" M src/widget.py\n")
@@ -2162,20 +2559,30 @@ class WatchTest(AfkTestCase):
         self.assertEqual(self.status()["state"], "cleanup-pending")
         self.assertIn("uncommitted", self.desktop_notifications()[-1])
 
-    def test_merged_pr_whose_shell_pane_is_gone_is_left_cleanup_pending(self):
+    def test_merged_pr_whose_shell_pane_is_gone_is_cleaned_up(self):
+        # A pane that no longer exists has no human in it, so it can't hold up cleanup.
+        for how, response in self.pane_gone("%6").items():
+            with self.subTest(how):
+                self.setUp()
+                self.reach_review()
+                self.merge()
+                self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = response
+
+                self.afk("tick")
+
+                self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
+                self.assertEqual(self.afk("status").splitlines()[1:], [])
+
+    def test_merged_pr_whose_shell_pane_is_gone_with_uncommitted_changes_is_left_cleanup_pending(self):
         self.reach_review()
-        self.merge()
-
-        def pane_gone(cmd):
-            raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %6")
-
-        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = pane_gone
+        self.merge(worktree_status=" M src/widget.py\n")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = ""
 
         self.afk("tick")
 
         self.assertEqual(self.cleanup_commands(), ([], [], []))
         self.assertEqual(self.status()["state"], "cleanup-pending")
-        self.assertIn("shell pane is gone", self.desktop_notifications()[-1])
+        self.assertIn("uncommitted", self.desktop_notifications()[-1])
 
     def test_cleanup_pending_worker_is_cleaned_up_once_the_shell_is_idle_again(self):
         self.reach_review()
@@ -2187,6 +2594,36 @@ class WatchTest(AfkTestCase):
 
         self.assertEqual([len(c) for c in self.cleanup_commands()], [1, 1, 1])
         self.assertEqual(self.afk("status").splitlines()[1:], [])
+
+    def test_a_merged_worker_whose_worktree_has_submodules_is_cleaned_up(self):
+        self.reach_review()
+        self.merge()
+
+        def with_submodules(cmd):
+            if "--force" not in cmd:
+                raise subprocess.CalledProcessError(
+                    128, cmd, stderr="fatal: working trees containing submodules cannot be moved or removed")
+            return git(cmd)
+
+        self.run_fake.responses[("git", "-C", str(self.repo), "worktree", "remove")] = with_submodules
+
+        self.afk("tick")
+
+        self.assertEqual(self.afk("status").splitlines()[1:], [])
+        self.assertFalse((self.project_dir / "worktrees" / "03").exists())
+
+    def test_a_merged_worker_with_changes_in_an_ignored_submodule_is_left_cleanup_pending(self):
+        # A submodule set to ignore=all hides its changes from a plain `git status`, and cleanup forces the removal.
+        self.reach_review()
+        self.merge()
+        worktree = str(self.project_dir / "worktrees" / "03")
+        self.run_fake.responses[("git", "-C", worktree, "status")] = (
+            lambda cmd: " M vendor/lib\n" if "--ignore-submodules=none" in cmd else "")
+
+        self.afk("tick")
+
+        self.assertEqual(self.cleanup_commands(), ([], [], []))
+        self.assertIn("uncommitted", self.desktop_notifications()[-1])
 
     def test_a_merged_worker_whose_branch_is_checked_out_elsewhere_is_cleaned_up_leaving_the_branch(self):
         self.reach_review()
@@ -2528,6 +2965,8 @@ class WatchTest(AfkTestCase):
         self.assertTrue(prompt.startswith("AFK guide mode — ticket 04"), prompt)
         self.assertIn(str(self.scratch / "issues" / "04-spike.md"), prompt)
         self.assertNotIn("AFK phase: implement", prompt)
+        self.assertIn("opens a PR from this branch against `main`", prompt)
+        self.assertNotIn("afk land", prompt)  # a project landing by PR lands hitl tickets by PR too
 
     def test_the_watcher_never_drives_a_hitl_worker_and_shows_it_as_the_users(self):
         self.start_hitl()
@@ -2580,7 +3019,7 @@ class WatchTest(AfkTestCase):
         self.afk("tick")
 
         self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%7"]])
-        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"), [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-04"]])
         self.assertFalse((self.project_dir / "workers" / "04").exists())
 
@@ -2664,11 +3103,809 @@ class WatchTest(AfkTestCase):
 
         worktree = str(self.project_dir / "worktrees" / "04")
         self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%7"]])
-        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"), [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"), [["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-04"]])
         self.assertFalse((self.project_dir / "workers" / "04").exists())
         self.assertIn("04 ticket closed and cleaned up", self.desktop_notifications()[-1])
         self.assertIn("**Status:** closed", path.read_text())  # the tracker already has it as closed
+
+
+class LocalLandingWatchTest(WorkerTestCase):
+    INIT = ("--land", "local", "--target", "widgets-v2")
+
+    def test_each_done_phase_advances_to_the_next_critiquing_instead_of_opening_a_pr(self):
+        for _ in range(4):
+            self.finish_phase()
+
+        self.assertEqual(self.phase(), "review")
+        self.assertEqual(self.status()["state"], "review")
+        self.assertEqual(
+            [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()],
+            ["AFK phase: verify", "AFK phase: prepr", "AFK phase: critique", "AFK phase: review"],
+        )
+
+    def test_prepr_checks_for_merge_conflicts_against_the_local_target(self):
+        for _ in range(2):
+            self.finish_phase()
+
+        prepr = self.prompts_sent()[-1]
+        self.assertTrue(prepr.startswith("AFK phase: prepr"), prepr)
+        self.assertIn("git merge widgets-v2", prepr)
+        self.assertIn("git diff widgets-v2...HEAD", prepr)
+        self.assertNotIn("git fetch", prepr)
+        self.assertNotIn("{{", prepr)
+
+    def test_reaching_review_notifies_that_the_branch_is_ready(self):
+        for _ in range(4):
+            self.finish_phase()
+
+        self.assertIn("03 branch ready for review", self.desktop_notifications()[-1])
+        self.assertNotIn("PR", self.desktop_notifications()[-1])
+
+    def test_critique_runs_each_of_the_repos_reviewers_over_the_diff_against_the_target(self):
+        self.repo_config('reviewers = ["coderabbit review --base {{target}} --plain", "copilot -p \'review git diff {{target}}...HEAD\'"]')
+        for _ in range(3):
+            self.finish_phase()
+
+        critique = self.prompts_sent()[-1]
+        self.assertTrue(critique.startswith("AFK phase: critique"), critique)
+        self.assertIn("`coderabbit review --base widgets-v2 --plain`", critique)
+        self.assertIn("`copilot -p 'review git diff widgets-v2...HEAD'`", critique)
+        self.assertIn("git diff widgets-v2...HEAD", critique)
+        self.assertNotIn("{{", critique)
+
+    def test_critique_without_reviewers_is_a_code_review_subagent(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        critique = self.prompts_sent()[-1]
+        self.assertIn("No reviewers are configured", critique)
+        self.assertIn("code-review subagent", critique)
+        self.assertNotIn("{{", critique)
+
+    def test_a_critique_round_that_fixed_findings_is_followed_by_another_until_one_finds_nothing(self):
+        for _ in range(3):
+            self.finish_phase()
+
+        self.finish_phase("round: fixed a missing null check")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("critique", "working"))
+        self.assertTrue(self.prompts_sent()[-1].startswith("AFK phase: critique"))
+
+        self.finish_phase("Critique clean; rejected 2 findings")
+
+        self.assertEqual((self.phase(), self.status()["state"]), ("review", "review"))
+        self.assertEqual(
+            [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()][-3:],
+            ["AFK phase: critique", "AFK phase: critique", "AFK phase: review"],
+        )
+
+    def test_the_review_prompt_critiques_feedback_fixes_and_lands_on_approval_without_pushing(self):
+        self.repo_config('reviewers = ["coderabbit review --base {{target}} --plain"]')
+        for _ in range(4):
+            self.finish_phase()
+
+        review = self.prompts_sent()[-1]
+        self.assertTrue(review.startswith("AFK phase: review"), review)
+        self.assertIn("`coderabbit review --base widgets-v2 --plain`", review)
+        self.assertIn("git merge widgets-v2", review)
+        self.assertIn('afk land "', review)
+        self.assertIn("Ticket: 03", review)
+        self.assertIn("Never push", review)
+        self.assertNotIn("origin/", review)
+        self.assertNotIn("{{", review)
+
+    def test_a_worker_in_review_is_never_looked_up_on_github(self):
+        for _ in range(4):
+            self.finish_phase()
+
+        for _ in range(3):
+            self.now += afk.PR_POLL_SECONDS
+            self.afk("tick")
+
+        self.assertEqual(self.run_fake.find("gh", "pr", "view"), [])
+        self.assertEqual(self.status()["state"], "review")
+
+    def test_a_worker_in_review_whose_ticket_is_closed_ends_without_a_pr_until_it_is_reopened(self):
+        for _ in range(4):
+            self.finish_phase()
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+        self.run_fake.responses[("git", "-C", str(self.project_dir / "worktrees" / "03"), "log")] = "abc1234 Widget UI\n"
+        path = self.scratch / "issues" / "03-ui.md"
+        path.write_text(path.read_text().replace("**Status:** ready-for-agent", "**Status:** closed"))
+
+        self.afk("tick")
+
+        self.assertEqual(self.run_fake.find("gh", "pr", "view"), [])
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertEqual(self.status()["ended"], "ticket closed")
+
+        path.write_text(path.read_text().replace("**Status:** closed", "**Status:** ready-for-agent"))
+        self.now += afk.PR_POLL_SECONDS
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "review")
+        self.assertNotIn("ended", self.status())
+
+    def test_a_hitl_workers_pr_is_still_found_by_its_branch_and_cleaned_up_once_merged(self):
+        self.ticket("04-spike", "Widget spike", type="hitl")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.run_fake.responses[("tmux", "split-window")] = "%8\n"
+        self.afk("start", "04")
+
+        self.afk("tick")
+
+        self.assertEqual([c[3] for c in self.run_fake.find("gh", "pr", "view")], ["afk/widgets-04"])
+        self.assertEqual(self.status("04")["state"], "yours")
+
+        self.run_fake.responses[("gh", "pr", "view", "afk/widgets-04")] = pr_view("MERGED")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%8")] = "bash\n"
+        self.run_fake.responses[("git", "-C", str(self.project_dir / "worktrees" / "04"), "status")] = ""
+        self.now += afk.PR_POLL_SECONDS
+        self.afk("tick")
+
+        self.assertIn(["tmux", "kill-window", "-t", "%7"], self.run_fake.find("tmux", "kill-window"))
+        self.assertIn(["git", "-C", str(self.repo), "branch", "-D", "afk/widgets-04"], self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"))
+        self.assertFalse((self.project_dir / "workers" / "04").exists())
+        self.assertIn("04 merged and cleaned up", " ".join(self.desktop_notifications()))
+
+    def test_the_guide_mode_prompt_lands_on_the_humans_request_after_committing_and_confirming(self):
+        self.ticket("04-spike", "Widget spike", type="hitl")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.afk("start", "04")
+
+        launch = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])
+        prompt = launch[-1]
+        self.assertTrue(prompt.startswith("AFK guide mode — ticket 04"), prompt)
+        self.assertIn('afk land "', prompt)
+        self.assertIn("type(scope): summary", prompt)
+        self.assertIn("Ticket: 04", prompt)
+        self.assertIn("squashes the branch onto `widgets-v2`", prompt)
+        self.assertIn("if you committed anything since their request, show the human what will land and ask them to confirm", prompt)
+        self.assertIn("in a plain reply, and end your turn", prompt)  # a question tool's answer isn't a typed prompt
+        self.assertIn("against `widgets-v2`", prompt)
+        self.assertNotIn("{{", prompt)
+
+
+class ApprovalTest(WorkerTestCase):
+    INIT = ("--land", "local", "--target", "widgets-v2")
+
+    def test_a_prompt_the_human_types_is_recorded_as_their_last(self):
+        self.now += 300
+
+        self.prompt("lgtm, land it")
+
+        self.assertEqual(self.status()["last_human_prompt_at"], self.now)
+
+    def test_a_phase_prompt_the_watcher_pasted_is_not_the_humans(self):
+        self.prompt("lgtm, land it")
+        approved = self.now
+        self.now += 300
+        self.finish_phase()
+
+        # The verify prompt, as Claude Code hands the hook a paste: wrapped, after blank lines.
+        self.prompt(f'\n\n<pasted_content id="7eeb">\n{self.prompts_sent()[-1]}</pasted_content id="7eeb">\n')
+        self.prompt("/tdd AFK phase: implement — ticket 03 (x)\n\nImplement it.")  # the first, with its skill
+
+        self.assertEqual(self.status()["last_human_prompt_at"], approved)
+
+    def test_a_background_task_landing_is_not_the_humans(self):
+        self.prompt("lgtm")
+        approved = self.now
+        self.now += 300
+
+        self.prompt("<task-notification>\n<task-id>bsscixg0x</task-id>\n<status>completed</status>\n</task-notification>")
+
+        self.assertEqual(self.status()["last_human_prompt_at"], approved)
+
+    def test_a_phase_prompt_pasted_after_half_typed_text_is_not_the_humans(self):
+        self.prompt("lgtm")
+        approved = self.now
+        self.now += 300
+        self.finish_phase()
+
+        self.prompt(f'lg\n\n<pasted_content id="7eeb">\n{self.prompts_sent()[-1]}</pasted_content id="7eeb">\n')
+
+        self.assertEqual(self.status()["last_human_prompt_at"], approved)
+
+
+class GitRun(FakeRun):
+    """FakeRun, except git, which runs for real: landing is git's work, so it is checked against real repos."""
+
+    def __call__(self, cmd, input=None, cwd=None):
+        if cmd[0] != "git":
+            return super().__call__(cmd, input, cwd)
+        self.calls.append(list(cmd))
+        self.inputs.append(input)
+        self.cwds.append(cwd and str(cwd))
+        before = self.responses.get(("git", "before"))
+        if before:
+            before(cmd)
+        return afk.default_run(cmd, input, cwd)
+
+
+class LandTestCase(WorkerTestCase):
+    """Worker 03 of a local-mode project, of task type TYPE, in a real git clone with an origin, landing on INIT's target."""
+
+    INIT = ("--land", "local", "--target", "widgets-v2")
+    TYPE = None
+
+    def setUp(self):
+        AfkTestCase.setUp(self)
+        identity = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "Ada",
+                    "GIT_AUTHOR_EMAIL": "ada@example.com", "GIT_COMMITTER_NAME": "Ada", "GIT_COMMITTER_EMAIL": "ada@example.com"}
+        patcher = mock.patch.dict(os.environ, identity)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = 1_700_000_000.0
+        self.run_fake = GitRun(self.run_fake.responses)
+        del self.run_fake.responses[("git", "-C")]
+        self.origin = self.tmp / "origin.git"
+        self.git("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=self.tmp)
+        self.git("init", "-q", "-b", "main")
+        self.commit("README.md", "widgets\n", "Initial commit", at=self.now - 3600)
+        self.git("remote", "add", "origin", str(self.origin))
+        self.git("push", "-q", "origin", "main")
+        self.ticket("03-ui", "Widget UI", type=self.TYPE)
+        self.afk("init", str(self.scratch), *self.INIT)
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.afk("start", "03")
+        self.calls_before = len(self.run_fake.calls)
+        self.worktree = self.project_dir / "worktrees" / "03"
+
+    def git(self, *args, cwd=None, at=None):
+        env = {**os.environ, **({"GIT_AUTHOR_DATE": f"@{int(at)} +0000", "GIT_COMMITTER_DATE": f"@{int(at)} +0000"} if at else {})}
+        return subprocess.run(["git", *args], cwd=cwd or self.repo, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, name, text, message, cwd=None, at=None):
+        """Commit `text` to file `name`, in the clone or the given worktree, at clock time `at`."""
+        cwd = cwd or self.repo
+        (Path(cwd) / name).write_text(text)
+        self.git("add", name, cwd=cwd)
+        self.git("commit", "-q", "-m", message, cwd=cwd, at=at or self.now)
+        return self.git("rev-parse", "HEAD", cwd=cwd)
+
+    def work(self, name="widget.py", text="widget = 1\n", message="Add the widget"):
+        """The worker commits on its branch, a minute ago."""
+        return self.commit(name, text, message, cwd=self.worktree, at=self.now - 60)
+
+    def other_checkout(self):
+        """A second worktree on the target, standing in for another worker that lands on it."""
+        path = self.tmp / "other"
+        if not path.exists():
+            self.git("worktree", "add", "-q", str(path), "widgets-v2")
+        return path
+
+    def tip(self, branch, cwd=None):
+        return self.git("rev-parse", branch, cwd=cwd)
+
+    def land(self, message="feat(widgets): add the widget\n\nA widget.\n\nTicket: 03\n"):
+        """`afk land` from the worker, as (exit code, output)."""
+        out = io.StringIO()
+        code = afk.main(["land", message], run=self.run_fake, env={**self.env, **self.worker_env()},
+                        stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+        return code, out.getvalue()
+
+
+class LandTest(LandTestCase):
+    def test_an_approved_branch_lands_as_one_squash_commit_on_the_target(self):
+        head = self.work()
+        self.work("widget_test.py", "assert widget\n", "Test the widget")
+        before = self.tip("widgets-v2")
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        landed = self.tip("widgets-v2")
+        self.assertEqual(self.git("rev-parse", f"{landed}^"), before)
+        self.assertEqual(self.git("rev-parse", f"{landed}^{{tree}}"), self.git("rev-parse", "HEAD^{tree}", cwd=self.worktree))
+        self.assertEqual(self.git("log", "-1", "--format=%B", landed), "feat(widgets): add the widget\n\nA widget.\n\nTicket: 03")
+        self.assertEqual((self.status()["ended"], self.status()["landed_sha"]), ("landed", landed))
+        self.assertIn(landed[:7], out)
+
+
+    def test_a_conflict_free_merge_of_the_target_after_approval_keeps_it(self):
+        self.work()
+        self.commit("other.py", "other = 1\n", "Another ticket landed", cwd=self.other_checkout())
+        self.prompt("lgtm")
+        self.now += 120
+        self.git("merge", "-q", "--no-edit", "widgets-v2", cwd=self.worktree, at=self.now - 60)
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.git("ls-tree", "--name-only", "widgets-v2").split(), ["README.md", "other.py", "widget.py"])
+
+
+    def test_a_target_checked_out_in_a_clean_worktree_is_fast_forwarded_there(self):
+        checkout = self.other_checkout()
+        (checkout / "notes.txt").write_text("untracked, so nothing landing can lose\n")
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.tip("HEAD", cwd=checkout), self.tip("widgets-v2"))
+        self.assertEqual((checkout / "widget.py").read_text(), "widget = 1\n")
+        self.assertEqual(self.git("status", "--porcelain", cwd=checkout), "?? notes.txt")
+
+
+    def test_an_integration_branch_is_pushed_once_landed(self):
+        self.work()
+        self.prompt("lgtm")
+
+        self.land()
+
+        self.assertEqual(self.tip("widgets-v2", cwd=self.origin), self.tip("widgets-v2"))
+
+    def test_a_failed_push_notifies_without_undoing_the_land(self):
+        pushed = self.git("commit-tree", "main^{tree}", "-p", "main", "-m", "Pushed from elsewhere")
+        self.git("push", "-q", "origin", f"{pushed}:refs/heads/widgets-v2")  # so landing can't fast-forward origin's
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.tip("widgets-v2"), self.status()["landed_sha"])
+        self.assertEqual(self.tip("widgets-v2", cwd=self.origin), pushed)
+        self.assertIn("push", self.run_fake.find("notify-send")[-1][-1])
+
+
+    def test_the_watcher_leaves_a_landing_worker_alone_until_its_land_has_finished(self):
+        self.work()
+        self.prompt("lgtm")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "zsh\n"  # an idle shell
+        during = []
+
+        def watcher_ticks_mid_push(cmd):
+            if "push" in cmd and not during:
+                during.append(None)
+                self.afk("tick")
+                during[0] = (self.project_dir / "workers" / "03").exists()
+
+        self.run_fake.responses[("git", "before")] = watcher_ticks_mid_push
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(during, [True])
+        self.assertEqual(self.tip("widgets-v2", cwd=self.origin), self.status()["landed_sha"])
+        self.assertEqual(self.status()["ended"], "landed")
+
+    def test_a_checkout_of_the_target_that_cannot_be_updated_notifies_without_undoing_the_land(self):
+        checkout = self.other_checkout()
+        (checkout / "widget.py").write_text("untracked, in the way\n")
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.status()["ended"], "landed")
+        self.assertEqual((checkout / "widget.py").read_text(), "untracked, in the way\n")
+        self.assertIn(f"{checkout} still has", self.run_fake.find("notify-send")[-1][-1])
+
+
+    def test_a_checkout_of_the_target_whose_directory_is_gone_does_not_stop_the_land(self):
+        shutil.rmtree(self.other_checkout())  # git still lists it, as prunable
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.status()["ended"], "landed")
+
+
+class LandOnBaseTest(LandTestCase):
+    INIT = ("--land", "local")
+
+    def test_base_is_landed_on_its_checkout_in_the_clone_and_never_pushed(self):
+        pushed = self.tip("main", cwd=self.origin)
+        self.work()
+        self.prompt("lgtm")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.tip("HEAD"), self.tip("main"))
+        self.assertEqual((self.repo / "widget.py").read_text(), "widget = 1\n")
+        self.assertEqual(self.tip("main", cwd=self.origin), pushed)
+        self.assertEqual([c for c in self.run_fake.find("git") if "push" in c], [])
+
+
+class LandRefusalTest(LandTestCase):
+    def assertRefused(self, message, land_message=None):
+        """afk land fails with `message`, leaving the target and the worker's status as they were."""
+        before, status = self.tip("widgets-v2"), self.status()
+        code, out = self.land(*(() if land_message is None else (land_message,)))
+        self.assertEqual(code, 1, out)
+        self.assertIn(message, out)
+        self.assertEqual(self.tip("widgets-v2"), before)
+        self.assertEqual(self.status(), status)
+
+    def test_an_empty_message_is_refused(self):
+        self.work()
+        self.prompt("lgtm")
+
+        self.assertRefused("afk: land needs a commit message", "  \n")
+
+
+    def test_a_branch_the_human_has_not_approved_is_refused(self):
+        self.work()
+
+        self.assertRefused("no approval since")
+
+    def test_an_approval_followed_by_a_commit_of_the_workers_own_is_stale(self):
+        self.prompt("lgtm")
+        self.now += 120
+        self.work()  # a fix, a minute after the human approved
+
+        self.assertRefused("no approval since")
+
+    def test_a_branch_with_nothing_to_land_is_refused(self):
+        self.prompt("lgtm")
+
+        self.assertRefused("nothing to land")
+
+
+    def test_a_target_that_moved_since_the_branch_last_merged_it_is_refused(self):
+        self.work()
+        self.commit("other.py", "other = 1\n", "Another ticket landed", cwd=self.other_checkout())
+        self.prompt("lgtm")
+
+        self.assertRefused("target moved; merge it, re-run pre-PR, land again")
+
+
+    def test_a_merge_of_the_target_with_resolved_conflicts_after_approval_needs_a_new_one(self):
+        self.work("README.md", "widgets, by 03\n", "Retitle the readme")
+        self.commit("README.md", "widgets, by another\n", "Another ticket landed", cwd=self.other_checkout())
+        self.prompt("lgtm")
+        self.now += 120
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.git("merge", "widgets-v2", cwd=self.worktree)
+        (self.worktree / "README.md").write_text("widgets, by 03 and another\n")
+        self.git("commit", "-q", "-am", "Merge widgets-v2", cwd=self.worktree, at=self.now - 60)
+
+        self.assertRefused("no approval since")
+
+
+    def test_a_land_that_loses_the_race_to_move_the_target_changes_nothing(self):
+        self.work()
+        self.prompt("lgtm")
+        theirs = self.git("commit-tree", "widgets-v2^{tree}", "-p", "widgets-v2", "-m", "Another ticket landed")
+
+        def another_worker_lands_first(cmd):
+            if "update-ref" in cmd and self.tip("widgets-v2") != theirs:
+                self.git("update-ref", "refs/heads/widgets-v2", theirs)
+
+        self.run_fake.responses[("git", "before")] = another_worker_lands_first
+        status = self.status()
+        code, out = self.land()
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("target moved; merge it, re-run pre-PR, land again", out)
+        self.assertEqual(self.tip("widgets-v2"), theirs)
+        self.assertEqual(self.status(), status)
+
+
+    def test_a_target_checked_out_in_a_worktree_with_uncommitted_changes_is_refused_naming_it(self):
+        checkout = self.other_checkout()
+        (checkout / "README.md").write_text("widgets, half edited\n")
+        self.work()
+        self.prompt("lgtm")
+
+        self.assertRefused(f"widgets-v2 is checked out in {checkout} with uncommitted changes")
+        self.assertEqual((checkout / "README.md").read_text(), "widgets, half edited\n")
+
+
+    def test_a_branch_already_landed_is_refused(self):
+        self.work()
+        self.prompt("lgtm")
+        self.land()
+
+        self.assertRefused("already landed")
+
+
+    def test_a_clean_merge_of_anything_but_the_target_after_approval_needs_a_new_one(self):
+        self.work()
+        # Older than the approval, on main, checked out in the clone: none of it the target's.
+        self.commit("base.py", "unreviewed = 1\n", "Unreviewed work on base", at=self.now - 600)
+        self.prompt("lgtm")
+        self.now += 120
+        self.git("merge", "-q", "--no-edit", "main", cwd=self.worktree, at=self.now - 60)
+
+        self.assertRefused("no approval since")
+
+
+class LandedCleanupTest(LandTestCase):
+    def setUp(self):
+        super().setUp()
+        self.work()
+        self.prompt("lgtm")
+        code, out = self.land()
+        self.assertEqual(code, 0, out)
+        self.shell("zsh")
+
+    def shell(self, command):
+        """The worker's shell pane runs `command`."""
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = command + "\n"
+
+    def test_a_landed_worker_is_cleaned_up_its_ticket_done_and_its_unpushed_branch_deleted(self):
+        self.afk("tick")
+
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
+        self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "done")
+        self.assertIn("03 landed and cleaned up", " ".join(c[-1] for c in self.run_fake.find("notify-send")))
+
+
+    def test_a_landed_worker_with_a_busy_shell_waits_for_it_to_go_idle(self):
+        self.shell("vim")
+
+        self.afk("tick")
+
+        self.assertEqual((self.status()["state"], self.status()["message"]), ("cleanup-pending", "its shell pane is running vim"))
+        self.shell("zsh")
+        self.afk("tick")
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+    def test_a_landed_worker_with_uncommitted_changes_waits_for_them(self):
+        (self.worktree / "widget.py").write_text("widget = 2\n")
+
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertTrue(self.worktree.exists())
+
+
+class HitlLandTest(LandTestCase):
+    """A hitl ticket's guide-mode worker, landing on the human's request."""
+
+    TYPE = "hitl"
+
+    def test_the_humans_request_to_land_is_the_approval(self):
+        self.assertEqual(self.status()["phase"], "hitl")
+        self.work()
+        before = self.tip("widgets-v2")
+        self.prompt("land it")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        landed = self.tip("widgets-v2")
+        self.assertEqual(self.git("rev-parse", f"{landed}^"), before)
+        self.assertEqual((self.status()["ended"], self.status()["landed_sha"]), ("landed", landed))
+
+    def test_the_guide_mode_prompt_afk_launches_it_with_is_not_the_humans_approval(self):
+        launch = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])[-1]
+        self.assertTrue(launch.startswith("AFK guide mode"), launch)
+        self.work()
+        self.prompt(launch)
+        self.prompt("/tdd " + launch)  # as launched when the repo gives hitl a skill
+
+        code, out = self.land()
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("no approval since the branch's last commit", out)
+
+    def test_a_commit_made_after_the_request_needs_the_human_to_confirm(self):
+        self.prompt("land it")
+        self.commit("widget.py", "widget = 1\n", "Add the widget", cwd=self.worktree, at=self.now)
+        before = self.tip("widgets-v2")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("no approval since the branch's last commit", out)
+        self.assertEqual(self.tip("widgets-v2"), before)
+
+        self.now += 60
+        self.prompt("yes, land it")
+        code, out = self.land()
+
+        self.assertEqual(code, 0, out)
+        self.assertNotEqual(self.tip("widgets-v2"), before)
+
+    def test_a_landed_hitl_worker_is_cleaned_up_like_any_landed_worker(self):
+        self.work()
+        self.prompt("land it")
+        self.assertEqual(self.land()[0], 0)
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "zsh\n"
+
+        self.afk("tick")
+
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
+        self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "done")
+        self.assertIn("03 landed and cleaned up", " ".join(c[-1] for c in self.run_fake.find("notify-send")))
+
+
+class LandPrModeTest(LandTestCase):
+    INIT = ()
+
+    def test_a_worker_landing_by_pr_is_refused(self):
+        self.work()
+        self.prompt("lgtm")
+        before = self.tip("main")
+
+        code, out = self.land()
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("lands by PR", out)
+        self.assertEqual(self.tip("main"), before)
+        self.assertNotIn("ended", self.status())
+
+
+class DropTestCase(LandTestCase):
+    """Worker 03 of a local-mode project, as in LandTestCase, with an idle shell pane, for the human to drop."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "zsh\n"  # an idle shell pane
+
+    def drop(self, *args):
+        """`afk drop` run by the human from the project's session, as (exit code, output)."""
+        out = io.StringIO()
+        code = afk.main(["drop", *args], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+        return code, out.getvalue()
+
+    def assertRefused(self, message, *args):
+        """afk drop fails with `message`, leaving the worker, its worktree and its branch as they were."""
+        status, head = self.status(), self.tip("HEAD", cwd=self.worktree)
+        code, out = self.drop(*args)
+        self.assertEqual(code, 1, out)
+        self.assertIn(message, out)
+        self.assertEqual(self.status(), status)
+        self.assertEqual(self.tip("afk/widgets-03"), head)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+
+class DropTest(DropTestCase):
+    def test_a_dropped_worker_is_cleaned_up_with_its_unlanded_commits_and_its_ticket_offered_again(self):
+        self.work()
+        self.work("widget_test.py", "assert widget\n", "Test the widget")
+        before = self.tip("widgets-v2")
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 2 unlanded commits", out)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%5"]])
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
+        self.assertFalse((self.project_dir / "workers" / "03").exists())  # its slot is free
+        self.assertEqual(self.tip("widgets-v2"), before)
+        self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "ready-for-agent")
+        self.assertEqual([t["id"] for t in json.loads(self.afk("next"))["tickets"]], ["03"])
+
+    def test_without_discard_it_refuses_saying_how_many_unlanded_commits_would_be_lost(self):
+        self.work()
+        self.work("widget_test.py", "assert widget\n", "Test the widget")
+
+        self.assertRefused("dropping 03 would delete 2 unlanded commits; run `afk drop 03 --discard`", "03")
+
+    def test_a_ticket_without_a_worker_is_refused(self):
+        self.ticket("04-api", "Widget API")
+
+        for ticket in ("04", "99"):
+            code, out = self.drop(ticket, "--discard")
+
+            self.assertEqual(code, 1, out)
+            self.assertIn(f"afk: no worker for ticket {ticket}", out)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+    def test_without_discard_a_busy_shell_pane_or_uncommitted_changes_are_refused_too(self):
+        self.work()
+        (self.worktree / "widget.py").write_text("widget = 2\n")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "vim\n"
+
+        self.assertRefused("dropping 03 would delete 1 unlanded commit and its worktree's uncommitted changes, and "
+                           "end vim in its shell pane; run `afk drop 03 --discard`", "03")
+        self.assertEqual((self.worktree / "widget.py").read_text(), "widget = 2\n")
+
+    def test_with_discard_uncommitted_changes_are_deleted_too_and_it_says_so(self):
+        (self.worktree / "widget.py").write_text("widget = 2\n")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "vim\n"
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 0 unlanded commits and its worktree's uncommitted changes, and ended vim in its shell "
+                      "pane", out)
+        self.assertFalse(self.worktree.exists())
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+    def close_ticket_in_review(self):
+        for _ in range(4):
+            self.finish_phase()
+        path = self.scratch / "issues" / "03-ui.md"
+        path.write_text(path.read_text().replace("**Status:** ready-for-agent", "**Status:** closed"))
+        self.now += afk.PR_POLL_SECONDS
+        self.afk("tick")
+        return path
+
+    def test_a_worker_whose_ticket_is_closed_waits_on_its_unlanded_commits_until_it_is_dropped(self):
+        self.work()
+
+        path = self.close_ticket_in_review()
+
+        message = "its branch has unpushed commits; `afk drop 03 --discard` deletes them"
+        self.assertEqual((self.status()["state"], self.status()["message"]), ("cleanup-pending", message))
+        self.assertIn(message, self.desktop_notifications()[-1])
+        self.assertTrue(self.worktree.exists())
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+        self.assertIn("**Status:** closed", path.read_text())  # left as it is
+
+    def test_a_landed_worker_waiting_on_its_cleanup_is_refused_as_its_work_is_in_the_target(self):
+        self.work()
+        self.prompt("lgtm")
+        self.assertEqual(self.land()[0], 0)
+
+        self.assertRefused("03 has landed on widgets-v2", "03", "--discard")
+        self.assertEqual(afk.parse_ticket(self.scratch / "issues" / "03-ui.md").status, "ready-for-agent")
+
+    def test_a_worker_whose_worktree_is_gone_is_still_dropped(self):
+        self.work()
+        shutil.rmtree(self.worktree)
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 1 unlanded commit;", out)
+        self.assertEqual(self.git("branch", "--list", "afk/widgets-03"), "")
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+    def test_a_worker_whose_target_is_gone_waits_on_its_commits_and_is_still_dropped(self):
+        self.work()
+        self.git("branch", "-D", "widgets-v2")
+
+        self.close_ticket_in_review()  # the tick doesn't fail
+
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        code, out = self.drop("03", "--discard")
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 1 unlanded commit", out)
+
+    def test_misplaced_or_unknown_options_are_refused_with_usage(self):
+        for args in (("03", "--discard", "--force"), ("--discard", "03")):
+            self.assertRefused("afk: usage: afk drop <ticket> [--discard]", *args)
+
+    def test_a_worker_is_refused_dropping_a_ticket(self):
+        status = self.status()
+        out = io.StringIO()
+        code = afk.main(["drop", "03", "--discard"], run=self.run_fake, env={**self.env, **self.worker_env()},
+                        stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("afk drop is the human's", out.getvalue())
+        self.assertEqual(self.status(), status)
+
+    def test_a_worker_whose_ticket_is_closed_holding_only_the_targets_work_is_cleaned_up(self):
+        self.commit("other.py", "other = 1\n", "Another ticket landed", cwd=self.other_checkout())
+        self.git("merge", "-q", "widgets-v2", cwd=self.worktree)  # landed, so in the target, though never pushed
+
+        self.close_ticket_in_review()
+
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+
+class DropPrModeTest(DropTestCase):
+    INIT = ()
+
+    def test_a_worker_landing_by_pr_is_refused_as_closing_its_pr_drops_it(self):
+        self.work()
+
+        self.assertRefused("03 lands by PR: close its PR instead", "03", "--discard")
 
 
 class LimitsTest(unittest.TestCase):
@@ -2763,6 +4000,41 @@ class LimitsTest(unittest.TestCase):
         status, _ = self.review_round(status, now=4)
 
         self.assertEqual(status["state"], "review")
+
+    def critique_round(self, status, now, message="round: fixed a finding"):
+        """The worker finishes a critique round, reports done and stops."""
+        return afk.tick("03", {**status, "state": "done", "message": message, "idle": True}, now,
+                        limits={**self.limits, "critique_rounds": 2})
+
+    def test_critique_rounds_past_the_limit_are_marked_stuck_and_notified(self):
+        status, effects = self.critique_round(self.worker(phase="critique", landing="local"), now=1)
+        self.assertEqual((status["phase"], status["state"]), ("critique", "working"))
+        self.assertIn(("prompt", "03", "%5", "critique"), effects)
+
+        status, effects = self.critique_round(status, now=3)
+
+        self.assertEqual((status["phase"], status["state"]), ("critique", "stuck"))
+        self.assertIn("still fixing after 2 critique rounds", status["message"])
+        [(_, notification)] = [e for e in effects if e[0] == "notify"]
+        self.assertIn("stuck", notification)
+        self.assertFalse([e for e in effects if e[0] in ("prompt", "interrupt")])
+
+    def test_a_worker_stuck_on_critique_rounds_gets_more_rounds_after_the_human_looks(self):
+        status = self.worker(phase="critique", landing="local")
+        for round in range(2):
+            status, _ = self.critique_round(status, now=round)
+        self.assertEqual(status["state"], "stuck")
+
+        status, effects = self.critique_round({**status, "state": "working"}, now=4)
+
+        self.assertEqual((status["phase"], status["state"]), ("critique", "working"))
+        self.assertIn(("prompt", "03", "%5", "critique"), effects)
+
+    def test_a_critique_round_that_finds_nothing_to_fix_moves_on_to_review(self):
+        status, effects = self.critique_round(self.worker(phase="critique", landing="local"), now=1, message="Clean")
+
+        self.assertEqual((status["phase"], status["state"]), ("review", "review"))
+        self.assertIn(("prompt", "03", "%5", "review"), effects)
 
 
 class NextTest(AfkTestCase):
@@ -3043,6 +4315,110 @@ class CloseTest(AfkTestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("usage: afk close [--force]", out)
+class ProjectLandedTest(AfkTestCase):
+    """A local-mode project landing on an integration branch tells the human once all its tickets have landed there."""
+
+    LANDED = "all tickets landed on widgets-v2; open a PR to main when ready"
+
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI", status="done")
+        self.ticket("05-export", "Widget export", status="closed")
+
+    def tick(self):
+        calls_before = len(self.run_fake.calls)
+        output = self.afk("tick")
+        notifications = [" ".join(c[1:]) for c in self.run_fake.calls[calls_before:] if c[0] == "notify-send"]
+        return output, notifications
+
+    def test_every_ticket_landed_notifies_once(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        output, notifications = self.tick()
+
+        self.assertEqual(notifications, [f"afk: widgets {self.LANDED}"])
+        self.assertIn(self.LANDED, output.splitlines())
+        self.now += 120
+        _, later = self.tick()
+        self.assertEqual(later, [])
+        self.assertTrue((self.project_dir / "config.toml").exists())  # kept open until the human closes it
+
+    def test_a_ticket_added_later_reopens_the_project_until_it_too_lands(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        self.tick()
+        self.ticket("07-import", "Widget import")
+
+        self.now += 60
+        output, reopened = self.tick()
+        self.ticket("07-import", "Widget import", status="done")
+        self.now += 60
+        _, landed = self.tick()
+
+        self.assertNotIn(f"afk: widgets {self.LANDED}", reopened)
+        self.assertNotIn(self.LANDED, output.splitlines())
+        self.assertEqual(landed, [f"afk: widgets {self.LANDED}"])
+
+    def test_no_notice_in_pr_mode_or_when_the_target_is_base_where_the_finished_project_closes(self):
+        for init in [(), ("--land", "local"), ("--land", "local", "--target", "main")]:
+            with self.subTest(init=init):
+                shutil.rmtree(self.project_dir, ignore_errors=True)
+                self.afk("init", str(self.scratch), *init)
+
+                output, notifications = self.tick()
+
+                self.assertNotIn("all tickets landed", output)
+                self.assertEqual(notifications, ["afk: widgets project widgets finished: 2 tickets done"])
+                self.assertFalse(self.project_dir.exists())
+
+    def test_no_notice_while_a_worker_is_left(self):
+        self.ticket("07-import", "Widget import")
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        self.afk("start", "07")
+        self.ticket("07-import", "Widget import", status="closed")  # closed by hand, its worker not yet cleaned up
+
+        output, notifications = self.tick()
+
+        self.assertNotIn("all tickets landed", output)
+        self.assertEqual(notifications, [])
+        self.assertNotIn("all tickets landed", self.afk("status"))
+
+    def test_a_ticket_started_and_dropped_between_polls_does_not_count_as_landed(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        self.tick()
+        self.ticket("07-import", "Widget import")
+        self.afk("start", "07")
+        self.now += 10
+        self.tick()
+
+        shutil.rmtree(self.project_dir / "workers" / "07")  # dropped, its ticket back on the frontier
+        self.now += 10
+        output, notifications = self.tick()
+
+        self.assertNotIn("all tickets landed", output)
+        self.assertNotIn(f"afk: widgets {self.LANDED}", notifications)
+
+    def test_a_target_that_is_only_the_project_clones_base_is_still_an_integration_branch_in_another_clone(self):
+        self.repo_config('base = "widgets-v2"')
+        api = self.tmp / "api"
+        (api / "docs" / "agents").mkdir(parents=True)
+        (api / "docs" / "agents" / "afk.md").write_text('+++\nbase = "main"\n+++\n')
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write(f'\n[repos]\n"acme/api" = "{api}"\n')
+
+        output, _ = self.tick()
+
+        self.assertIn(self.LANDED, output.splitlines())
+
+    def test_status_shows_the_notice_while_every_ticket_has_landed(self):
+        self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
+
+        landed = self.afk("status").splitlines()
+        self.ticket("07-import", "Widget import")
+        reopened = self.afk("status").splitlines()
+
+        self.assertEqual(landed[-1], self.LANDED)
+        self.assertNotIn(self.LANDED, reopened)
 
 
 class ApprovedStartTest(AfkTestCase):
@@ -3151,7 +4527,7 @@ class ApprovedStartTest(AfkTestCase):
         worktree = str(self.project_dir / "worktrees" / "05")
         self.assertEqual(
             [c for c in self.run_fake.find("git", "-C") if c[3] in ("worktree", "branch") and c[4] != "add"],
-            [["git", "-C", str(self.api), "worktree", "remove", worktree],
+            [["git", "-C", str(self.api), "worktree", "remove", "--force", worktree],
              ["git", "-C", str(self.api), "branch", "-D", "afk/widgets-05"]],
         )
 

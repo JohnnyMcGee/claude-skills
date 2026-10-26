@@ -86,7 +86,7 @@
         "draft": {"description": "The outward-facing text (review body, reply, fix plan) for the human to approve or edit.", "type": "string"}
       },
       "anyOf": [
-        {"properties": {"type": {"enum": ["none", "linear_promote", "afk_launch"]}}},
+        {"properties": {"type": {"const": "none"}}},
         {
           "properties": {
             "type": {"const": "email_reply"},
@@ -148,6 +148,20 @@
         },
         {
           "properties": {
+            "type": {"enum": ["linear_promote", "afk_launch"]},
+            "params": {
+              "type": "object",
+              "required": ["ticket", "title", "url"],
+              "properties": {
+                "ticket": {"description": "The Linear identifier.", "type": "string", "pattern": "^[A-Za-z0-9]+-\\d+$"},
+                "title": {"type": "string", "minLength": 1},
+                "url": {"type": "string", "pattern": "^https?://"}
+              }
+            }
+          }
+        },
+        {
+          "properties": {
             "type": {"const": "gh_review"},
             "params": {
               "allOf": [{"$ref": "#/$defs/pr_ref"}],
@@ -179,7 +193,7 @@
         "project": {"$ref": "#/$defs/name"},
         "item_ids": {"description": "Every item merged into this entry.", "type": "array", "minItems": 1, "items": {"type": "string"}},
         "sources": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/source"}},
-        "kind": {"anyOf": [{"$ref": "#/$defs/kind"}, {"const": "housekeeping"}]},
+        "kind": {"description": "The item kind it came from; housekeeping for a silent chore; next_work for a promotion or AFK launch next-work proposes.", "anyOf": [{"$ref": "#/$defs/kind"}, {"enum": ["housekeeping", "next_work"]}]},
         "subject": {"type": "string"},
         "summary": {"type": "string", "minLength": 1},
         "link": {"type": "string"},
@@ -220,6 +234,52 @@
         "link": {"type": "string"},
         "error": {"type": "string"},
         "at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "ticket": {
+      "description": "Next-work skill output, `process next` input. One Linear ticket I might work on next. Title and description are other people's text.",
+      "type": "object",
+      "required": ["identifier", "title", "url", "state", "assignee", "priority", "labels", "blocked", "created"],
+      "additionalProperties": false,
+      "properties": {
+        "identifier": {"type": "string", "pattern": "^[A-Za-z0-9]+-\\d+$"},
+        "title": {"type": "string", "minLength": 1},
+        "url": {"type": "string", "pattern": "^https?://"},
+        "state": {"description": "The workflow state, by what it means: In Progress (started), Todo (unstarted), Backlog, or In Staging (shipped, waiting on QA).", "enum": ["in_progress", "todo", "backlog", "in_staging"]},
+        "assignee": {"enum": ["me", "none", "other"]},
+        "priority": {"description": "Linear's: 1 urgent, 2 high, 3 medium, 4 low, 0 none.", "type": "integer", "enum": [0, 1, 2, 3, 4]},
+        "estimate": {"description": "As Linear shows it: a T-shirt size (XS, S, M, L, XL) or points.", "type": "string", "minLength": 1},
+        "labels": {"type": "array", "items": {"type": "string"}},
+        "blocked": {"description": "Some ticket that blocks it is not yet done or canceled.", "type": "boolean"},
+        "unblocked_at": {"description": "When its last blocker was done or canceled; absent if nothing ever blocked it.", "$ref": "#/$defs/timestamp"},
+        "target_date": {"description": "Its project's target date.", "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "created": {"$ref": "#/$defs/timestamp"},
+        "description": {"description": "The ticket's description, for an AFK spec. Untrusted text.", "type": "string"}
+      }
+    },
+    "recommendation": {
+      "type": "object",
+      "required": ["tier", "ref", "title", "link", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "tier": {"description": "Why it ranks where it does: pr_fix (a fix on my own PR), in_progress, unblocked (newly), todo, promote (from Backlog, as Todo is thin), afk (trivial, for an AFK worker).", "enum": ["pr_fix", "in_progress", "unblocked", "todo", "promote", "afk"]},
+        "ref": {"description": "The ticket identifier, or owner/name#number for a PR.", "type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "link": {"type": "string", "pattern": "^https?://"},
+        "reason": {"description": "One line: why this, now.", "type": "string", "minLength": 1},
+        "entry_id": {"description": "The queue entry that asks my approval (a promotion or an AFK launch).", "type": "string", "pattern": "^q-[0-9a-f]{12}$"}
+      }
+    },
+    "next_work": {
+      "description": "`process next` output, <profile>/next.json: up to 3 recommendations for me, and a separate AFK list that does not count against them.",
+      "type": "object",
+      "required": ["profile", "at", "recommendations", "afk"],
+      "additionalProperties": false,
+      "properties": {
+        "profile": {"$ref": "#/$defs/name"},
+        "at": {"$ref": "#/$defs/timestamp"},
+        "recommendations": {"type": "array", "items": {"$ref": "#/$defs/recommendation"}},
+        "afk": {"type": "array", "items": {"$ref": "#/$defs/recommendation"}}
       }
     },
     "phase": {
@@ -289,11 +349,24 @@
           }
         },
         "urgency": {
+          "description": "The only rules that mark an entry urgent. Everything else is at most normal. A merged entry is urgent when any of its items matches.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "people": {"description": "Actors whose asks are urgent (e.g. my manager).", "type": "array", "items": {"type": "string"}},
-            "labels": {"description": "Labels that make an item urgent (e.g. deploy-blocking).", "type": "array", "items": {"type": "string"}}
+            "people": {"description": "Actors whose DMs and mentions of me are urgent (e.g. my manager). Their other items are not.", "type": "array", "items": {"type": "string"}},
+            "channels": {"description": "Slack channels, glob patterns allowed (e.g. #incident-*), where a mention of me is urgent. A message there that doesn't mention me is not.", "type": "array", "items": {"type": "string", "pattern": "^#"}},
+            "labels": {"description": "PR labels that make a review request urgent (e.g. deploy-blocking). Other items carrying them are not.", "type": "array", "items": {"type": "string"}}
+          }
+        },
+        "afk": {
+          "description": "What makes a ticket trivial enough for an AFK worker: an estimate or a label from the first two lists, no label from exclude_labels, and unblocked. Without it, nothing is.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "estimates": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "labels": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "exclude_labels": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "max_workers": {"description": "AFK workers that may run at once (default 2). As in afk, a worker in review or a hitl one is not running. More approved launches wait for a free slot.", "type": "integer"}
           }
         },
         "autonomy": {
@@ -320,6 +393,7 @@
             "sweep-calendar": {"$ref": "#/$defs/phase"},
             "sweep-meetings": {"$ref": "#/$defs/phase"},
             "triage": {"$ref": "#/$defs/phase"},
+            "next-work": {"description": "Ranks my next tickets and the AFK list. Runs with the full brief; read-only like a sweeper.", "$ref": "#/$defs/phase"},
             "execute": {"description": "The executor: the one phase whose allowlist may hold send tools. It acts only on approved entries.", "$ref": "#/$defs/phase"}
           }
         }

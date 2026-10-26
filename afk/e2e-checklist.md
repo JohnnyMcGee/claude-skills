@@ -10,7 +10,7 @@ It uses a throwaway repo with three trivial tickets in a local `.scratch` spec:
 | 02 — `/version` endpoint | default | 01 | the next batch unblocked by a merge |
 | 03 — change the greeting | `hitl` | — | a guide-mode worker, `cleanup-pending` on a dirty worktree |
 
-Tick each box as you go. Where the result doesn't match **Expect**, note it in [Defects](#defects) and carry on if you can.
+Section 11 covers local landing mode. Tick each box as you go. Where the result doesn't match **Expect**, note it in [Defects](#defects) and carry on if you can.
 
 ## Prerequisites
 
@@ -146,7 +146,8 @@ In the repo, run `claude` and `/afk-setup`. Accept its proposals: base `main`, n
 - [ ] Step 1 reports each machine item as already done, fixed, or needs you. A second run changes nothing.
 - [ ] It writes `docs/agents/afk.md`, and `afk check` prints `is valid` with no warnings
 - [ ] It creates `.claude/skills/pre-pr/SKILL.md`, and afk.md names it
-- [ ] The proof passes all four steps in one run. Afterwards `git worktree list` and `git branch` show no `afk/trial`.
+- [ ] Step 5 finds the reviewer CLIs on your PATH (`coderabbit`, `copilot`): it proposes a `reviewers` command for each one found, and gives an install hint for each one missing without installing it. Accept its proposals.
+- [ ] The proof passes every step in one run, each reviewer exiting 0 over the trial diff without prompting, printing its findings or that it found none, and leaving the worktree clean and HEAD unchanged. With no reviewer installed, the reviewers step is skipped. Afterwards `git worktree list` and `git branch` show no `afk/trial`.
 - [ ] It shows the diff and commits only once you approve. Push the commit to `main`.
 
 ## 3. Init
@@ -224,9 +225,87 @@ Re-open 02's ticket as `Status: ready-for-agent` again and start it.
 - [ ] Once it has a PR, close the PR on GitHub without merging. Within about a minute 02 is cleaned up, you're notified "02 closed and cleaned up", its ticket still reads `Status: ready-for-agent`, and `afk frontier` lists it.
 - [ ] Start 02 once more as a guide-mode worker (`afk start 02 --type hitl`), since only a worker in `pr`, `review` or `hitl` is polled. It isn't cleaned up for the PR the last attempt closed. With no PR, set its ticket to `Status: closed`. Within about a minute it's cleaned up, you're notified "02 ticket closed and cleaned up", and its ticket still reads `Status: closed`.
 
-## 11. Tear down
+## 11. Local landing mode
 
-- [ ] Stop `afk watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e`, the tmux session, `~/code/afk-e2e`, and the GitHub repo (`gh repo delete afk-e2e`).
+Re-uses the throwaway repo, with the PR-mode run above finished and torn down from the afk side (stop its `afk watch`; keep the repo and its remote). This section checks that workers land without a PR, that the integration branch is pushed and base never is, and that approval gates the land. It needs the reviewer CLIs from section 2, step 5 (or accept the code-review subagent fallback). Tickets in a second spec:
+
+| Ticket | Blocked by | Exercises |
+| --- | --- | --- |
+| 01 — `/ping` endpoint | — | critique, stale approval, `afk land`, cleanup |
+| 02 — `/pong` endpoint | 01 | starting from the landed work |
+| 03 — `/echo` endpoint | — | `afk drop --discard`, then landing on a restart |
+
+```bash
+cd ~/code/afk-e2e && git checkout main && git pull
+mkdir -p .scratch/afk-e2e-local/issues && cd .scratch/afk-e2e-local
+printf '# AFK E2E local\n\nThree trivial tickets for the local landing section.\n' > spec.md
+for t in "01 ping none" "02 pong 01" "03 echo none"; do
+  read -r n name blk <<< "$t"
+  blocked=$([ "$blk" = none ] && echo "None — can start immediately" || echo "$blk")
+  printf '# %s — /%s endpoint\n\n**Blocked by:** %s\n\n**Status:** ready-for-agent\n\n`GET /%s` returns 200 with body `%s\\n`.\n\n## Acceptance criteria\n\n- [ ] `GET /%s` returns 200\n- [ ] A unit test covers it\n' "$n" "$name" "$blocked" "$name" "$name" "$name" > "issues/$n-$name-endpoint.md"
+done
+cd ../.. && git rev-parse main origin/main   # note both SHAs
+TMUX= tmux new -s afk-e2e-local -c ~/code/afk-e2e
+```
+
+`TMUX=` lets the new session start from inside the old one. Split the window as in step 3. Everything below runs in this session.
+
+**Init**
+
+- [ ] `/afk init .scratch/afk-e2e-local --land local --target afk-e2e-int` → binds the project and prints `created branch afk-e2e-int from main in …`
+- [ ] `config.toml` has `[landing]` with `mode = "local"` and `target = "afk-e2e-int"`. `git branch` in the repo lists `afk-e2e-int`, and nothing is pushed yet.
+- [ ] Re-running `afk init` with no argument changes nothing: `[landing]` is kept and the branch isn't recreated.
+- [ ] Start `afk watch`. `afk frontier` lists 01 and 03, not 02.
+
+**A worker through critique to review (01)**
+
+- [ ] `/afk next`, approve 01 and 03. Each worktree branches from `afk-e2e-int` (`git log --oneline -1` in it matches `git rev-parse afk-e2e-int`), and each status records `landing` `local` and `target` `afk-e2e-int`.
+- [ ] 01 runs implement → verify → prepr as in step 5. Its prepr merges `afk-e2e-int`, not `origin/main`, and it never pushes or opens a PR.
+- [ ] critique: 01 runs each reviewer from `reviewers` over `git diff afk-e2e-int...HEAD` (or a code-review subagent if none is installed), names any it skipped, and fixes or rejects each finding with a one-line reason. A round that fixed anything ends `done "round: …"` and the critique prompt comes again. A round with nothing to fix moves it on. The dashboard shows phase `critique` throughout.
+- [ ] review: the dashboard shows phase `review` with no PR, the window is marked Ready, and you get a notification that the branch is ready for review. The worker replies "Standing by."
+
+**Feedback leaves the approval stale**
+
+- [ ] While 01 is in review, type feedback into its agent pane: "also return `Content-Length`". It fixes, commits, re-runs the pre-PR skill, merges `afk-e2e-int`, critiques the changed diff and reports `done`. Your feedback came before the new commit, so any earlier "approve" is stale. Ask it to run `afk land "test: stale"` by hand. Expect a refusal "no approval since the branch's last commit", with `afk-e2e-int` unmoved.
+
+**Approval, then `afk land`**
+
+- [ ] Type "approve" in 01's agent pane after its last commit. It writes a conventional commit message with a `Ticket: 01` trailer and runs `afk land "…"`.
+- [ ] Expect `afk land` to print the new commit on `afk-e2e-int`. `git log --oneline afk-e2e-int` shows one new commit, not 01's branch history, and the message matches.
+
+**Target pushed, base untouched**
+
+- [ ] `git rev-parse origin/afk-e2e-int` equals `afk-e2e-int` after `git fetch`: the integration branch was pushed.
+- [ ] `git rev-parse main origin/main` match the two SHAs you noted before init: base was not moved or pushed.
+- [ ] In 01's agent pane, `git push origin afk-e2e-int`, `git checkout afk-e2e-int` and `git update-ref refs/heads/afk-e2e-int HEAD` are each denied.
+
+**Cleanup**
+
+- [ ] Within about a minute 01's window, worktree and local branch are gone, its slot is freed, and you're notified "01 landed and cleaned up; run `/afk next`".
+- [ ] `.scratch/afk-e2e-local/issues/01-ping-endpoint.md` reads `Status: done`
+- [ ] `afk frontier` now lists 02
+
+**A dependent ticket starts from the landed work (02)**
+
+- [ ] `/afk next` proposes 02, noting that 03 is running. On approval, 02's worktree branches from `afk-e2e-int` and `git log` there includes 01's landed commit. `/ping` and its test are in the worktree.
+- [ ] Run 02 through critique to review. Approve it so it lands on top of 01 without a conflict. Keep 03 running until the drop below, then finish 02 and the rest.
+
+**`afk drop --discard`**
+
+- [ ] 03 is not worth landing. In the right pane (not 03's agent pane) run `afk drop 03`. Expect it to exit with `afk: dropping 03 would delete N unlanded commits…; run `afk drop 03 --discard`…`, changing nothing, and to list any uncommitted changes and anything running in the shell pane.
+- [ ] Ask 03's agent to run `afk drop 03 --discard`. Expect it to be denied. Then run it yourself: 03's window, worktree and branch go, its slot is freed, and it says what it deleted. `afk frontier` lists 03 again, and its ticket still reads `Status: ready-for-agent`.
+- [ ] `afk drop 01 --discard` refuses, as 01 has no worker. Right after 02 lands, before the watcher cleans it up, `afk drop 02 --discard` refuses and says the watcher will clean it up (best-effort: the window is short).
+
+**The all-landed notification**
+
+- [ ] While 03 is on the frontier, there is no "all tickets landed" line on the dashboard or in `afk status`, and no notification.
+- [ ] Start 03 again, take it through to review, approve and land it. Once the last worker is cleaned up and every ticket is done, the dashboard and `afk status` say `all tickets landed on afk-e2e-int; open a PR to main when ready`, and you're notified once.
+- [ ] The integration branch holds one commit per ticket: `git log --oneline main..afk-e2e-int` shows three. Open a PR from it to `main` with `gh pr create --base main --head afk-e2e-int`; that is the only PR in the run.
+- [ ] Add `issues/04-extra-endpoint.md` to the spec (copy 03's, renumbered). The all-landed line goes away; run it through to a land and the line returns with another notification, and `git log --oneline main..afk-e2e-int` shows four.
+
+## 12. Tear down
+
+- [ ] Stop `afk watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, both tmux sessions, `~/code/afk-e2e`, and the GitHub repo (`gh repo delete afk-e2e`).
 
 ## Defects
 

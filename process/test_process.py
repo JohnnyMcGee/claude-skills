@@ -1,10 +1,15 @@
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import process
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "afk"))
+import afk  # noqa: E402  the AFK spec contract is afk's own parser
 
 
 class FakeRun:
@@ -65,10 +70,12 @@ team = "{team}"
 {extra}
 [urgency]
 people = ["boss"]
+channels = ["#incident-*"]
 labels = ["deploy-blocking"]
 
 [autonomy]
 silent = {silent}
+{afk}
 
 [phases.sweep-github]
 model = "sonnet"
@@ -81,6 +88,10 @@ allowed_tools = ["Read", "Bash(process emit:*)", "mcp__linear-server__get_notifi
 [phases.triage]
 model = "opus"
 allowed_tools = {triage_tools}
+
+[phases.next-work]
+model = "opus"
+allowed_tools = ["Read", "Bash(process next:*)", "mcp__linear-server__list_issues"]
 
 [phases.execute]
 model = "opus"
@@ -203,7 +214,7 @@ class ProcessTestCase(unittest.TestCase):
     def state(self):
         return self.tmp / "state" / "process"
 
-    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Bash(process execute plan:*)", "Bash(process execute result:*)"), text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None, repo="acme/widgets", team="WID", sweep_tools=("Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__github__pull_request_read")):
+    def write_profile(self, name="acme", active=True, silent=(), triage_tools=("Read", "Bash(process triage:*)", "mcp__linear-server__mark_notification"), execute_tools=("Bash(process execute plan:*)", "Bash(process execute result:*)"), afk=None, text=None, sources=("github", "linear"), workspace="acme", account="me@acme.example", watchlist=("#deploys",), match=None, repo="acme/widgets", team="WID", sweep_tools=("Read", "Bash(process emit:*)", "Bash(gh pr list:*)", "mcp__github__pull_request_read")):
         path = self.tmp / "config" / "process" / "profiles" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         extra = ""
@@ -229,6 +240,7 @@ class ProcessTestCase(unittest.TestCase):
                 triage_tools=json.dumps(list(triage_tools)),
                 sweep_tools=json.dumps(list(sweep_tools)),
                 execute_tools=json.dumps(list(execute_tools)),
+                afk="[afk]\n" + "".join(f"{k} = {json.dumps(v)}\n" for k, v in afk.items()) if afk else "",
             )
         )
         return path
@@ -461,12 +473,69 @@ class TriageTest(TriageTestCase):
         self.assertNotEqual(queue[1]["item_ids"], first["item_ids"])
 
 
+class UrgencyTest(TriageTestCase):
+    """Exactly three rules interrupt me: a DM or mention from an urgent person, a mention in an incident channel, and a
+    review request labeled deploy-blocking."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_profile(sources=ALL_SOURCES)
+
+    def urgent(self):
+        """The summaries of the entries triage marked urgent."""
+        return sorted(e["summary"] for e in self.triage() if e["urgency"] == "urgent")
+
+    def test_a_dm_or_a_mention_from_my_manager_is_urgent(self):
+        self.emit(slack(native_id="D1/1", kind="dm", actor={"name": "boss", "role": "person"}, summary="Boss DMed you about the launch", facts={"channel": "DM", "ask": "question"}), source="slack")
+        self.emit(linear(native_id="notif-9", kind="mention", subject="https://linear.app/acme/issue/WID-9#comment-c-9", actor={"name": "boss", "role": "person"}, summary="Boss mentioned you on WID-9", facts={"notification_id": "notif-9"}), source="linear")
+
+        self.assertEqual(self.urgent(), ["Boss DMed you about the launch", "Boss mentioned you on WID-9"])
+
+    def test_my_manager_is_matched_whatever_the_case_a_source_shows_their_name_in(self):
+        self.emit(slack(native_id="D1/1", kind="dm", actor={"name": "Boss", "role": "person"}, summary="Boss DMed you about the launch", facts={"channel": "DM", "ask": "question"}), source="slack")
+
+        self.assertEqual(self.urgent(), ["Boss DMed you about the launch"])
+
+    def test_my_managers_pr_comment_or_ticket_change_is_not_urgent(self):
+        self.emit(item(native_id="comment/1", kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-1", actor={"name": "boss", "role": "person"}, summary="Boss commented on #7"))
+        self.emit(linear(native_id="issue/WID-20", kind="ticket_change", subject="https://linear.app/acme/issue/WID-20", actor={"name": "boss", "role": "person"}, summary="Boss moved WID-20's due date up", facts={}), source="linear")
+
+        self.assertEqual(self.urgent(), [])
+
+    def test_a_mention_in_an_incident_channel_is_urgent_but_an_incident_message_that_does_not_mention_me_is_not(self):
+        self.emit(
+            slack(native_id="C9/1", summary="Ops asked you in #incident-db to check the replica lag", facts={"channel": "#incident-db", "ask": "question"}),
+            slack(native_id="C9/2", kind="channel_message", summary="Ops posted an update in #incident-db", facts={"channel": "#incident-db"}),
+            slack(native_id="C1/3", summary="Dee asked you in #deploys about the index", facts={"channel": "#deploys", "ask": "question"}),
+            source="slack",
+        )
+
+        self.assertEqual(self.urgent(), ["Ops asked you in #incident-db to check the replica lag"])
+
+    def test_a_review_request_labeled_deploy_blocking_is_urgent_but_the_label_elsewhere_is_not(self):
+        self.emit(
+            item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", labels=["deploy-blocking"], summary="Ben requested your review on #102"),
+            item(native_id="comment/2", kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-2", labels=["deploy-blocking"], summary="Ana commented on #7"),
+        )
+
+        self.assertEqual(self.urgent(), ["Ben requested your review on #102"])
+
+    def test_the_same_ask_in_slack_and_linear_is_one_urgent_entry_when_either_item_matches(self):
+        permalink = "https://acme.slack.com/archives/C300/p1792500000000900"
+        self.emit(slack(native_id="C300/1792500000.000900", subject=permalink, link=permalink, actor={"name": "boss", "role": "person"}, summary="Boss asked you in #widgets for the export ETA", facts={"channel": "#widgets", "ask": "question"}), source="slack")
+        self.emit(linear(native_id="notif-10", kind="mention", subject=permalink, actor={"name": "Slack", "role": "bot"}, summary="Slack thread synced to WID-15 mentions you", facts={"notification_id": "notif-10"}), source="linear")
+
+        [ask] = [e for e in self.triage() if e["kind"] == "mention"]
+
+        self.assertEqual((ask["sources"], ask["urgency"]), (["linear", "slack"], "urgent"))
+
+    def test_a_dm_from_a_peer_is_not_urgent(self):
+        self.emit(slack(native_id="D1/1", kind="dm", summary="Dee DMed you about the index", facts={"channel": "DM", "ask": "question"}), source="slack")
+
+        self.assertEqual(self.urgent(), [])
+
+
 class TriageRulesTest(TriageTestCase):
-    def test_asks_from_urgent_people_or_with_urgent_labels_are_urgent(self):
-        self.emit(item(actor={"name": "boss", "role": "person"}), item(native_id="pr/102", subject="https://github.com/acme/widgets/pull/102", labels=["deploy-blocking"]), item(native_id="pr/103", subject="https://github.com/acme/widgets/pull/103"))
-
-        self.assertEqual([e["urgency"] for e in self.triage()], ["urgent", "urgent", "normal"])
-
     def test_an_action_type_promoted_to_silent_skips_approval(self):
         self.write_profile(silent=["gh_thread_reply"])
         self.emit(item(kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#issuecomment-9"))
@@ -1496,6 +1565,380 @@ class DryRunExecuteTest(ExecuteTestCase):
         self.assertIn("only a dry run records skipped", self.process("execute", "result", "acme", self.review["id"], "skipped", expect=1))
 
 
+def ticket(identifier, **over):
+    """A candidate ticket as the next-work skill hands it to `process next`."""
+    base = {
+        "identifier": identifier,
+        "title": f"Ticket {identifier}",
+        "url": f"https://linear.app/acme/issue/{identifier}",
+        "state": "todo",
+        "assignee": "none",
+        "priority": 3,
+        "labels": [],
+        "blocked": False,
+        "created": "2026-10-01T12:00:00Z",
+    }
+    return {**base, **over}
+
+
+class NextWorkTestCase(ExecuteTestCase):
+    def next_work(self, *tickets, profile="acme"):
+        out = self.process("next", profile, stdin="".join(json.dumps(t) + "\n" for t in tickets))
+        return out, json.loads((self.profile_dir(profile) / "next.json").read_text())
+
+    def picks(self, result):
+        return [r["ref"] for r in result["recommendations"]]
+
+
+class NextWorkRankingTest(NextWorkTestCase):
+    def test_in_progress_comes_first_then_todo_by_priority_then_target_date_then_age(self):
+        _, result = self.next_work(
+            ticket("WID-1", priority=4),
+            ticket("WID-2", priority=2, target_date="2026-12-01"),
+            ticket("WID-3", priority=2, target_date="2026-11-01", created="2026-10-10T12:00:00Z"),
+            ticket("WID-4", priority=2, target_date="2026-11-01", created="2026-09-10T12:00:00Z"),
+            ticket("WID-5", state="in_progress", assignee="me", priority=4),
+        )
+
+        self.assertEqual(self.picks(result), ["WID-5", "WID-4", "WID-3"])
+        self.assertTrue(all(r["reason"].strip() for r in result["recommendations"]))
+        self.assertEqual(self.process("validate", "next_work", str(self.profile_dir() / "next.json")), "")
+
+    def test_fixes_waiting_on_me_on_my_own_prs_come_before_any_ticket(self):
+        self.emit(
+            my_pr(8, mergeable="mergeable", checks="failing", review="review_required"),
+            item(native_id="comment/9001", kind="pr_comment", subject="https://github.com/acme/widgets/pull/8#issuecomment-9001", summary="Ana asks why offset pagination", facts={"collaborator": True}),
+            item(native_id="comment/9002", kind="pr_comment", subject="https://github.com/acme/widgets/pull/7#discussion_r9002", actor={"name": "lint-bot", "role": "bot"}, summary="Unused import on #7"),
+        )
+        self.triage()
+
+        _, result = self.next_work(ticket("WID-5", state="in_progress", assignee="me", priority=1))
+
+        self.assertEqual(self.picks(result), ["acme/widgets#8", "WID-5"])  # the bot's fix on #7 is the executor's, not mine
+        [fix] = [r for r in result["recommendations"] if r["tier"] == "pr_fix"]
+        self.assertEqual(fix["link"], "https://github.com/acme/widgets/pull/8")
+        self.assertIn("2 fixes waiting", fix["reason"])
+
+    def test_a_newly_unblocked_ticket_comes_before_the_rest_of_todo_and_a_blocked_one_never_ranks(self):
+        _, result = self.next_work(
+            ticket("WID-1", priority=1),
+            ticket("WID-2", priority=4, unblocked_at="2026-10-19T09:00:00Z"),
+            ticket("WID-3", priority=4, unblocked_at="2026-10-01T09:00:00Z"),  # long ago: just another Todo ticket
+            ticket("WID-4", priority=1, blocked=True),
+        )
+
+        self.assertEqual(self.picks(result), ["WID-2", "WID-1", "WID-3"])
+        self.assertIn("Unblocked 2026-10-19", result["recommendations"][0]["reason"])
+
+    def test_backlog_fills_the_slots_todo_leaves_as_promotions_queued_for_my_approval(self):
+        _, result = self.next_work(ticket("WID-1"), ticket("WID-7", state="backlog", priority=4), ticket("WID-8", state="backlog", priority=2), ticket("WID-9", state="backlog", priority=3))
+
+        self.assertEqual(self.picks(result), ["WID-1", "WID-8", "WID-9"])
+        promotions = [e for e in self.queue() if e["action"]["type"] == "linear_promote"]
+        self.assertEqual([e["action"]["params"]["ticket"] for e in promotions], ["WID-8", "WID-9"])
+        self.assertEqual({(e["status"], e["autonomy"]) for e in promotions}, {("pending", "draft")})
+        self.assertEqual([r.get("entry_id") for r in result["recommendations"]], [None] + [e["id"] for e in promotions])
+        self.assertIn("Todo is thin", result["recommendations"][1]["reason"])
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+        self.assertEqual(self.run_fake.calls, [])  # proposed, never done
+
+    def test_backlog_is_left_alone_while_todo_fills_every_slot(self):
+        _, result = self.next_work(ticket("WID-1"), ticket("WID-2"), ticket("WID-3"), ticket("WID-8", state="backlog", priority=1))
+
+        self.assertEqual(self.picks(result), ["WID-1", "WID-2", "WID-3"])
+        self.assertEqual(self.queue(), [])
+
+    def test_the_full_brief_shows_my_next_work_with_reasons_and_the_afk_list(self):
+        self.write_profile(afk=TRIVIAL)
+        self.next_work(ticket("WID-5", state="in_progress", assignee="me", title="Paginate orders"), ticket("WID-1", estimate="S", title="Rename the flag"))
+
+        self.process("brief")
+
+        brief = (self.state / "brief.md").read_text()
+        section = brief.split("### Next work", 1)[1]
+        self.assertIn("1. WID-5 Paginate orders — Already in progress: medium priority, opened 19 days ago · https://linear.app/acme/issue/WID-5", section)
+        self.assertIn("AFK: WID-1 Rename the flag — Trivial: estimate S · pending", section)
+        self.process("brief", "--delta")
+        self.assertNotIn("### Next work", (self.state / "brief.md").read_text())  # it runs with the full brief
+
+    def test_in_staging_tickets_never_take_a_slot(self):
+        _, result = self.next_work(ticket("WID-1", state="in_staging", assignee="me", priority=1), ticket("WID-2"))
+
+        self.assertEqual(self.picks(result), ["WID-2"])
+
+
+# Maxim's trivial rules.
+TRIVIAL = {"estimates": ["XS", "S"], "labels": ["Cleanup", "Technical Debt", "Coderabbit"], "exclude_labels": ["Decompose", "Needs Design", "wayfinder:grilling"]}
+
+
+class AfkListTest(NextWorkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(afk=TRIVIAL)
+
+    def test_trivial_unblocked_todo_tickets_go_to_a_separate_afk_list_queued_for_my_approval(self):
+        _, result = self.next_work(
+            ticket("WID-1", estimate="S", description="Rename the flag."),
+            ticket("WID-2", estimate="L", labels=["Cleanup"]),
+            ticket("WID-3", estimate="XS", labels=["Needs Design"]),
+            ticket("WID-4", estimate="XS", blocked=True),
+            ticket("WID-5", estimate="M"),
+        )
+
+        self.assertEqual(self.picks(result), ["WID-3", "WID-5"])  # the AFK list doesn't count against my 3
+        self.assertEqual([a["ref"] for a in result["afk"]], ["WID-1", "WID-2"])
+        self.assertEqual([a["reason"] for a in result["afk"]], ["Trivial: estimate S", "Trivial: labeled Cleanup"])
+        launches = [e for e in self.queue() if e["action"]["type"] == "afk_launch"]
+        self.assertEqual([e["id"] for e in launches], [a["entry_id"] for a in result["afk"]])
+        self.assertEqual({(e["status"], e["autonomy"]) for e in launches}, {("pending", "draft")})
+        self.assertIn("Rename the flag.", launches[0]["action"]["draft"])
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+        self.assertEqual(self.run_fake.calls, [])
+
+    def test_what_is_trivial_comes_from_the_profile(self):
+        self.write_profile(afk={**TRIVIAL, "estimates": ["M"]})
+
+        _, result = self.next_work(ticket("WID-1", estimate="S"), ticket("WID-5", estimate="M"))
+
+        self.assertEqual([a["ref"] for a in result["afk"]], ["WID-5"])
+        self.write_profile()  # no [afk] rules: nothing is trivial
+        _, result = self.next_work(ticket("WID-1", estimate="S"), ticket("WID-5", estimate="M"))
+        self.assertEqual((self.picks(result), result["afk"]), (["WID-1", "WID-5"], []))
+
+
+class NextWorkProposalsTest(NextWorkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(afk=TRIVIAL)
+
+    def test_a_rerun_keeps_each_proposal_waiting_once_and_supersedes_those_it_no_longer_makes(self):
+        self.next_work(ticket("WID-1", estimate="S"), ticket("WID-8", state="backlog"))
+        before = self.queue()
+
+        _, result = self.next_work(ticket("WID-1", estimate="S"), ticket("WID-2"), ticket("WID-3"), ticket("WID-4"), ticket("WID-8", state="backlog"))
+
+        [promote] = [e for e in before if e["action"]["type"] == "linear_promote"]
+        [afk] = [e for e in before if e["action"]["type"] == "afk_launch"]
+        self.assertEqual({e["id"]: e["status"] for e in self.queue()}, {afk["id"]: "pending", promote["id"]: "superseded"})
+        self.assertEqual(len(self.jsonl(self.state / "queue.jsonl")), 3)  # the waiting launch was not appended again
+        self.assertEqual(result["afk"][0]["entry_id"], afk["id"])
+
+    def test_a_skipped_afk_launch_never_comes_back_and_the_ticket_is_mine_again(self):
+        self.next_work(ticket("WID-1", estimate="S"))
+        [launch] = self.queue()
+        self.decide(launch, "skip")
+        self.process("execute")
+
+        _, result = self.next_work(ticket("WID-1", estimate="S"))
+
+        self.assertEqual((self.picks(result), result["afk"]), (["WID-1"], []))
+        self.assertEqual([e["status"] for e in self.queue()], ["skipped"])
+
+    def test_an_approved_promotion_is_carried_out_by_the_executor_phase(self):
+        self.next_work(ticket("WID-8", state="backlog"))
+        [promote] = self.queue()
+        self.decide(promote)
+
+        self.process("execute")
+
+        self.assertEqual(self.executor_calls()[0][2], "/execute acme")
+        plan = self.process("execute", "plan", "acme")
+        self.assertIn(f'{promote["id"]}  linear_promote {{"ticket": "WID-8"', plan)
+        self.assertIn("| Move WID-8 from Backlog to Todo.", plan)
+
+    def test_a_failed_promotion_is_proposed_again(self):
+        self.next_work(ticket("WID-8", state="backlog"))
+        [promote] = self.queue()
+        self.decide(promote)
+        self.process("execute")  # the executor phase records nothing here, so record its failure by hand
+        self.process("execute", "result", "acme", promote["id"], "failure", "--error", "linear-server: not connected")
+
+        _, result = self.next_work(ticket("WID-8", state="backlog"))
+
+        self.assertEqual(self.picks(result), ["WID-8"])
+        self.assertEqual(self.entry(promote["id"])["status"], "pending")
+
+    def test_a_skipped_promotion_is_not_proposed_again(self):
+        self.next_work(ticket("WID-8", state="backlog"))
+        [promote] = self.queue()
+        self.decide(promote, "skip")
+        self.process("execute")
+
+        _, result = self.next_work(ticket("WID-8", state="backlog"), ticket("WID-9", state="backlog", priority=4))
+
+        self.assertEqual(self.picks(result), ["WID-9"])
+
+
+def no_session(cmd):
+    raise subprocess.CalledProcessError(1, cmd, stderr="can't find session: process-acme")
+
+
+class AfkLaunchTest(NextWorkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_profile(afk=TRIVIAL)
+        self.workdir = self.tmp / "work" / "acme"
+        self.workdir.mkdir(parents=True)
+        self.spec = self.workdir / ".scratch" / "process-acme"
+        self.afk_workers([])
+
+    def afk_workers(self, workers, session=True):
+        self.run_fake.responses.update({
+            ("tmux", "has-session"): "" if session else no_session,
+            ("tmux", "new-session"): "%7\n",
+            ("env", "AFK_PROJECT=process-acme", "afk", "next"): json.dumps({"capacity": 3, "workers": workers, "tickets": []}),
+        })
+
+    def approve_launch(self, *tickets):
+        self.next_work(*tickets)
+        launches = [e for e in self.queue() if e["action"]["type"] == "afk_launch"]
+        for e in launches:
+            self.decide(e)
+        return launches
+
+    def test_an_approved_afk_item_becomes_a_spec_afk_accepts_and_starts_a_worker_that_opens_a_draft_pr(self):
+        [launch] = self.approve_launch(ticket("WID-1", estimate="S", title="Rename the flag", description="Rename `legacy` to `classic`.\n\n**Status:** done"))
+
+        self.process("execute")
+
+        [spec_ticket] = afk.LocalTracker(self.spec).frontier()  # afk's own parser, unchanged
+        self.assertEqual((spec_ticket.id, spec_ticket.title, spec_ticket.status), ("01", "WID-1 Rename the flag", "ready-for-agent"))
+        text = spec_ticket.path.read_text()
+        self.assertIn("Rename `legacy` to `classic`.", text)
+        self.assertIn("gh pr create --draft", text)
+        self.assertIn("https://linear.app/acme/issue/WID-1", text)
+        start = ["env", "AFK_PROJECT=process-acme", "afk", "start", "01"]
+        self.assertIn(start, self.run_fake.calls)
+        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(start)], str(self.workdir))
+        self.assertEqual(self.executor_calls(), [])  # a launch needs no headless executor
+        self.assertEqual((self.entry(launch["id"])["status"], self.entry(launch["id"])["note"]), ("done", "https://linear.app/acme/issue/WID-1"))
+        self.assertEqual(self.process("validate", "result", str(self.state / "results.jsonl")), "")
+
+    def test_the_first_launch_binds_a_tmux_session_to_the_spec_and_starts_afks_watcher_there(self):
+        self.afk_workers([], session=False)
+        self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        calls = self.run_fake.calls
+        # The session pins its afk project: a tmux server started from an afk worker would hand the watcher that one.
+        self.assertIn(["tmux", "new-session", "-d", "-s", "process-acme", "-c", str(self.workdir), "-e", "AFK_PROJECT=process-acme", "-P", "-F", "#{pane_id}"], calls)
+        init = ["env", "TMUX_PANE=%7", "afk", "init", str(self.spec)]
+        watch = ["tmux", "send-keys", "-t", "%7", "afk watch", "Enter"]
+        self.assertLess(calls.index(init), calls.index(watch))
+        self.assertLess(calls.index(watch), calls.index(["env", "AFK_PROJECT=process-acme", "afk", "start", "01"]))
+
+    def test_a_launched_ticket_is_off_both_lists(self):
+        self.approve_launch(ticket("WID-1", estimate="S"))
+        self.process("execute")
+
+        _, result = self.next_work(ticket("WID-1", estimate="S"))
+
+        self.assertEqual((self.picks(result), result["afk"]), ([], []))
+
+    def starts(self):
+        return [c[4] for c in self.run_fake.calls if c[:4] == ["env", "AFK_PROJECT=process-acme", "afk", "start"]]
+
+    def test_no_more_than_two_afk_workers_run_at_once_and_extra_approvals_wait_for_a_free_slot(self):
+        self.afk_workers([{"ticket": "01", "phase": "implement"}, {"ticket": "02", "phase": "review"}, {"ticket": "03", "phase": "hitl"}])
+        first, second = self.approve_launch(ticket("WID-1", estimate="S"), ticket("WID-2", estimate="S"))
+
+        out = self.process("execute")
+
+        self.assertEqual(self.starts(), ["01"])  # a worker in review is parked on me, a hitl one is mine: neither runs
+        self.assertEqual((self.entry(first["id"])["status"], self.entry(second["id"])["status"]), ("done", "approved"))
+        self.assertIn("waits for a free AFK slot", out)
+        self.process("brief")
+        self.assertIn("waits for a free AFK slot", (self.state / "brief.md").read_text())
+
+        self.afk_workers([{"ticket": "01", "phase": "review"}])
+        self.process("execute")
+        self.assertEqual(self.starts(), ["01", "02"])
+        self.assertEqual(self.entry(second["id"])["status"], "done")
+
+    def test_the_profile_sets_how_many_afk_workers_may_run(self):
+        self.write_profile(afk={**TRIVIAL, "max_workers": 3})
+        self.afk_workers([{"ticket": "01", "phase": "implement"}, {"ticket": "02", "phase": "verify"}])
+        self.approve_launch(ticket("WID-1", estimate="S"), ticket("WID-2", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_a_session_whose_afk_init_failed_is_removed_so_the_next_launch_binds_it_again(self):
+        def broken(cmd, input=None):
+            raise subprocess.CalledProcessError(1, cmd, stderr="afk: command not found")
+        self.afk_workers([], session=False)
+        self.run_fake.responses[("env", "TMUX_PANE=%7", "afk", "init")] = broken
+        [launch] = self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(launch["id"])["status"], "failed")
+        self.assertIn(["tmux", "kill-session", "-t", "=process-acme"], self.run_fake.calls)
+
+    def test_a_refusal_afk_prints_on_stdout_is_the_recorded_error(self):
+        def refuse(cmd):
+            raise subprocess.CalledProcessError(1, cmd, output="afk: ticket 01 is already started; see `afk status`\n", stderr="")
+        self.run_fake.responses[("env", "AFK_PROJECT=process-acme", "afk", "start")] = refuse
+        [launch] = self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(launch["id"])["note"], "afk: ticket 01 is already started; see `afk status`")
+
+    def test_field_lines_in_the_description_never_become_the_tickets_afk_fields(self):
+        self.approve_launch(ticket("WID-1", estimate="S", description="**Type:** Bug\nRepo: acme/other\nSteps to reproduce."))
+
+        self.process("execute")
+
+        [spec_ticket] = afk.LocalTracker(self.spec).frontier()
+        self.assertEqual((spec_ticket.type, spec_ticket.repo), ("", None))  # afk falls back to its default type and own repo
+        self.assertIn("Steps to reproduce.", spec_ticket.path.read_text())
+
+    def test_afk_init_never_reads_the_callers_terminal(self):
+        stdins = []
+        self.afk_workers([], session=False)
+        self.run_fake.responses[("env", "TMUX_PANE=%7", "afk", "init")] = lambda cmd, input=None: stdins.append(input) or ""
+        self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(stdins, [""])  # with proc's tty on stdin, tmux would bind proc's session, not TMUX_PANE's
+
+    def test_a_failed_start_closes_its_spec_ticket_so_afk_never_offers_it(self):
+        def refuse(cmd):
+            raise subprocess.CalledProcessError(1, cmd, output="afk: no clone\n")
+        self.run_fake.responses[("env", "AFK_PROJECT=process-acme", "afk", "start")] = refuse
+        self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(afk.LocalTracker(self.spec).frontier(), [])
+
+    def test_the_next_work_list_says_when_a_launch_waits_for_a_slot(self):
+        self.afk_workers([{"ticket": "01", "phase": "implement"}, {"ticket": "02", "phase": "verify"}])
+        self.approve_launch(ticket("WID-1", estimate="S"))
+        self.process("execute")
+
+        self.process("brief")
+
+        self.assertIn("Trivial: estimate S · approved, waits for a free AFK slot", (self.state / "brief.md").read_text())
+
+    def test_a_failed_start_is_recorded_as_a_failure(self):
+        def refuse(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="afk: base branch 'main' does not exist")
+        self.run_fake.responses[("env", "AFK_PROJECT=process-acme", "afk", "start")] = refuse
+        [launch] = self.approve_launch(ticket("WID-1", estimate="S"))
+
+        self.process("execute")
+
+        self.assertEqual(self.entry(launch["id"])["status"], "failed")
+        self.assertIn("base branch", self.entry(launch["id"])["note"])
+        _, result = self.next_work(ticket("WID-1", estimate="S"))
+        self.assertEqual((self.picks(result), result["afk"]), (["WID-1"], []))  # back to me
+
+
 class ContractTest(ProcessTestCase):
     def test_decisions_and_results_validate_against_the_shared_schema(self):
         approve = {"entry_id": "q-0123456789ab", "verdict": "approve", "draft": "Edited.", "reason": "too formal", "promote_to_silent": False, "at": "2026-10-20T13:05:00Z"}
@@ -1521,9 +1964,9 @@ class RunTest(ProcessTestCase):
         self.process("run")
 
         calls = self.claude_calls()
-        self.assertEqual([c[:3] for c, _ in calls], [["claude", "-p", "/sweep-github acme"], ["claude", "-p", "/sweep-linear acme"], ["claude", "-p", "/triage acme"]])
+        self.assertEqual([c[2] for c, _ in calls], ["/sweep-github acme", "/sweep-linear acme", "/triage acme", "/next-work acme"])
         profile = process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")
-        for (cmd, cwd), phase in zip(calls, ["sweep-github", "sweep-linear", "triage"]):
+        for (cmd, cwd), phase in zip(calls, ["sweep-github", "sweep-linear", "triage", "next-work"]):
             self.assertEqual(self.opt(cmd, "--model"), profile["phases"][phase]["model"])
             inbox = self.profile_dir("acme") / "inbox"
             self.assertEqual(self.opt(cmd, "--allowedTools").split(","), profile["phases"][phase]["allowed_tools"] + [f"Edit(/{inbox}/**)"])
@@ -1545,6 +1988,16 @@ class RunTest(ProcessTestCase):
         self.assertIn("· delta", brief)
         self.assertNotIn("## acme", brief)
 
+    def test_next_work_runs_with_the_full_brief_only_and_reads_fixtures_in_a_dry_run(self):
+        self.write_profile("acme")
+
+        self.process("run", "--delta")
+        self.assertNotIn("/next-work acme", [c[2] for c, _ in self.claude_calls()])
+
+        self.env["XDG_STATE_HOME"] = str(self.tmp / "scratch")
+        self.process("run", "--fixtures", "/fx")
+        self.assertIn("/next-work acme --fixtures /fx", [c[2] for c, _ in self.claude_calls()])
+
     def test_a_source_shared_by_two_profiles_is_swept_once_for_both(self):
         self.write_profile("acme", sources=ALL_SOURCES)
         self.write_profile("side", sources=ALL_SOURCES)
@@ -1559,7 +2012,7 @@ class RunTest(ProcessTestCase):
 
         prompts = [c[2] for c, _ in self.claude_calls()]
         shared = [f"/sweep-{s} acme" for s in ALL_SOURCES[2:]]
-        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", *shared, "/triage acme", "/sweep-github side", "/sweep-linear side", "/triage side"])
+        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", *shared, "/triage acme", "/next-work acme", "/sweep-github side", "/sweep-linear side", "/triage side", "/next-work side"])
         self.assertNotIn("slack", (self.state / "brief.md").read_text())  # side's watermark moved with acme's sweep
 
     def test_unsorted_items_get_their_own_section_of_the_brief_once(self):
@@ -1657,7 +2110,7 @@ class RunTest(ProcessTestCase):
 
         prompts = self.silent_fix_run()
 
-        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", "/triage acme", "/execute acme"])
+        self.assertEqual(prompts, ["/sweep-github acme", "/sweep-linear acme", "/triage acme", "/next-work acme", "/execute acme"])
         self.assertIn("> ⚠ execute left 1 approved entr(ies) without a result", (self.state / "brief.md").read_text())
 
     def test_run_skips_its_executor_while_procs_executor_is_running(self):
@@ -1693,6 +2146,7 @@ class RunTest(ProcessTestCase):
         self.assertNotIn("sweep-github", brief)
         self.assertIn("> ⚠ sweep-linear stored nothing: its watermark did not move", brief)
         self.assertIn("> ⚠ triage left 1 item(s) unhandled", brief)
+        self.assertIn("> ⚠ next-work ranked nothing: next.json was not written", brief)
 
     def test_a_dry_run_refuses_to_write_into_the_real_state_directory(self):
         self.write_profile("acme")
@@ -1719,7 +2173,7 @@ class RunTest(ProcessTestCase):
 
         self.process("run")
 
-        self.assertEqual(self.claude_calls()[-1][0][2], "/triage acme")
+        self.assertIn("/triage acme", [c[2] for c, _ in self.claude_calls()])
         self.assertIn("> ⚠ sweep-linear failed: linear-server: not connected", (self.state / "brief.md").read_text())
 
 
@@ -1792,6 +2246,14 @@ class ProfileTest(ProcessTestCase):
             with self.subTest(tool=tool):
                 self.write_profile(sweep_tools=["Read", tool])
                 self.assertIn(f"phases.sweep-github grants {tool!r}", self.process("profiles", expect=1))
+
+    def test_next_work_is_read_only_like_a_sweeper(self):
+        path = self.write_profile()
+        for tool in self.SILENT_WRITES:
+            with self.subTest(tool=tool):
+                path.write_text(path.read_text().replace('"Bash(process next:*)", ', f'"Bash(process next:*)", "{tool}", '))
+                self.assertIn(f"phases.next-work grants {tool!r}", self.process("profiles", expect=1))
+                path = self.write_profile()
 
     def test_sweepers_may_read_slack_reactions_calendars_and_meeting_notes(self):
         reads = ["mcp__slack__slack_get_reactions", "mcp__slack__slack_read_thread", "mcp__claude_ai_Google_Calendar__list_events", "mcp__claude_ai_Google_Drive__read_file_content", "mcp__claude_ai_Gmail__search_threads"]
@@ -1926,6 +2388,8 @@ class ProfileTest(ProcessTestCase):
         self.assertEqual(acme["slack"]["watchlist"], ["#incidents", "#deploys"])
         self.assertEqual({p["model"] for p in acme["phases"].values()}, {"sonnet", "opus"})
         self.assertIn("## Changelog", acme["body"])
+        self.assertIn("Bash(process next:*)", acme["phases"]["next-work"]["allowed_tools"])
+        self.assertEqual((acme["afk"]["estimates"], acme["afk"]["max_workers"]), (["XS", "S"], 2))
 
 
 if __name__ == "__main__":

@@ -49,8 +49,20 @@ class Afk:
     def project_dir(self, project):
         return self.state_root() / project
 
-    def cmd_init(self, spec=None):
-        """Create the project, or refresh it: re-running keeps its limits, overrides and hand-added repos."""
+    def cmd_init(self, *args):
+        """Create the project, or refresh it: re-running keeps its landing, limits, overrides and hand-added repos."""
+        spec, options = None, {}
+        args = list(args)
+        while args:
+            arg = args.pop(0)
+            if arg in INIT_OPTIONS and args:
+                options[arg[2:]] = args.pop(0)
+            elif arg.startswith("--") or spec is not None:
+                raise SystemExit("afk: usage: afk init [<spec>] [--land <pr|local>] [--target <branch>]")
+            else:
+                spec = arg
+        if options.get("land", "pr") not in LANDING_MODES:
+            raise SystemExit(f"afk: unknown landing mode '{options['land']}'; supported: {', '.join(LANDING_MODES)}")
         if spec is None:
             spec = self.config()["spec"]  # re-init the current session's project
         issue = GITHUB_ISSUE.match(spec)
@@ -67,9 +79,19 @@ class Afk:
             tickets = LocalTracker(spec)
         session = self.run(["tmux", "display-message", "-p", "#{session_name}"]).strip()
         pdir = self.project_dir(project)
-        pdir.mkdir(parents=True, exist_ok=True)
         path = pdir / "config.toml"
         config = tomllib.loads(path.read_text()) if path.exists() else {}
+        # Flags change the landing re-init keeps; without a target, each repo's work lands on its base.
+        landing = {**config.pop("landing", {}), **({"mode": options["land"]} if "land" in options else {})}
+        if landing.get("mode") == "pr":
+            landing = {}
+        if "target" in options:
+            if not landing:
+                raise SystemExit("afk: --target needs --land local")
+            landing["target"] = options["target"]
+        if landing:
+            config["landing"] = landing
+        pdir.mkdir(parents=True, exist_ok=True)
         own = getattr(tickets, "repo", None)
         wanted = [r for r in tickets.repos() if not (own and same(r, own))]
         found = self.find_clones(repo, wanted)
@@ -82,6 +104,21 @@ class Afk:
         self.out(f"afk project '{project}' bound to tmux session '{session}'")
         for name, clone in repos.items():
             self.out(f"  {name}  {clone}")
+        # Only local landing reads the clones' configs, so a pr-mode init never trips on one that afk check would flag.
+        clones = {c: reduce(deep_merge, [*repo_config_layers(Path(c)), config.get("overrides", {})], {})
+                  for c in dict.fromkeys([str(repo), *repos.values()])} if landing else {}
+        names = {c: c for c in clones} | ({str(repo): own} if own else {}) | {c: name for name, c in repos.items()}
+        unreviewed = [names[c] for c, repo_config in clones.items() if not repo_config.get("reviewers")]
+        if unreviewed:
+            self.out(f"warning: no reviewers in {', '.join(unreviewed)}, so critique there is a code-review subagent; "
+                     f"run /afk-setup in each to add them")
+        target = landing.get("target")
+        for clone, repo_config in clones.items() if target else ():
+            # An integration branch: started from each clone's base, then left alone, as it holds landed work.
+            base = repo_config.get("base", "main")
+            if target != base and not self.branch_exists(clone, target):
+                self.run(["git", "-C", clone, "branch", target, base])
+                self.out(f"created branch {target} from {base} in {clone}")
         missing = [r for r in wanted if not any(same(r, k) for k in repos)]
         if missing:
             self.out(f"no local clone of {', '.join(missing)}: clone it next to {repo} (or as a submodule) and run "
@@ -189,6 +226,12 @@ class Afk:
             raise SystemExit(f"afk: ticket {ticket.id} would use agent '{choices['agent']}'; supported: {', '.join(AGENTS)}")
         task_type = task_types.get(type_name, {})
         base = repo_config.get("base", "main")
+        landing = config.get("landing", {})
+        # Recorded in its status, so a change to the project's landing never strands a running worker.
+        mode = landing.get("mode", "pr")
+        if mode not in LANDING_MODES:
+            raise SystemExit(f"afk: unknown landing mode '{mode}' in the project's [landing]; supported: {', '.join(LANDING_MODES)}")
+        target = (mode == "local" and landing.get("target")) or base
         # A hitl ticket is the human's: its worker guides them and is never driven through the phases.
         phase, state = ("hitl", "yours") if type_name == HITL else ("implement", "working")
         slot = self.claim_worker(worker_dir, counted=phase != "hitl")
@@ -198,7 +241,7 @@ class Afk:
         try:
             tracker.claim(ticket)
             undo.append(lambda: tracker.release(ticket))
-            self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), base])
+            self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), target])
             undo.append(lambda: self.run(["git", "-C", str(clone), "branch", "-D", branch]))
             undo.append(lambda: self.run(["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)]))
             self.prepare_worktree(clone, worktree, repo_config, slot_env)
@@ -211,18 +254,18 @@ class Afk:
             shell = self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", str(worktree), "-P", "-F", "#{pane_id}"]).strip()
 
             settings = worker_dir / "settings.json"
-            settings.write_text(json.dumps(worker_settings(base), indent=2) + "\n")
+            settings.write_text(json.dumps(worker_settings(base, target if mode == "local" else None), indent=2) + "\n")
             launch = [
                 "env", f"AFK_PROJECT={project}", f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
                 *[arg for key in ("model", "effort") if choices[key] for arg in (f"--{key}", choices[key])],
-                self.first_prompt(ticket, phase, task_type, clone),
+                self.first_prompt(ticket, phase, task_type, clone, mode, target),
             ]
             write_json(
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "title": ticket.title, "phase": phase, "state": state, "message": "",
                  "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "repo": repo, **choices,
-                 "started_at": self.clock(), "phase_started_at": self.clock()},
+                 "landing": mode, "target": target, "started_at": self.clock(), "phase_started_at": self.clock()},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
@@ -249,7 +292,8 @@ class Afk:
     def cmd_check(self, repo=None):
         """Validate a repo's docs/agents/afk.md (plus afk.local.md) against what `afk start` reads."""
         repo = Path(repo or self.run(["git", "rev-parse", "--show-toplevel"]).strip()).resolve()
-        errors, warnings = check_repo_config(repo, self.branch_exists)
+        which = lambda binary: shutil.which(binary, path=self.env.get("PATH", os.defpath))
+        errors, warnings = check_repo_config(repo, self.branch_exists, which)
         for warning in warnings:
             self.out(f"warning: {warning}")
         for error in errors:
@@ -343,6 +387,151 @@ class Afk:
             return 2
         self.update_status(lambda status: dict(state=state, message=message, idle=False, reports=status.get("reports", 0) + 1))
 
+    def cmd_land(self, message=""):
+        """Squash the worker's branch onto its target branch as one commit with the message."""
+        status = read_json(self.worker_status_path())
+        if status.get("landing") != "local":
+            raise SystemExit("afk: this worker lands by PR, not with `afk land`; see its project's [landing]")
+        if not message.strip():
+            raise SystemExit('afk: land needs a commit message: afk land "<type(scope): summary>"')
+        if status.get("landed_sha"):
+            raise SystemExit(f"afk: already landed as {status['landed_sha'][:7]} on {status['target']}; afk cleans this "
+                             "worker up next")
+        target = status["target"]
+        ref = f"refs/heads/{target}"
+        worktree = str(self.worktree(status["ticket"]))
+        git = lambda *args, input=None: self.run(["git", "-C", worktree, *args], input=input).strip()
+        # Each read once, so whatever moves meanwhile, the checks hold for exactly what lands, on exactly what it replaces.
+        old, head = git("rev-parse", ref), git("rev-parse", "HEAD")
+        try:
+            git("merge-base", "--is-ancestor", old, head)
+        except subprocess.CalledProcessError:
+            raise SystemExit(f"afk: {target} moved since the branch last merged it: target moved; merge it, re-run "
+                             "pre-PR, land again")
+        # The branch's own work, not what it merged from the target. Git keeps whole seconds, so an approval in the
+        # same second as the last commit can't be told to come after it.
+        committed = git("log", "-1", "--no-merges", "--format=%ct", head, "--not", old)
+        if not committed:
+            raise SystemExit(f"afk: nothing to land: the branch has no commits of its own on top of {target}")
+        approved = status.get("last_human_prompt_at", float("-inf"))
+        # A merge of the target git made unaided keeps the approval; one whose conflicts the worker resolved is its own
+        # work, as is any change slipped into a merge, and anything merged from elsewhere, which the human never saw.
+        merges = (line.split() for line in git("log", "--merges", "--format=%ct %H", head, "--not", old).splitlines())
+        changed = [int(committed), *(int(at) for at, merge in merges if not self.clean_merge(worktree, merge, old))]
+        if approved < max(changed) + 1:
+            raise SystemExit("afk: no approval since the branch's last commit: the human must approve it as it stands, "
+                             "in this pane")
+        new = git("commit-tree", f"{head}^{{tree}}", "-p", old, "-F", "-", input=message)
+
+        def warn(message):
+            self.out(message)
+            self.notify(message)
+
+        # One land at a time in a repo, so a land can't update a checkout of the target to a commit already replaced.
+        with locked(Path(git("rev-parse", "--path-format=absolute", "--git-common-dir")), "afk-land.lock"):
+            # Moving a branch checked out in a worktree leaves that worktree's files behind, so they move with it.
+            checkout = next((path for path, branch in self.worktrees(worktree) if branch == ref), None)
+            # Untracked files don't count: the clone's own .scratch is one, and git refuses to overwrite any.
+            if checkout and self.run(["git", "-C", checkout, "status", "--porcelain", "--untracked-files=no"]).strip():
+                raise SystemExit(f"afk: {target} is checked out in {checkout} with uncommitted changes; commit or stash "
+                                 "them there, then land again")
+            try:
+                git("update-ref", ref, new, old)  # compare-and-swap, so a worker landing at the same time can't be clobbered
+            except subprocess.CalledProcessError:
+                raise SystemExit(f"afk: {target} moved while landing: target moved; merge it, re-run pre-PR, land again")
+            self.update_status(lambda status: dict(landed_sha=new))  # landed: never again, whatever fails from here
+            self.out(f"landed {new[:7]} on {target}")
+            if checkout:
+                try:
+                    # What `git checkout` does: update the files the land changed, refusing to overwrite any changed since.
+                    self.run(["git", "-C", checkout, "read-tree", "-m", "-u", old, new])
+                except subprocess.CalledProcessError as error:
+                    warn(f"{status['ticket']} landed on {target}, but {checkout} still has the files of {old[:7]}: "
+                         f"{(error.stderr or '').strip()}")
+        # An integration branch is pushed, so it's safe off this machine; base never is: taking work there is the human's.
+        if target != self.repo_config(self.clone(status.get("repo"))).get("base", "main"):
+            try:
+                git("push", "origin", f"{new}:{ref}")  # never forced, so only ever a fast-forward
+            except subprocess.CalledProcessError as error:
+                warn(f"{status['ticket']} landed on {target}, but pushing it failed: {(error.stderr or '').strip()}")
+        # Last, as the watcher then cleans the worker up, which mustn't cut the land short.
+        self.update_status(lambda status: dict(ended="landed"))
+
+    def cmd_drop(self, *args):
+        """Abandon a local-mode worker: release its ticket back onto the frontier and clean it up, deleting its
+        unlanded commits."""
+        if self.env.get("AFK_TICKET"):
+            raise SystemExit("afk: afk drop is the human's: run it from the project's session, not from a worker")
+        if not args or args[0].startswith("-") or set(args[1:]) - {"--discard"}:
+            raise SystemExit("afk: usage: afk drop <ticket> [--discard]")
+        ticket_id, discard = args[0], "--discard" in args[1:]
+        worker_dir = self.workers_dir() / ticket_id
+        self.workers_dir().mkdir(parents=True, exist_ok=True)
+        # Under the tick lock, then the worker's, as a tick takes them, so the watcher can't act on it meanwhile.
+        with locked(self.workers_dir()):
+            if not (worker_dir / "status.json").exists():
+                raise SystemExit(f"afk: no worker for ticket {ticket_id}; see `afk status`")
+            with locked(worker_dir):
+                status = read_json(worker_dir / "status.json")
+                if status.get("landing", "pr") != "local":
+                    raise SystemExit(f"afk: {ticket_id} lands by PR: close its PR instead, and afk cleans it up and "
+                                     "releases its ticket")
+                # Its work is safe, so its ticket is completed, not released, once cleanup is safe too.
+                if status.get("landed_sha") or status.get("ended") == "merged":
+                    ended = f"landed on {status['target']}" if status.get("landed_sha") else "merged"
+                    raise SystemExit(f"afk: {ticket_id} has {ended}; afk cleans it up once that's safe: see `afk status`")
+                # From the clone, as a cleanup that failed partway may have removed the worktree, or even the branch.
+                clone, branch = str(self.clone(status.get("repo"))), f"refs/heads/afk/{self.current_project()}-{ticket_id}"
+                commits = int(self.run(["git", "-C", clone, "rev-list", "--count", *self.unsaved(clone, branch, status["target"])])
+                              if self.branch_exists(clone, branch) else 0)
+                lost = f"{commits} unlanded commit{'s' * (commits != 1)}"
+                # What cleanup otherwise waits out, which dropping deletes too: the human's edits and whatever they run.
+                worktree = self.worktree(ticket_id)
+                if worktree.exists() and self.run(["git", "-C", str(worktree), "status", "--porcelain", "--ignore-submodules=none"]).strip():
+                    lost += " and its worktree's uncommitted changes"
+                command = self.pane_command(status["shell_pane"]) if "shell_pane" in status else None
+                busy = command is not None and command not in SHELLS
+                if not discard:
+                    raise SystemExit(f"afk: dropping {ticket_id} would delete {lost}"
+                                     + (f", and end {command} in its shell pane" if busy else "")
+                                     + f"; run `afk drop {ticket_id} --discard` to drop it anyway")
+                ticket = self.find_ticket(ticket_id)
+                released = bool(ticket and not ticket.done)
+                # A closed ticket is left as it is, as cleanup leaves one after it ends a worker.
+                self.clean_up(ticket_id, status["pane"], "dropped" if released else "ticket closed")
+        self.out(f"dropped {ticket_id}: deleted {lost}" + (f", and ended {command} in its shell pane" if busy else "")
+                 + ("; its ticket is back on the frontier" if released else ""))
+
+    def unsaved(self, repo, rev, target):
+        """`git rev-list` arguments for the commits of `rev` that deleting its branch would lose: those on no remote,
+        nor on the target, while the target still exists."""
+        return [rev, "--not", "--remotes", *([f"refs/heads/{target}"] if self.branch_exists(repo, f"refs/heads/{target}") else [])]
+
+    def worktrees(self, repo):
+        """(path, checked-out ref) of each of the repo's worktrees; the ref is None for a detached HEAD. One whose
+        directory is gone, which git calls prunable, has no files to keep up to date, so it isn't listed."""
+        listing = self.run(["git", "-C", repo, "worktree", "list", "--porcelain"])
+        for block in listing.strip().split("\n\n"):
+            fields = dict(line.partition(" ")[::2] for line in block.splitlines())
+            if "prunable" not in fields:
+                yield fields["worktree"], fields.get("branch")
+
+    def clean_merge(self, worktree, merge, target):
+        """Whether the merge commit merged the target, at or before commit `target`, and is exactly what git merges
+        its two parents to, without conflicts."""
+        parents = self.run(["git", "-C", worktree, "log", "-1", "--format=%P", merge]).split()
+        if len(parents) != 2:
+            return False
+        try:
+            self.run(["git", "-C", worktree, "merge-base", "--is-ancestor", parents[1], target])
+        except subprocess.CalledProcessError:
+            return False  # merged from elsewhere
+        try:
+            tree = self.run(["git", "-C", worktree, "merge-tree", "--write-tree", *parents]).split("\n", 1)[0]
+        except subprocess.CalledProcessError:
+            return False  # conflicts
+        return tree == self.run(["git", "-C", worktree, "rev-parse", f"{merge}^{{tree}}"]).strip()
+
     def cmd_hook(self, event):
         payload = json.loads(self.stdin.read() or "{}")
 
@@ -360,10 +549,13 @@ class Afk:
                 # About to use a tool, so no longer stopped: it resumed, say when a background task it waited on
                 # landed. Nothing may be pasted into it until it stops again.
                 changes["idle"] = False
-            elif event == "prompt" and waiting_on_human(status):
-                # The human answered or nudged it, so it's working again. Time spent waiting on them isn't the
-                # worker's: its phase clock restarts, and its limits apply afresh.
-                changes.update(state="working", message="", idle=False, phase_started_at=self.clock())
+            elif event == "prompt" and not MACHINE_PROMPT.search(payload.get("prompt", "")):
+                # Typed by the human, not pasted by the watcher: what `afk land` takes for their approval.
+                changes["last_human_prompt_at"] = self.clock()
+                if waiting_on_human(status):
+                    # The human answered or nudged it, so it's working again. Time spent waiting on them isn't the
+                    # worker's: its phase clock restarts, and its limits apply afresh.
+                    changes.update(state="working", message="", idle=False, phase_started_at=self.clock())
             return changes
 
         self.update_status(changes)
@@ -422,12 +614,15 @@ class Afk:
                 try:
                     pr_state = pr_url = None
                     pr_ready = ticket_closed = False
-                    if before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS:
-                        pr_state, pr_url, pr_ready = self.pr_state(before)
+                    polled = before["phase"] in ("pr", "review", "hitl") and now - before.get("pr_polled_at", 0) >= PR_POLL_SECONDS
+                    if polled:
+                        # A local-mode worker never opens a PR, but the human may open one for a hitl ticket.
+                        if before["phase"] == "hitl" or before.get("landing", "pr") == "pr":
+                            pr_state, pr_url, pr_ready = self.pr_state(before)
                         ticket = self.find_ticket(before["ticket"])
                         ticket_closed = bool(ticket and ticket.done)
-                    given.update(pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
-                    ended = ending(before, pr_state, ticket_closed)
+                    given.update(polled=polled, pr_state=pr_state, pr_url=pr_url, pr_ready=pr_ready, ticket_closed=ticket_closed)
+                    ended = ending(before, polled, pr_state, ticket_closed)
                     blocker = self.cleanup_blocker(before, ended) if ended else None
                     status, effects = tick(path.parent.name, before, now, cleanup_blocker=blocker, **given)
                     if any(kind == "prompt" for kind, *_ in effects) and not self.agent_running(before["pane"]):
@@ -454,17 +649,28 @@ class Afk:
             self.close_if_finished()
 
     def surface_unblocked(self, statuses, now):
-        """The Gate 1 judgment point: unblocked tickets and a free worker slot. The user decides with /afk next.
+        """The Gate 1 judgment point: unblocked tickets and a free worker slot. The user decides with /afk next. And
+        the end of a project landing on an integration branch: every ticket landed, so the human takes it to base.
 
         The tracker is polled at most every FRONTIER_POLL seconds, as a GitHub frontier costs a request per ticket,
-        and the user is notified once per newly unblocked ticket, not every tick.
+        and the user is notified once per newly unblocked ticket, and once per project landed, not every tick.
         """
         path = self.project_dir(self.current_project()) / "frontier.json"
         seen = read_json(path) if path.exists() else {}
         before = dict(seen)
         started = {s["ticket"] for s in statuses}
         if now - seen.get("polled_at", float("-inf")) >= FRONTIER_POLL:
-            seen.update(polled_at=now, unblocked=[t.id for t in self.tracker().frontier()])
+            seen.update(polled_at=now, unblocked=[t.id for t in self.tracker().frontier()], landed=self.landed(statuses))
+        if statuses:
+            seen["landed"] = None  # a worker means a ticket is open again, whatever the last poll found
+        landed = seen.get("landed")
+        if landed:
+            self.out(landed)
+            if not seen.get("landed_notified"):
+                self.notify(landed)
+                seen["landed_notified"] = True
+        else:
+            seen.pop("landed_notified", None)  # a ticket added later reopens the project, to land again
         candidates = [t for t in seen["unblocked"] if t not in started]
         # A ticket that drops out, say blocked again, counts as newly unblocked when it returns.
         seen["notified"] = [t for t in seen.get("notified", []) if t in candidates]
@@ -482,9 +688,14 @@ class Afk:
         """Close the project once every ticket is done, so the watcher stops. Called only when no worker is left,
         each having passed cleanup_blocker, and at the tracker's poll cadence.
 
-        A blocked or claimed ticket isn't done, so an empty frontier alone never closes a project. Anything left
-        behind holds the project open, and the user is notified once per reason.
+        A blocked or claimed ticket isn't done, so an empty frontier alone never closes a project. Nor does one
+        landed on an integration branch: the human takes it to base, and a ticket added meanwhile reopens it, so
+        they close it by hand. Anything left behind holds the project open, and the user is notified once per reason.
         """
+        path = self.project_dir(self.current_project()) / "frontier.json"
+        seen = read_json(path)
+        if seen.get("landed"):
+            return
         tickets = self.tracker().tickets()
         if not tickets or not all(t.done for t in tickets):
             return
@@ -492,8 +703,6 @@ class Afk:
         if reason is None:
             self.close_project(tickets)
             return
-        path = self.project_dir(self.current_project()) / "frontier.json"
-        seen = read_json(path)
         message = f"project finished but not closed: {reason}; fix it, then run `afk close`"
         self.out(message)
         if seen.get("close_blocked") != reason:
@@ -557,11 +766,31 @@ class Afk:
         self.out(message)
         self.closed = True
 
+    def landed(self, statuses):
+        """The human's next step once every ticket of a project landing on an integration branch has landed, else None:
+        no ticket open or claimed, and no worker left.
+
+        As at init, the target is an integration branch in each clone whose base it isn't, so the human takes it to
+        each such base.
+        """
+        config = self.config()
+        landing, clones = config.get("landing", {}), [config["repo"], *config.get("repos", {}).values()]
+        target = landing.get("target")
+        bases = dict.fromkeys(self.repo_config(c).get("base", "main") for c in clones)
+        bases.pop(target, None)
+        if landing.get("mode") != "local" or not target or not bases or statuses:
+            return None
+        tickets = self.tracker().tickets()
+        if tickets and all(t.done for t in tickets):
+            return f"all tickets landed on {target}; open a PR to {' and '.join(bases)} when ready"
+        return None
+
     def perform(self, kind, *args):
         if kind == "prompt":
             ticket_id, pane, phase = args
-            repo = read_json(self.workers_dir() / ticket_id / "status.json").get("repo")
-            self.send_prompt(ticket_id, pane, self.phase_prompt(ticket_id, phase, self.clone(repo)))
+            status = read_json(self.workers_dir() / ticket_id / "status.json")
+            prompt = self.phase_prompt(ticket_id, phase, self.clone(status.get("repo")), status.get("landing", "pr"), status.get("target"))
+            self.send_prompt(ticket_id, pane, prompt)
         elif kind == "window":
             # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
             pane, name, state = args
@@ -578,7 +807,8 @@ class Afk:
     def cleanup_blocker(self, status, ended):
         """Why cleaning up this worker could lose the human's work, or None if it's safe.
 
-        Unless it merged, its branch may hold commits that were never pushed, which deleting the branch would lose.
+        Unless it merged or landed, its branch may hold commits that were never pushed, which deleting the branch would
+        lose.
         A worktree already gone, as after a cleanup that failed partway, holds nothing left to lose.
         """
         worktree = self.worktree(status["ticket"])
@@ -587,38 +817,48 @@ class Afk:
         if "shell_pane" not in status:
             return "its shell pane is unknown (it was started by an older afk)"
         command = self.pane_command(status["shell_pane"])
-        if command is None:
-            return "its shell pane is gone"
-        if command not in SHELLS:
+        if command is not None and command not in SHELLS:  # a pane that's gone has no human in it
             return f"its shell pane is running {command}"
         worktree = str(worktree)
-        if self.run(["git", "-C", worktree, "status", "--porcelain"]).strip():
+        # A submodule set to ignore=all would otherwise hide its changes, which the forced removal would then delete.
+        if self.run(["git", "-C", worktree, "status", "--porcelain", "--ignore-submodules=none"]).strip():
             return "its worktree has uncommitted changes"
-        if ended != "merged" and self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
-            return "its branch has unpushed commits"
+        if ended in ("merged", "landed"):
+            return None
+        if status.get("landing", "pr") == "pr":
+            unpushed = self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip()
+            return "its branch has unpushed commits" if unpushed else None
+        # A local-mode branch is never pushed, and work landed on its target, pushed or not, isn't lost with it, so
+        # what's left goes only when the human drops it.
+        if self.run(["git", "-C", worktree, "log", "--oneline", *self.unsaved(worktree, "HEAD", status["target"])]).strip():
+            return f"its branch has unpushed commits; `afk drop {status['ticket']} --discard` deletes them"
         return None
 
     def clean_up(self, ticket_id, pane, ended):
         """Remove an ended worker's window, worktree, local branch and state; removing its dir frees its slot.
 
-        A merged ticket is completed. One whose PR was closed unmerged is released, back onto the frontier. A closed
-        ticket is left as it is, as is one gone from the tracker.
+        A merged or landed ticket is completed. One whose PR was closed unmerged, or that the human dropped, is released,
+        back onto the frontier. A closed ticket is left as it is, as is one gone from the tracker.
 
         Removing the worker's dir is the commit point, so each step before it tolerates having been done by a cleanup
         that failed partway, and a branch git won't delete, say one checked out in another worktree, is left for the
         human: cleanup_blocker has already checked it holds nothing unpushed.
         """
         project = self.current_project()
-        repo = str(self.clone(read_json(self.workers_dir() / ticket_id / "status.json").get("repo")))
+        status = read_json(self.workers_dir() / ticket_id / "status.json")
+        repo = str(self.clone(status.get("repo")))
         tracker, ticket = self.tracker(), self.find_ticket(ticket_id)
         if ticket and ended == "merged":
             tracker.complete(ticket)
-        elif ticket and ended == "closed":
+        elif ticket and ended == "landed":
+            tracker.complete(ticket, landed=(status["landed_sha"], status["target"]))
+        elif ticket and ended in ("closed", "dropped"):
             tracker.release(ticket)
         self.best_effort(["tmux", "kill-window", "-t", pane])
         worktree = self.worktree(ticket_id)
         if worktree.exists():
-            self.run(["git", "-C", repo, "worktree", "remove", str(worktree)])
+            # Forced, since git won't otherwise remove a worktree with submodules; cleanup_blocker has checked it's clean.
+            self.run(["git", "-C", repo, "worktree", "remove", "--force", str(worktree)])
         else:
             self.best_effort(["git", "-C", repo, "worktree", "prune"])  # forget a worktree whose dir is gone
         branch = f"afk/{project}-{ticket_id}"
@@ -643,18 +883,25 @@ class Afk:
         except (OSError, subprocess.CalledProcessError):
             pass
 
-    def phase_prompt(self, ticket_id, phase, clone):
+    def phase_prompt(self, ticket_id, phase, clone, landing="pr", target=None):
+        """The phase's prompt for the worker's landing mode: phase-<phase>-<landing>.md where the mode has its own."""
         ticket = self.tracker().get(ticket_id)
+        repo_config = self.repo_config(clone)
+        base = repo_config.get("base", "main")
+        target = target or base
+        template = SKILL_DIR / f"phase-{phase}-{landing}.md"
         return render(
-            SKILL_DIR / f"phase-{phase}.md",
+            template if template.is_file() else SKILL_DIR / f"phase-{phase}.md",
             ticket=ticket.id,
             ticket_path=ticket.path,
-            base=self.repo_config(clone).get("base", "main"),
+            base=base,
+            target=target,
+            reviewers=reviewer_list(repo_config.get("reviewers", []), target),
         )
 
-    def first_prompt(self, ticket, phase, task_type, clone):
+    def first_prompt(self, ticket, phase, task_type, clone, landing="pr", target=None):
         """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
-        prompt = self.phase_prompt(ticket.id, phase, clone)
+        prompt = self.phase_prompt(ticket.id, phase, clone, landing, target)
         if "prompt" in task_type:
             template = clone / task_type["prompt"]
             prompt += "\n" + render(template, ticket=ticket.id, ticket_path=ticket.path)
@@ -690,12 +937,17 @@ class Afk:
             return None
 
     def agent_running(self, pane):
-        return self.pane_command(pane) == "claude"
+        # Claude Code sets its process title to its version (e.g. "2.1.310"), so tmux may report that instead.
+        command = self.pane_command(pane)
+        return command == "claude" or bool(command and re.fullmatch(r"\d+\.\d+\.\d+", command))
 
     def pane_command(self, pane):
-        """The pane's foreground command, or None if the pane is gone."""
+        """The pane's foreground command, or None if the pane is gone.
+
+        Older tmux fails to find a pane that's gone; tmux 3.6 prints nothing and exits 0.
+        """
         try:
-            return self.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"]).strip()
+            return self.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"]).strip() or None
         except subprocess.CalledProcessError:
             return None
 
@@ -711,9 +963,18 @@ class Afk:
 
     def cmd_status(self):
         rows = [read_json(p) for p in sorted((self.project_dir(self.current_project()) / "workers").glob("*/status.json"))]
-        self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<10}MESSAGE")
+        self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<17}MESSAGE")
         for s in rows:
-            self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<10}{s.get('message', '')}".rstrip())
+            self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<17}{s.get('message', '')}".rstrip())
+        landed = self.landed(rows)
+        if landed:
+            self.out(landed)
+
+    def cmd_view(self):
+        """The current project's config.toml, headed by its path."""
+        path = self.project_dir(self.current_project()) / "config.toml"
+        self.out(f"# {path}")
+        self.out(path.read_text().rstrip())
 
     def worker_status_path(self):
         ticket = self.env.get("AFK_TICKET")
@@ -768,6 +1029,12 @@ class Afk:
 
 REPORT_STATES = ("done", "blocked", "question")
 
+# A prompt no human typed: afk's own phase or guide-mode prompt, perhaps after its task type's skill, or pasted, as the
+# watcher sends them (Claude Code hands the hook a paste wrapped in a <pasted_content> tag, after whatever was typed
+# before it); or Claude Code's notice that a background task finished, which it submits as a prompt.
+MACHINE_PROMPT = re.compile(
+    r"\A\s*(?:/\S+\s+)?AFK (?:phase:|guide mode)|<pasted_content[^>]*>\s*AFK (?:phase:|guide mode)|\A\s*<task-notification>")
+
 AGENTS = ("claude",)
 
 # The built-in task type for human-in-the-loop tickets; the repo may still configure it under task_types.
@@ -778,10 +1045,19 @@ FRONTIER_POLL = 60  # seconds between the watcher's reads of the tracker
 # Corrections the user can make at Gate 1, each a `afk start` option.
 START_OPTIONS = ("--type", "--agent", "--model", "--effort", "--repo")
 
-# Runaway limits; a project's config.toml [limits] table overrides any of them.
-LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3}
+INIT_OPTIONS = ("--land", "--target")
 
-PHASES = ("implement", "verify", "prepr", "pr", "review")
+# How a project's work reaches its target branch: by a PR the human merges, or landed by the worker once approved.
+LANDING_MODES = ("pr", "local")
+
+# Runaway limits; a project's config.toml [limits] table overrides any of them.
+LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3, "critique_rounds": 3}
+
+# Marks a critique round's done report: it fixed findings, so the fixes need a round of their own.
+CRITIQUE_ROUND = "round:"
+
+# Each landing mode's phases: a local-mode worker never opens a PR, so its reviewer CLIs critique the branch instead.
+PHASES = {"pr": ("implement", "verify", "prepr", "pr", "review"), "local": ("implement", "verify", "prepr", "critique", "review")}
 
 PR_POLL_SECONDS = 60
 NO_PR = "no PR found for its branch"
@@ -805,6 +1081,7 @@ REPO_KEYS = {
     "verify_concurrency": (int, "an integer of at least 1"),
     "default_type": (str, "a string"),
     "task_types": (dict, "a table of task types"),
+    "reviewers": (list, "a list of strings"),
 }
 TASK_TYPE_KEYS = ("agent", "model", "effort", "skill", "prompt")
 
@@ -822,13 +1099,17 @@ def waiting_on_human(status):
         status.get("state") == "attention" and status.get("message") == NO_REPORT)
 
 
-def ending(status, pr_state, ticket_closed=False):
-    """How the worker's work ended: its PR "merged" or "closed", or its "ticket closed"; None while it goes on.
+def ending(status, polled, pr_state, ticket_closed=False):
+    """How the worker's work ended: "landed" by `afk land`, its PR "merged" or "closed", or its "ticket closed"; None
+    while it goes on.
 
-    A closed ticket outranks a closed PR, so cleanup never releases a ticket that is already closed. A pending
-    worker keeps its ending between polls; a fresh poll decides it again, as a closed PR can be reopened.
+    Landing is final, as its work is in the target. A closed ticket outranks a closed PR, so cleanup never releases a
+    ticket that is already closed. A pending worker keeps its ending between polls; a fresh poll decides it again, as a
+    closed PR or ticket can be reopened.
     """
-    if status["state"] == "cleanup-pending" and pr_state is None:
+    if status.get("ended") == "landed":
+        return "landed"
+    if status["state"] == "cleanup-pending" and not polled:
         return status.get("ended", "merged")  # workers left pending before closed PRs were cleaned up had merged
     if pr_state == "MERGED":
         return "merged"
@@ -838,24 +1119,26 @@ def ending(status, pr_state, ticket_closed=False):
 
 
 def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None,
-         pr_state=None, pr_url=None, pr_ready=False, ticket_closed=False, cleanup_blocker=None):
+         polled=False, pr_state=None, pr_url=None, pr_ready=False, ticket_closed=False, cleanup_blocker=None):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
     may_verify=False says the repo's verify slots are full, so a worker due to verify must queue.
+    polled says this tick polled the tracker for the worker, and GitHub unless it's a local-mode worker, as it does
+    about once a minute.
     pr_state is GitHub's state for the worker's PR when this tick polled it, else None; pr_url is the PR's URL, if any.
     pr_ready says the polled PR carries READY_LABEL.
     ticket_closed says the tracker, polled with the PR, has the worker's ticket closed.
     cleanup_blocker, for a merged or closed PR or a closed ticket, says why cleaning up now could lose the human's work.
     A status of None out means the worker is cleaned up and gone.
     """
-    ended = ending(status, pr_state, ticket_closed)
+    ended = ending(status, polled, pr_state, ticket_closed)
     if ended and cleanup_blocker is None:
         return None, [
             ("cleanup", ticket, status["pane"], ended),
             ("notify", f"{ticket} {ended} and cleaned up; run `/afk next` to propose the next batch"),
         ]
-    if pr_state is not None:
+    if polled:
         status = {**status, "pr_polled_at": now}
     if pr_url:
         status = {**status, "pr": pr_url}
@@ -916,7 +1199,16 @@ def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=Non
                 return {**status, "state": "stuck", "message": reason, "fix_loops": 0}, [("notify", f"{ticket} stuck: {reason}")]
             status = {**status, "state": "review", "fix_loops": loops}
             return status, [("notify", f"{ticket} addressed review feedback: {message}")]
-        phase = PHASES[PHASES.index(phase) + 1]
+        if phase == "critique" and message.startswith(CRITIQUE_ROUND):
+            rounds = status.get("critique_rounds", 0) + 1
+            if rounds >= limits["critique_rounds"]:
+                # As with fix loops, it has already stopped, and counting restarts for after the human has looked.
+                reason = f"still fixing after {limits['critique_rounds']} critique rounds"
+                return {**status, "state": "stuck", "message": reason, "critique_rounds": 0}, [("notify", f"{ticket} stuck: {reason}")]
+            status = {**status, "state": "working", "message": "", "idle": False, "phase_started_at": now, "critique_rounds": rounds}
+            return status, [("prompt", ticket, status["pane"], "critique")]
+        phases = PHASES[status.get("landing", "pr")]  # workers started before landing modes landed by PR
+        phase = phases[phases.index(phase) + 1]
         if phase == "verify" and not may_verify:
             # Stays in its finished phase, so if it needs attention while queued, done still leads to verify.
             return {**status, "state": "queued", "queued_at": now}, []
@@ -934,7 +1226,9 @@ def enter_review(ticket, status, now, effects):
     # The PR's URL is whatever the last poll found by branch, never taken from a report.
     status = {**status, "phase": "review", "state": "review", "message": "", "idle": False, "phase_started_at": now}
     pr = status.get("pr")
-    return status, effects + [("notify", f"{ticket} PR ready for review" + (f": {pr}" if pr else ""))]
+    # A local-mode worker has no PR: its branch is reviewed in its pane.
+    ready = "PR" if status.get("landing", "pr") == "pr" else "branch"
+    return status, effects + [("notify", f"{ticket} {ready} ready for review" + (f": {pr}" if pr else ""))]
 
 
 def enforce(ticket, status, now, limits, last_activity):
@@ -1052,8 +1346,8 @@ class LocalTracker:
     def release(self, ticket):
         pass
 
-    def complete(self, ticket):
-        """Merged: mark it done, as GitHub closes an issue, so the frontier doesn't offer it again."""
+    def complete(self, ticket, landed=None):
+        """Merged or landed: mark it done, as GitHub closes an issue, so the frontier doesn't offer it again."""
         ticket.path.write_text(set_field(ticket.path.read_text(), "Status", "done"))
 
     def split(self, ticket, parts):
@@ -1168,8 +1462,14 @@ class GithubTracker:
         repo, number = self.locate(ticket.id)
         self.run(["gh", "issue", "edit", number, "--repo", repo, "--remove-assignee", "@me"])
 
-    def complete(self, ticket):
-        """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it."""
+    def complete(self, ticket, landed=None):
+        """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it. Landed, as the
+        (sha, target) it landed as: no PR will close it, so it is closed here."""
+        if landed:
+            repo, number = self.locate(ticket.id)
+            sha, target = landed
+            self.run(["gh", "issue", "close", number, "--repo", repo, "--reason", "completed",
+                      "--comment", f"Landed in {sha} on {target}"])
 
     def blockers(self, ticket):
         """Native blocked-by dependencies; failing those, the issues the body's "Blocked by" section names."""
@@ -1243,6 +1543,13 @@ def launch_choices(ticket, default_type, task_types, corrections):
     return {**choices, **{k: v for k, v in corrections.items() if k != "type"}}
 
 
+def reviewer_list(reviewers, target):
+    """The critique prompt's list of the repo's reviewer commands, each with its {{target}} filled in."""
+    if not reviewers:
+        return "No reviewers are configured, so a code-review subagent is the critique."
+    return "\n".join(f"- `{command.replace('{{target}}', shlex.quote(target))}`" for command in reviewers)
+
+
 def slug(title):
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
 
@@ -1252,9 +1559,23 @@ def window_name(ticket):
     return f"{ticket.id}-{abbrev}"
 
 
-def worker_settings(base):
-    """Per-session Claude settings: status hooks plus a deny list against irreversible damage."""
+def worker_settings(base, target=None):
+    """Per-session Claude settings: status hooks plus a deny list against irreversible damage.
+
+    A local-mode worker's target is moved only by `afk land`, so the worker is denied moving it, or checking it out,
+    by hand. Best-effort: a worker in auto permission mode can find another way.
+    """
     hook = lambda event: [{"hooks": [{"type": "command", "command": f"{shlex.quote(AFK_BIN)} hook {event}"}]}]
+    pushes = lambda branch: [f"Bash(git push * {branch})", f"Bash(git push * HEAD:{branch})", f"Bash(git push * *:{branch})"]
+    landing = [
+        *(pushes(target) if target != base else []),
+        f"Bash(git update-ref *refs/heads/{target})",
+        f"Bash(git update-ref *refs/heads/{target} *)",
+        f"Bash(git checkout {target})",
+        f"Bash(git checkout * {target})",
+        f"Bash(git switch {target})",
+        f"Bash(git switch * {target})",
+    ] if target else []
     return {
         "permissions": {
             "deny": [
@@ -1262,12 +1583,14 @@ def worker_settings(base):
                 "Bash(git push * -f)",
                 "Bash(git push * -f *)",
                 "Bash(git push * +*)",
-                f"Bash(git push * {base})",
-                f"Bash(git push * HEAD:{base})",
-                f"Bash(git push * *:{base})",
+                *pushes(base),
+                *landing,
                 "Bash(gh pr merge *)",
                 "Bash(git worktree remove *)",
                 "Bash(git worktree prune *)",
+                # Dropping a ticket deletes its work, which is the human's call.
+                "Bash(afk drop *)",
+                f"Bash({shlex.quote(AFK_BIN)} drop *)",
             ]
         },
         "hooks": {
@@ -1281,10 +1604,10 @@ def worker_settings(base):
 
 
 def dashboard(statuses, now):
-    yield f"{'TICKET':<8}{'PHASE':<11}{'STATE':<11}{'ELAPSED':<9}PR"
+    yield f"{'TICKET':<8}{'PHASE':<11}{'STATE':<17}{'ELAPSED':<9}PR"  # wide enough for cleanup-pending
     for s in statuses:
         elapsed = duration(now - s.get("phase_started_at", now))
-        yield f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<11}{elapsed:<9}{s.get('pr', '-')}"
+        yield f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<17}{elapsed:<9}{s.get('pr', '-')}"
 
 
 def duration(seconds):
@@ -1312,8 +1635,8 @@ def repo_config_layers(repo):
     return [frontmatter(p.read_text()) for p in (docs / "afk.md", docs / "afk.local.md") if p.is_file()]
 
 
-def check_repo_config(repo, branch_exists):
-    """(errors, warnings) for a repo's AFK config, as `afk start` would read it."""
+def check_repo_config(repo, branch_exists, which):
+    """(errors, warnings) for a repo's AFK config, as `afk start` would read it; which(binary) finds one on PATH."""
     docs = repo / "docs" / "agents"
     main = docs / "afk.md"
     if not main.is_file():
@@ -1366,6 +1689,18 @@ def check_repo_config(repo, branch_exists):
         for name in config["copy"]:
             if isinstance(name, str) and not (repo / name).is_file():
                 errors.append(f"copy: {name} not found in {repo}")
+    if isinstance(config.get("reviewers"), list):
+        # Critique skips a missing reviewer rather than failing, so a missing binary is a warning.
+        for command in (c for c in config["reviewers"] if isinstance(c, str)):
+            try:
+                binary = next((word for word in shlex.split(command) if not re.match(r"\w+=", word)), None)
+            except ValueError as error:
+                errors.append(f"reviewer `{command}`: {error}")
+                continue
+            if binary is None:
+                errors.append(f"reviewer `{command}` names no command")
+            elif not which(binary):
+                warnings.append(f"reviewer `{command}`: {binary} is not on PATH, so critique will skip it")
     base = config.get("base", "main")
     if isinstance(base, str) and not branch_exists(repo, base):
         errors.append(f"base branch '{base}' does not exist in {repo}")
@@ -1403,9 +1738,10 @@ def section(markdown, heading):
 
 
 @contextmanager
-def locked(worker_dir):
-    """Serialise read-modify-writes of one worker's status between the watcher, its hooks and its reports."""
-    with open(worker_dir / "lock", "w") as lock:
+def locked(directory, name="lock"):
+    """Hold the lock file `name` in `directory`: it serialises read-modify-writes of one worker's status between the
+    watcher, its hooks and its reports, and the lands in one repo."""
+    with open(directory / name, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
@@ -1474,7 +1810,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|close|report|status|hook|check|trial> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|close|land|drop|status|view|hook|check|trial> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)
