@@ -4036,6 +4036,18 @@ class LandPrModeTest(LandTestCase):
         self.assertNotIn("ended", self.status())
 
 
+class LandOutsideAWorkerTest(AfkTestCase):
+    def test_land_outside_a_worker_says_to_run_it_from_one(self):
+        self.run_fake.responses[("tmux", "show-options")] = ""  # a session with no project
+
+        out = io.StringIO()
+        code = afk.main(["land", "feat: x"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("afk: AFK_TICKET is not set; run this from an afk worker", out.getvalue())
+
+
 class DropTestCase(LandTestCase):
     """Worker 03 of a local-mode project, as in LandTestCase, with an idle shell pane, for the human to drop."""
 
@@ -4093,6 +4105,15 @@ class DropTest(DropTestCase):
 
             self.assertEqual(code, 1, out)
             self.assertIn(f"afk: no worker for ticket {ticket}", out)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+    def test_a_project_whose_state_is_gone_has_no_worker_to_drop(self):
+        shutil.rmtree(self.project_dir)  # closed, though the session still names it
+
+        code, out = self.drop("03", "--discard")
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("afk: no worker for ticket 03", out)
         self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
 
     def test_without_discard_a_busy_shell_pane_or_uncommitted_changes_are_refused_too(self):
