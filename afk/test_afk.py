@@ -838,10 +838,11 @@ class LinearTestCase(AfkTestCase):
         self.run_fake.responses[("linear", "api")] = self.linear_api
         self.run_fake.responses[("linear", "issue", "update")] = self.linear_update
 
-    def issue(self, identifier, title, state="unstarted", assignee=None, description="", child=True):
-        """A Linear issue in a state of the given type; a child is a sub-issue of ENG-1 and in the project."""
+    def issue(self, identifier, title, state="unstarted", assignee=None, description="", child=True, parent=True):
+        """A Linear issue in a state of the given type; a child is in the project, and a sub-issue of ENG-1 unless it
+        has no parent."""
         self.issues[identifier] = {"title": title, "state": state, "assignee": assignee, "description": description,
-                                   "child": child}
+                                   "child": child, "parent": child and parent}
 
     def node(self, identifier):
         issue = self.issues[identifier]
@@ -854,6 +855,12 @@ class LinearTestCase(AfkTestCase):
             "state": {"type": issue["state"]},
             "assignee": issue["assignee"] and {"displayName": issue["assignee"]},
             "inverseRelations": {"nodes": blockers + related},
+            "id": f"uuid-{identifier}", "team": {"id": f"team-{identifier.split('-')[0]}"},
+            "parent": {"id": "uuid-ENG-1"} if issue["parent"] else None,
+            "project": {"id": "uuid-8f3c2a1b9d0e"} if issue["child"] else None,
+            "relations": {"nodes": [{"type": "blocks", "relatedIssue": {"identifier": d}}
+                                    for d, blockers in self.blocked_by.items() if identifier in blockers]
+                          + [{"type": "related", "relatedIssue": {"identifier": "ENG-99"}}]},
         }
 
     def linear_api(self, cmd):
@@ -867,7 +874,8 @@ class LinearTestCase(AfkTestCase):
         complexity = pages[0] * (3.6 + 3.3 * pages[1]) if len(pages) == 2 else 3.6 + 3.3 * pages[0]
         if complexity > 10000:
             raise fail(1, f"The query is too complex. Complexity: {int(complexity)}. Maximum allowed complexity: 10000.")
-        children = [self.node(i) for i, issue in self.issues.items() if issue["child"]]
+        listed = "children" in document and "parent" or "child"
+        children = [self.node(i) for i, issue in self.issues.items() if issue[listed]]
         start = int(variables.get("after") or 0)
         page = {"nodes": children[start:start + pages[0]],
                 "pageInfo": {"hasNextPage": start + pages[0] < len(children), "endCursor": str(start + pages[0])}}
@@ -1032,16 +1040,88 @@ class LinearNextTest(LinearTestCase):
 
 
 class LinearSplitTest(LinearTestCase):
-    def test_split_is_refused_leaving_the_ticket_as_it_is(self):
-        self.issue("ENG-2", "Widget export")
+    """Splitting on Linear, against a fake that applies the issues and relations afk creates, so they show in the frontier."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_fake.responses[("linear", "issue", "relation", "add")] = self.linear_relation_add
+        self.issue("ENG-3", "Widget schema", state="completed")
+        self.issue("ENG-5", "Widget export", description="## What to build\n\nExport.\n")
+        self.issue("ENG-6", "Widget report")
+        self.issue("ENG-7", "Widget audit")
+        self.blocked_by = {"ENG-5": ["ENG-3"], "ENG-6": ["ENG-5"], "ENG-7": ["ENG-5"]}
         self.afk("init", self.SPEC)
 
-        out = io.StringIO()
-        code = afk.main(["split", "ENG-2"], run=self.run_fake, env=self.env, stdin=io.StringIO(json.dumps(SPLIT_PARTS)), stdout=out)
+    def linear_api(self, cmd):
+        document, variables = cmd[2], json.loads(cmd[cmd.index("--variables-json") + 1])
+        if "issueCreate" not in document:
+            return super().linear_api(cmd)
+        fields = variables["input"]
+        identifier = f"ENG-{max(int(i.split('-')[1]) for i in self.issues) + 1}"
+        # In ENG's team and the project, it is one of the project's issues; under ENG-1 too, one of ENG-1's sub-issues.
+        child = (fields.get("teamId"), fields.get("projectId")) == ("team-ENG", "uuid-8f3c2a1b9d0e")
+        self.issue(identifier, fields["title"], description=fields["description"], child=child,
+                   parent=fields.get("parentId") == "uuid-ENG-1")
+        return json.dumps({"data": {"issueCreate": {"issue": {"identifier": identifier, "url": self.node(identifier)["url"]}}}})
 
-        self.assertEqual(code, 1)
-        self.assertIn("can't split a Linear ticket yet", out.getvalue())
-        self.assertEqual([c for c in self.run_fake.calls if c[0] == "linear" and c[1] != "api"], [])
+    def linear_relation_add(self, cmd):
+        issue, relation, related = cmd[4:7]
+        self.assertEqual(relation, "blocks")
+        self.assertTrue({issue, related} <= set(self.issues), cmd)  # Linear refuses a relation to no issue
+        self.blocked_by.setdefault(related, []).append(issue)
+        return ""
+
+    def split(self, ticket, parts=SPLIT_PARTS):
+        return self.afk("split", ticket, stdin=json.dumps(parts))
+
+    def test_split_closes_the_ticket_for_one_issue_per_part_in_the_spec(self):
+        output = self.split("ENG-5")
+
+        self.assertIn("split ENG-5 into ENG-8, ENG-9", output)
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-8  Export endpoint  (acme/api)", "ENG-9  Export button  (acme/web)"])
+        self.assertIn("Serve widgets as CSV.", self.issues["ENG-8"]["description"])
+        self.assertEqual(self.issues["ENG-5"]["state"], "canceled")
+        [comment] = self.run_fake.find("linear", "issue", "comment", "add")
+        # By URL, which Linear turns into a mention of the issue.
+        self.assertEqual(comment[4:7], ["ENG-5", "--body", "Split into https://linear.app/acme/issue/ENG-8/export-endpoint, "
+                                        "https://linear.app/acme/issue/ENG-9/export-button, one per repo."])
+
+    def test_split_in_a_project_puts_the_parts_in_the_project_beside_a_ticket_with_no_parent(self):
+        self.run_fake.responses[("tmux", "show-options")] = "widgets-redesign-8f3c2a1b9d0e\n"
+        self.issue("ENG-5", "Widget export", parent=False)
+        self.afk("init", self.PROJECT)
+
+        self.split("ENG-5")
+
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-8  Export endpoint  (acme/api)", "ENG-9  Export button  (acme/web)"])
+        self.assertEqual([self.issues[i]["parent"] for i in ("ENG-8", "ENG-9")], [False, False])
+
+    def test_each_part_is_blocked_by_the_tickets_blockers_and_blocks_its_dependents(self):
+        self.issue("OPS-4", "Upstream fix", state="started", child=False)
+        self.blocked_by["ENG-5"].append("OPS-4")
+        self.split("ENG-5")
+
+        self.assertEqual(self.afk("frontier").splitlines(), [])
+        self.issues["OPS-4"]["state"] = "completed"
+        self.issues["ENG-3"]["state"] = "started"  # reopening either blocker blocks every part again
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-3  Widget schema"])
+        self.issues["ENG-3"]["state"] = "completed"
+        self.issues["ENG-8"]["state"] = "completed"
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-9  Export button  (acme/web)"])
+        self.issues["ENG-9"]["state"] = "completed"
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-6  Widget report", "ENG-7  Widget audit"])
+
+    def test_next_offers_each_part_in_its_own_repo(self):
+        web = self.clone(self.tmp / "web", "git@github.com:acme/web.git")
+        body = "Copied from ENG-5.\n\nRepo: acme/other\n"
+        self.split("ENG-5", [SPLIT_PARTS[0], {**SPLIT_PARTS[1], "body": body}])
+        self.afk("init")  # maps acme/web, now that a part names it
+
+        tickets = {t["id"]: t for t in json.loads(self.afk("next"))["tickets"]}
+
+        self.assertEqual({id: (t["title"], t["repo"]) for id, t in tickets.items()},
+                         {"ENG-8": ("Export endpoint", "acme/api"), "ENG-9": ("Export button", "acme/web")})
+        self.assertEqual(tickets["ENG-9"]["clone"], str(web))
 
 
 class LinearStartTest(LinearTestCase):

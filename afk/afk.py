@@ -2069,8 +2069,27 @@ class LinearTracker:
         self.run(["linear", "issue", "comment", "add", ticket.id, "--body", body, "--yes", "--no-input"])
 
     def split(self, ticket, parts):
-        raise SystemExit(f"afk: can't split a Linear ticket yet; split {ticket.id} in Linear by hand, one issue per repo, "
-                         "then run /afk next again")
+        """Create the parts beside the ticket, in its team, under its parent and in its project, then close it."""
+        issue = self.api("query($id: String!) { issue(id: $id) { team { id } parent { id } project { id } "
+                         "relations(first: 50) { nodes { type relatedIssue { identifier } } } } }", id=ticket.id)["issue"]
+        placement = {"teamId": issue["team"]["id"], **{f"{key}Id": issue[key]["id"] for key in ("parent", "project") if issue[key]}}
+        created = []
+        for part in parts:
+            # The Repo line first, as the first match wins.
+            description = f"Repo: {part['repo']}\n\n{part['body'].strip()}\n"
+            data = self.api("mutation($input: IssueCreateInput!) { issueCreate(input: $input) { issue { identifier url } } }",
+                            input={**placement, "title": part["title"], "description": description})
+            created.append(data["issueCreate"]["issue"])
+            for blocker in ticket.blocked_by:
+                self.run(["linear", "issue", "relation", "add", blocker, "blocks", created[-1]["identifier"], "--no-input"])
+        dependents = [r["relatedIssue"]["identifier"] for r in issue["relations"]["nodes"] if r["type"] == "blocks"]
+        for dependent in dependents:
+            for part in created:
+                self.run(["linear", "issue", "relation", "add", part["identifier"], "blocks", dependent, "--no-input"])
+        self.run(["linear", "issue", "update", ticket.id, "--state", "canceled", "--no-input"])
+        # By URL, which Linear turns into a mention of the issue.
+        self.comment(ticket, f"Split into {', '.join(part['url'] for part in created)}, one per repo.")
+        return [part["identifier"] for part in created]
 
     def frontier(self):
         # Each blocker comes with its state, so one outside the spec still counts, at no further request.

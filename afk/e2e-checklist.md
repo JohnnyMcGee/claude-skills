@@ -343,17 +343,18 @@ echo "$time_url $date_url $now_url"
 
 ## 13. Linear project (optional)
 
-Re-uses the throwaway repo, with the runs above finished and torn down from the afk side (stop their `afk watch`es; keep the repo and its remote). It checks that a project runs from Linear: tickets, claiming, blockers, release and completion all go through the `linear` CLI. It needs `linear` logged in (`linear auth login`) to a workspace with a team you can make throwaway issues in; `TEAM` below is its key. Make a parent issue and three sub-issues, noting each identifier `linear` prints (shown here as `P`, `L1`, `L2` and `L3`):
+Re-uses the throwaway repo, with the runs above finished and torn down from the afk side (stop their `afk watch`es; keep the repo and its remote). It checks that a project runs from Linear: tickets, claiming, blockers, release and completion all go through the `linear` CLI. It needs `linear` logged in (`linear auth login`) to a workspace with a team you can make throwaway issues in; `TEAM` below is its key. Make a parent issue and four sub-issues, noting each identifier `linear` prints (shown here as `P` and `L1` to `L4`):
 
 | Ticket | Blocked by | Exercises |
 | --- | --- | --- |
 | L1 — `/hello` endpoint | — | claim on start, a merge marking it done |
-| L2 — `/bye` endpoint | L1 | a blocks relation, unblocked by L1's merge |
+| L2 — `/bye` endpoint | L1, L4 | blocks relations, unblocked once L1 has merged and L4's parts are done |
 | L3 — `/noop` endpoint | — | release on a closed PR, then a land with its comment |
+| L4 — `/ping` endpoint | L1 | a split whose parts wait for L1, and that L2 waits for |
 
 ```bash
 linear issue create --team TEAM --title "AFK E2E Linear" --description "Throwaway parent for the afk e2e run." --yes
-for name in hello bye noop; do
+for name in hello bye noop ping; do
   linear issue create --team TEAM --parent P --title "/$name endpoint" --yes \
     --description "Repo: <you>/afk-e2e
 
@@ -365,6 +366,8 @@ for name in hello bye noop; do
 - [ ] A unit test covers it"
 done
 linear issue relation add L1 blocks L2
+linear issue relation add L1 blocks L4
+linear issue relation add L4 blocks L2
 cd ~/code/afk-e2e && git checkout main && git pull
 TMUX= tmux new -s afk-e2e-linear -c ~/code/afk-e2e
 ```
@@ -372,18 +375,18 @@ TMUX= tmux new -s afk-e2e-linear -c ~/code/afk-e2e
 Split the window as in step 3. Everything below runs in this session.
 
 - [ ] `/afk init <P's URL>` → `afk project '<p>' bound to tmux session 'afk-e2e-linear'`, where `<p>` is P's identifier lower-cased without its hyphen (e.g. `eng42`). `afk view` shows `tracker = "linear"`, and no `no local clone` line: the `Repo:` lines name this repo.
-- [ ] `afk frontier` lists L1 and L3, each with `(<you>/afk-e2e)`, and not L2.
+- [ ] `afk frontier` lists L1 and L3, each with `(<you>/afk-e2e)`, and not L2 or L4.
+- [ ] `echo '[{"repo": "<you>/afk-e2e", "title": "/ping handler", "body": "Serve GET /ping."}, {"repo": "<you>/afk-e2e", "title": "/ping test", "body": "Test GET /ping."}]' | afk split L4` (both parts in this repo, as there is only one) prints `split L4 into L5, L6`. In Linear, L4 is canceled with a comment `Split into …, one per repo.` that links L5 and L6, and L5 and L6 are sub-issues of P whose descriptions start `Repo: <you>/afk-e2e`, each blocked by L1 and blocking L2. `afk frontier` still lists only L1 and L3.
 - [ ] Start `afk watch`. `/afk next` proposes L1 and L3, reading each with `linear issue view`. Approve both. In Linear, both are assigned to you, and `afk frontier` lists neither. Their branches are `afk/<p>-L1` and `afk/<p>-L3`.
-- [ ] Run L1 through to Ready and merge its PR. Within about a minute it is cleaned up and L1 is in its team's completed state in Linear. In Linear the PR is linked to L1 alone, and P is still open. `afk frontier` now lists L2.
+- [ ] Run L1 through to Ready and merge its PR. Within about a minute it is cleaned up and L1 is in its team's completed state in Linear. In Linear the PR is linked to L1 alone, and P is still open. `afk frontier` now lists L5 and L6 and not L2, and `afk next` has both among its `tickets`. In Linear, mark L5 and L6 done (`linear issue update <id> --state completed`); `afk frontier` then lists L2.
 - [ ] Once L3 has a PR, close the PR without merging. Within about a minute L3 is cleaned up, unassigned in Linear, still not completed, and back in `afk frontier`.
-- [ ] `afk split L3` with any parts on stdin refuses, saying to split it in Linear by hand, and changes nothing in Linear.
 - [ ] Stop `afk watch`, run `afk close --force`, then `/afk init <P's URL> --land local` and `afk watch` again. Start L3, take it through to review, approve and land it. Once it is cleaned up, L3 is completed in Linear with the comment `Landed in <sha> on main`.
 - [ ] Start L2 (as `afk start <L2, lower-cased>`: any case names it), take it through to review, approve and land it. Every ticket has ended, so the watcher closes the project and exits, and `closed.log` has a line for `<p>`.
 - [ ] Optional: make a throwaway Linear project holding one new issue with the same `Repo:` line, and `/afk init <the project's URL>` in a fresh session. The project is named by its URL's slug (`<name>-<slug id>`), and `afk frontier` lists the new issue. Close it with `afk close --force`.
 
 ## 14. Tear down
 
-- [ ] Stop `afk watch` and `afk queue watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, and the queue's outcomes from this run (with `afk queue` empty and no worker running, `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/queue.json`). Remove the tmux sessions, `~/code/afk-e2e`, the GitHub repo (`gh repo delete afk-e2e`), and, if you ran section 13, its Linear issues (`linear issue delete` each of P and L1–L3) and any throwaway Linear project.
+- [ ] Stop `afk watch` and `afk queue watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, and the queue's outcomes from this run (with `afk queue` empty and no worker running, `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/queue.json`). Remove the tmux sessions, `~/code/afk-e2e`, the GitHub repo (`gh repo delete afk-e2e`), and, if you ran section 13, its Linear issues (`linear issue delete` each of P and L1–L6) and any throwaway Linear project.
 
 ## Defects
 
