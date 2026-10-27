@@ -128,7 +128,7 @@ Its tests run with `python3 -m unittest` from the `afk/` folder. [`afk/e2e-check
 
 `brief`, the `sweep-*` sweepers, `triage`, `next-work` and `execute` drive the `process` CLI in the `process/` folder (Python 3.11+, stdlib only; `gh` and `claude` on PATH). It is not a skill itself, but it is copied alongside them. The way to set it up is [`proc init`](https://github.com/JohnnyMcGee/proc#readme): it installs the process skills and `process`, writes and validates a first project profile, and offers a fixtures dry run. Run it again for each further project.
 
-Without proc, do the same by hand. Put `process` on PATH, then give it a profile per project:
+Instead of `proc init`, set up by hand (this assumes the skills are already copied to `~/.claude/skills/`, and skips the dry run). Put `process` on PATH, then give it a profile per project:
 
 ```bash
 ln -sf ~/.claude/skills/process/process.py ~/.local/bin/process
