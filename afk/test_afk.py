@@ -62,6 +62,11 @@ def pr_view(state, url="https://github.com/acme/widgets/pull/42", ready=False, c
     return json.dumps({"state": state, "url": url, "labels": labels, "createdAt": opened.strftime("%Y-%m-%dT%H:%M:%SZ")})
 
 
+def no_pr(cmd):
+    """What `gh pr view <branch>` does when the branch has no PR."""
+    raise subprocess.CalledProcessError(1, cmd, stderr=f'no pull requests found for branch "{cmd[3]}"')
+
+
 class AfkTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1400,6 +1405,620 @@ class QueuePauseTest(QueueTestCase):
 
     def test_an_unknown_subcommand_fails_with_usage(self):
         self.assertIn("usage: afk queue", self.queue_fails("queue", "flush"))
+
+
+class QueueTickTestCase(QueueTestCase):
+    """`afk queue tick`: the queue's watcher picking tickets up and driving their workers."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+
+    def enqueue(self, *numbers):
+        for number in numbers:
+            if self.key("acme/widgets", number) not in self.issues:
+                self.issue(number, f"Widget {number}")
+            self.afk("enqueue", f"https://github.com/acme/widgets/issues/{number}")
+
+    def worktree_adds(self):
+        return [c for c in self.run_fake.find("git", "-C") if c[3:5] == ["worktree", "add"]]
+
+    def desktop_notifications(self):
+        return [" ".join(c[1:]) for c in self.run_fake.find("notify-send")]
+
+
+class QueueTickTest(QueueTickTestCase):
+    def test_a_tick_starts_the_oldest_waiting_ticket_claimed_on_its_own_branch_in_the_queues_session(self):
+        self.enqueue(12, 13)
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit"),
+                         [["gh", "issue", "edit", "12", "--repo", "acme/widgets", "--add-assignee", "@me"]])
+        [add] = self.worktree_adds()
+        self.assertEqual(add[2], str(self.repo))
+        self.assertEqual(add[5:7], ["-b", "afk/queue-12"])
+        self.assertEqual(add[-1], "main")
+        [window] = self.run_fake.find("tmux", "new-window")
+        self.assertEqual(window[window.index("-t") + 1], "afk-queue:")
+        [send] = self.run_fake.find("tmux", "send-keys")
+        launch = shlex.split(send[4])
+        self.assertIn("AFK_SLOT=8", launch)
+        self.assertTrue(launch[-1].startswith("AFK phase: implement"), launch[-1])
+        self.assertIn(self.URL, launch[-1])
+        listing = self.afk("queue").splitlines()
+        self.assertTrue(listing[0].startswith("running  acme/widgets#12  Widget export  (implement, working)"), listing)
+        self.assertTrue(listing[1].startswith("1. acme/widgets#13"), listing)
+
+    def test_a_paused_queue_starts_nothing_until_it_is_resumed(self):
+        self.enqueue(12)
+        self.afk("queue", "pause")
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.worktree_adds(), [])
+        self.afk("queue", "resume")
+        self.afk("queue", "tick")
+        self.assertEqual(len(self.worktree_adds()), 1)
+
+    def test_a_ticket_waits_while_every_queue_worker_slot_is_taken(self):
+        self.enqueue(12, 13)
+        self.afk("queue", "tick")
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(len(self.worktree_adds()), 1)
+
+    def test_max_workers_lets_more_run_each_on_the_next_slot_down(self):
+        self.enqueue(12, 13, 14)
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text("[queue]\nmax_workers = 2\n")
+
+        self.afk("queue", "tick")
+
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        slots = [next(arg for arg in shlex.split(send[4]) if arg.startswith("AFK_SLOT="))
+                 for send in self.run_fake.find("tmux", "send-keys")]
+        self.assertEqual(slots, ["AFK_SLOT=8", "AFK_SLOT=7"])
+
+    def test_max_workers_beyond_the_queues_eight_slots_runs_eight_and_the_rest_wait(self):
+        self.enqueue(*range(12, 21))
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text("[queue]\nmax_workers = 20\n")
+
+        self.afk("queue", "tick")
+        self.afk("queue", "tick")
+
+        self.assertEqual(len(self.worktree_adds()), 8)
+        self.assertIn("1. acme/widgets#20", self.afk("queue"))
+
+
+class QueuePickUpTest(QueueTickTestCase):
+    """The checks a waiting ticket passes, re-read from its tracker, before a worker starts on it."""
+
+    def test_a_ticket_closed_while_it_waited_is_removed_with_a_notification_and_the_next_one_started(self):
+        self.enqueue(12, 13)
+        self.issue(12, "Widget export", state="closed")
+
+        output = self.afk("queue", "tick")
+
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13"])
+        self.assertEqual(self.run_fake.find("gh", "issue", "edit", "12"), [])
+        [notification] = self.desktop_notifications()
+        self.assertIn("acme/widgets#12 removed from the queue: it was closed", notification)
+        self.assertNotIn("\a", output)
+        listing = self.afk("queue")
+        self.assertIn("removed  acme/widgets#12  Widget export  it was closed", listing)
+        self.assertNotIn("1. acme/widgets#12", listing)
+
+    def test_a_ticket_assigned_to_someone_else_while_it_waited_is_removed_naming_them(self):
+        self.enqueue(12)
+        self.issue(12, "Widget export", assignees=["octocat"])
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.worktree_adds(), [])
+        self.assertIn("it was assigned to octocat", self.desktop_notifications()[0])
+        self.assertIn("removed  acme/widgets#12  Widget export  it was assigned to octocat", self.afk("queue"))
+
+    def test_a_blocked_ticket_is_skipped_keeping_its_place_and_started_once_unblocked(self):
+        self.issue(3, "Widget schema")
+        self.native_blockers[12] = [3]
+        self.enqueue(12, 13)
+
+        output = self.afk("queue", "tick")
+
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13"])
+        self.assertEqual(self.desktop_notifications(), [])
+        self.assertNotIn("\a", output)
+        self.assertIn("1. acme/widgets#12  Widget export  (acme/widgets: type feature, agent claude, model sonnet, "
+                      "effort medium)  blocked by #3", self.afk("queue"))
+
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text("[queue]\nmax_workers = 2\n")
+        self.afk("queue", "tick")
+        self.assertEqual(len(self.worktree_adds()), 1)  # blocked a moment ago, so not asked again yet
+
+        self.issue(3, "Widget schema", state="closed")
+        self.now += 60
+        self.afk("queue", "tick")
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13", "afk/queue-12"])
+
+    def test_a_ticket_numbered_as_a_running_one_in_another_repo_waits_for_it_to_end(self):
+        gadgets = self.clone(self.tmp / "gadgets", "git@github.com:acme/gadgets.git")
+        (gadgets / "docs" / "agents").mkdir(parents=True)
+        (gadgets / "docs" / "agents" / "afk.md").write_text((self.repo / "docs" / "agents" / "afk.md").read_text())
+        self.issue(12, "Gadget export", repo="acme/gadgets")
+        self.enqueue(12)
+        self.afk("enqueue", "https://github.com/acme/gadgets/issues/12")
+        self.enqueue(13)
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text("[queue]\nmax_workers = 2\n")
+
+        self.afk("queue", "tick")
+
+        self.assertEqual([(add[2], add[6]) for add in self.worktree_adds()],
+                         [(str(self.repo), "afk/queue-12"), (str(self.repo), "afk/queue-13")])
+        self.assertIn("1. acme/gadgets#12", self.afk("queue"))
+
+    def test_a_ticket_gone_from_github_is_removed_with_a_notification_and_the_next_one_started(self):
+        self.enqueue(12, 13)
+        del self.issues[12]
+        found = self.gh_api
+
+        def gh_api(cmd):
+            if any(arg.lower() == "repos/acme/widgets/issues/12" for arg in cmd):
+                raise subprocess.CalledProcessError(1, cmd, stderr="gh: Not Found (HTTP 404)")
+            return found(cmd)
+
+        self.run_fake.responses[("gh", "api")] = gh_api
+
+        self.afk("queue", "tick")
+
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13"])
+        self.assertIn("acme/widgets#12 removed from the queue: it was not found", self.desktop_notifications()[0])
+        self.assertIn("removed  acme/widgets#12  Widget export  it was not found", self.afk("queue"))
+
+    def test_a_ticket_that_cannot_be_checked_keeps_its_place_and_the_next_one_starts(self):
+        self.issue(12, "Widget export", body="## Blocked by\n\n#99\n")  # an issue gone, or out of reach
+        self.enqueue(12, 13)
+        found = self.gh_api
+
+        def gh_api(cmd):
+            if any(arg.lower() == "repos/acme/widgets/issues/99" for arg in cmd):
+                raise subprocess.CalledProcessError(1, cmd, stderr="gh: Not Found (HTTP 404)")
+            return found(cmd)
+
+        self.run_fake.responses[("gh", "api")] = gh_api
+
+        self.afk("queue", "tick")
+
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13"])
+        self.assertIn("1. acme/widgets#12", self.afk("queue"))
+        self.assertIn("couldn't check it: `gh api repos/acme/widgets/issues/99` failed", self.afk("queue"))
+
+    def test_a_start_the_watcher_was_killed_in_is_undone_and_tried_again(self):
+        self.enqueue(12)
+        # What a watcher killed mid-bootstrap leaves, as no rollback runs: the ticket running, a slot without a worker.
+        queue = self.state_home / "afk" / ".queue"
+        state = json.loads((queue / "queue.json").read_text())
+        state["tickets"][0].update(state="running", worker="12")
+        (queue / "queue.json").write_text(json.dumps(state))
+        (queue / "workers" / "12").mkdir(parents=True)
+        (queue / "workers" / "12" / "slot").write_text("8\n")
+
+        self.afk("queue", "tick")
+
+        worktree = str(queue / "worktrees" / "12")
+        self.assertIn(["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree], self.run_fake.calls)
+        self.assertIn(["git", "-C", str(self.repo), "branch", "-D", "afk/queue-12"], self.run_fake.calls)
+        self.assertIn("running  acme/widgets#12  Widget export  (implement, working)", self.afk("queue"))
+        self.assertIn("AFK_SLOT=8", self.run_fake.find("tmux", "send-keys")[-1][4])
+
+    def test_a_ticket_whose_worker_fails_to_start_keeps_its_place_says_why_and_is_retried_a_poll_later(self):
+        def split_fails(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="no space for new pane")
+
+        self.run_fake.responses[("tmux", "split-window")] = split_fails
+        self.enqueue(12, 13)
+
+        output = self.afk("queue", "tick")
+
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])  # both tried
+        self.assertIn("1. acme/widgets#12  Widget export", self.afk("queue"))
+        self.assertIn("failed to start: `tmux split-window", self.afk("queue"))
+        self.assertIn("no space for new pane", self.afk("queue"))
+        self.assertEqual(len(self.desktop_notifications()), 2)
+        self.assertIn("acme/widgets#12 failed to start", self.desktop_notifications()[0])
+        self.assertIn("\a", output)
+
+        self.afk("queue", "tick")
+        self.assertEqual(len(self.worktree_adds()), 2)  # not tried again until a poll later
+
+        self.now += 60
+        self.afk("queue", "tick")
+        self.assertEqual(len(self.worktree_adds()), 4)
+        self.assertEqual(len(self.desktop_notifications()), 2)  # the same failure again notifies nothing new
+
+
+class QueueWorkerTestCase(QueueTickTestCase):
+    """The queue with acme/widgets#12's worker started, and helpers to act as it."""
+
+    def setUp(self):
+        super().setUp()
+        self.enqueue(12)
+        self.afk("queue", "tick")
+        self.calls_before = len(self.run_fake.calls)
+
+    def worker_env(self):
+        return {"AFK_QUEUE": "1", "AFK_TICKET": "12"}
+
+    def finish_phase(self, message="Done"):
+        self.afk("report", "done", message, env=self.worker_env())
+        payload = {"session_id": "s", "transcript_path": str(self.tmp / "12.jsonl"), "hook_event_name": "Stop"}
+        self.afk("hook", "stop", stdin=json.dumps(payload), env=self.worker_env())
+        return self.afk("queue", "tick")
+
+    def status(self):
+        return json.loads((self.state_home / "afk" / ".queue" / "workers" / "12" / "status.json").read_text())
+
+    def prompts_sent(self, pane="%5"):
+        return WorkerTestCase.prompts_sent(self, pane)
+
+
+class QueuePhaseTest(QueueWorkerTestCase):
+    def test_each_done_phase_advances_to_the_next_critiquing_and_then_opening_a_draft(self):
+        for _ in range(4):
+            self.finish_phase()
+
+        self.assertEqual((self.status()["phase"], self.status()["state"]), ("draft", "working"))
+        self.assertEqual(
+            [p.splitlines()[0].split(" — ")[0] for p in self.prompts_sent()],
+            ["AFK phase: verify", "AFK phase: prepr", "AFK phase: critique", "AFK phase: draft"],
+        )
+        self.assertIn("running  acme/widgets#12  Widget export  (draft, working)", self.afk("queue"))
+
+    def test_critique_runs_the_repos_reviewers_over_the_diff_against_its_base_as_prepr_merged_it(self):
+        self.repo_config('default_type = "feature"\nreviewers = ["coderabbit review --base {{target}} --plain"]\n\n'
+                         '[task_types.feature]\nmodel = "sonnet"\n')
+        for _ in range(3):
+            self.finish_phase()
+
+        critique = self.prompts_sent()[-1]
+        self.assertTrue(critique.startswith("AFK phase: critique"), critique)
+        self.assertIn("`coderabbit review --base origin/main --plain`", critique)
+        self.assertIn("git diff origin/main...HEAD", critique)
+        self.assertNotIn("{{", critique)
+
+    def test_the_draft_prompt_names_the_ticket_the_base_and_the_ci_rounds(self):
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text("[queue.limits]\nci_rounds = 5\n")
+        for _ in range(4):
+            self.finish_phase()
+
+        draft = self.prompts_sent()[-1]
+        self.assertIn(self.URL, draft)
+        self.assertIn("--base main", draft)
+        self.assertIn("5 rounds", draft)
+        self.assertNotIn("{{", draft)
+
+    def test_the_draft_prompt_allows_two_ci_rounds_by_default(self):
+        for _ in range(4):
+            self.finish_phase()
+
+        self.assertIn("2 rounds", self.prompts_sent()[-1])
+
+    def test_every_phase_prompt_has_the_worker_keep_its_questions_for_the_draft_instead_of_asking(self):
+        for _ in range(4):
+            self.finish_phase()
+
+        [send] = self.run_fake.find("tmux", "send-keys", "-t", "%5")[:1]
+        for prompt in [shlex.split(send[4])[-1], *self.prompts_sent()]:
+            self.assertIn("## Questions for the engineer", prompt)
+
+
+class QueueDraftTest(QueueWorkerTestCase):
+    """A queue worker that reports done in the draft phase, its draft PR open."""
+
+    DRAFT = "https://github.com/acme/widgets/pull/7"
+
+    def setUp(self):
+        super().setUp()
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"  # its shell pane is idle
+        for _ in range(4):
+            self.finish_phase()
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("OPEN", url=self.DRAFT)
+        self.now += 60
+
+    def test_the_ticket_gets_a_comment_linking_its_draft_and_stays_open_and_assigned(self):
+        self.finish_phase("Draft open, CI green")
+
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        self.assertEqual(comment[3:6], ["12", "--repo", "acme/widgets"])
+        self.assertIn(self.DRAFT, comment[comment.index("--body") + 1])
+        self.assertEqual(self.run_fake.find("gh", "issue", "close"), [])
+        self.assertEqual([c for c in self.run_fake.find("gh", "issue", "edit") if "--remove-assignee" in c], [])
+
+    def test_its_window_worktree_and_local_branch_are_cleaned_up_with_a_notification_but_no_bell(self):
+        output = self.finish_phase("Draft open, CI green")
+
+        worktree = str(self.state_home / "afk" / ".queue" / "worktrees" / "12")
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%5"]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"),
+                         [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
+                         [["git", "-C", str(self.repo), "branch", "-D", "afk/queue-12"]])
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        [notification] = self.desktop_notifications()
+        self.assertIn(f"acme/widgets#12 draft PR opened: {self.DRAFT}", notification)
+        self.assertNotIn("\a", output)
+
+    def test_afk_queue_shows_the_draft_among_recent_outcomes(self):
+        self.finish_phase("Draft open, CI green")
+
+        listing = self.afk("queue")
+        self.assertIn(f"drafted  acme/widgets#12  Widget export  {self.DRAFT}", listing)
+        self.assertNotIn("running", listing)
+
+    def test_the_next_waiting_ticket_starts_in_the_same_tick_on_the_freed_slot(self):
+        self.enqueue(13)
+        self.assertEqual(len(self.worktree_adds()), 1)
+
+        self.finish_phase("Draft open, CI green")
+
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        launch = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])
+        self.assertIn("AFK_SLOT=8", launch)
+
+    def test_done_without_a_pr_for_its_branch_needs_attention_instead(self):
+        self.run_fake.responses[("gh", "pr", "view")] = no_pr
+
+        output = self.finish_phase("Draft open")
+
+        self.assertEqual((self.status()["phase"], self.status()["state"]), ("draft", "attention"))
+        self.assertIn("12 needs attention: no PR found for its branch", self.desktop_notifications()[-1])
+        self.assertIn("\a", output)
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+    def test_unpushed_commits_leave_it_cleanup_pending_and_the_queue_waits(self):
+        worktree = str(self.state_home / "afk" / ".queue" / "worktrees" / "12")
+        self.run_fake.responses[("git", "-C", worktree, "log")] = "3f2a9c1 Fix the export\n"
+        self.enqueue(13)
+
+        self.finish_phase("Draft open, CI green")
+
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertIn("unpushed commits", self.desktop_notifications()[-1])
+        self.assertEqual(len(self.worktree_adds()), 1)
+        self.assertEqual(self.run_fake.find("gh", "issue", "comment"), [])
+
+        self.run_fake.responses[("git", "-C", worktree, "log")] = ""
+        self.afk("queue", "tick")
+        self.assertEqual(len(self.run_fake.find("gh", "issue", "comment")), 1)
+        self.assertEqual(len(self.worktree_adds()), 2)
+
+    def test_a_ticket_the_engineer_closes_mid_draft_ends_without_a_comment_and_the_next_one_starts(self):
+        self.enqueue(13)
+        self.issue(12, "Widget export", state="closed")
+
+        self.afk("queue", "tick")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertEqual(self.run_fake.find("gh", "issue", "comment"), [])
+        self.assertIn("ended  acme/widgets#12  Widget export  its ticket was closed", self.afk("queue"))
+        self.assertEqual(len(self.worktree_adds()), 2)
+        [notification] = self.desktop_notifications()
+        self.assertIn("acme/widgets#12 ended: its ticket was closed", notification)
+        self.assertNotIn("/afk next", notification)
+
+    def pr_ends_mid_draft(self, state):
+        self.enqueue(13)
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view(state, url=self.DRAFT)
+
+        self.afk("queue", "tick")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        return self.afk("queue")
+
+    def test_a_pr_the_engineer_merges_mid_draft_ends_the_ticket_and_the_next_one_starts(self):
+        self.assertIn("ended  acme/widgets#12  Widget export  its PR was merged", self.pr_ends_mid_draft("MERGED"))
+
+    def test_a_pr_the_engineer_closes_mid_draft_ends_the_ticket_releasing_it_and_the_next_one_starts(self):
+        self.assertIn("ended  acme/widgets#12  Widget export  its PR was closed", self.pr_ends_mid_draft("CLOSED"))
+        self.assertIn(["gh", "issue", "edit", "12", "--repo", "acme/widgets", "--remove-assignee", "@me"],
+                      self.run_fake.find("gh", "issue", "edit"))
+
+    def test_a_pr_gone_by_the_time_the_ticket_ends_is_not_reported_as_its_draft(self):
+        views = iter([pr_view("OPEN", url=self.DRAFT)])
+        self.run_fake.responses[("gh", "pr", "view")] = lambda cmd: next(views, None) or no_pr(cmd)
+
+        self.finish_phase("Draft open")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "comment"), [])
+        self.assertIn("ended  acme/widgets#12  Widget export  its PR was closed", self.afk("queue"))
+
+    def test_a_running_worker_keeps_its_clone_when_a_ticket_of_its_repo_waits_in_another(self):
+        other = self.clone(self.tmp / "widgets-2", "git@github.com:acme/widgets.git")
+        (other / "docs" / "agents").mkdir(parents=True)
+        (other / "docs" / "agents" / "afk.md").write_text((self.repo / "docs" / "agents" / "afk.md").read_text())
+        self.run_fake.responses[("git", "rev-parse", "--show-toplevel")] = f"{other}\n"
+        self.enqueue(13)
+
+        self.finish_phase("Draft open")
+
+        worktree = str(self.state_home / "afk" / ".queue" / "worktrees" / "12")
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"),
+                         [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
+        self.assertEqual(self.worktree_adds()[-1][2], str(other))
+
+    def test_a_ticket_deleted_while_drafting_still_ends_as_drafted_without_a_comment(self):
+        self.enqueue(13)
+        found = self.gh_api
+
+        def gh_api(cmd):
+            if any(arg.lower() == "repos/acme/widgets/issues/12" for arg in cmd):
+                raise subprocess.CalledProcessError(1, cmd, stderr="gh: Not Found (HTTP 404)")
+            return found(cmd)
+
+        self.run_fake.responses[("gh", "api")] = gh_api
+
+        self.finish_phase("Draft open")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "comment"), [])
+        self.assertIn(f"drafted  acme/widgets#12  Widget export  {self.DRAFT}", self.afk("queue"))
+        self.assertEqual(self.worktree_adds()[-1][6], "afk/queue-13")
+
+    def test_a_cleanup_cut_short_once_the_ticket_ended_finishes_on_the_next_tick(self):
+        self.enqueue(13)
+        interrupted = []
+
+        def kill_window(cmd):
+            if not interrupted:
+                interrupted.append(cmd)
+                raise KeyboardInterrupt  # the watcher stopped mid-cleanup
+
+        self.run_fake.responses[("tmux", "kill-window")] = kill_window
+        self.afk("report", "done", "Draft open", env=self.worker_env())
+        self.afk("hook", "stop", stdin=json.dumps({"session_id": "s", "hook_event_name": "Stop"}), env=self.worker_env())
+        with self.assertRaises(KeyboardInterrupt):
+            self.afk("queue", "tick")
+
+        self.afk("queue", "tick")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertEqual(len(self.run_fake.find("gh", "issue", "comment")), 1)
+        self.assertEqual(len(self.desktop_notifications()), 1)
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+
+    def test_a_comment_that_fails_is_posted_on_the_next_tick_before_anything_is_cleaned_up(self):
+        def comment_fails(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="HTTP 502")
+
+        self.run_fake.responses[("gh", "issue", "comment")] = comment_fails
+        self.afk("report", "done", "Draft open", env=self.worker_env())
+        self.afk("hook", "stop", stdin=json.dumps({"session_id": "s", "hook_event_name": "Stop"}), env=self.worker_env())
+        self.queue_fails("queue", "tick")
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+        del self.run_fake.responses[("gh", "issue", "comment")]
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(len(self.run_fake.find("gh", "issue", "comment")), 2)
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        [notification] = self.desktop_notifications()
+        self.assertIn("draft PR opened", notification)
+
+    def test_a_pr_found_after_done_needed_attention_for_lack_of_one_ends_the_ticket(self):
+        self.run_fake.responses[("gh", "pr", "view")] = no_pr
+        self.finish_phase("Draft open")
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("OPEN", url=self.DRAFT)
+        self.now += 60
+
+        self.afk("queue", "tick")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertIn(f"drafted  acme/widgets#12  Widget export  {self.DRAFT}", self.afk("queue"))
+
+
+class QueueAndProjectsTest(QueueWorkerTestCase):
+    def test_queue_workers_and_a_projects_workers_never_count_toward_each_others_max(self):
+        self.ticket("03-ui", "Widget UI")
+        self.run_fake.responses[("tmux", "show-options")] = "widgets\n"
+        self.afk("init", str(self.scratch))
+        with open(self.state_home / "afk" / "widgets" / "config.toml", "a") as config:
+            config.write("\n[limits]\nmax_workers = 1\n")
+
+        self.afk("start", "03")
+        self.enqueue(13)
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text("[queue]\nmax_workers = 2\n")
+        self.afk("queue", "tick")
+
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/widgets-03", "afk/queue-13"])
+
+    def test_enqueueing_the_running_ticket_is_refused(self):
+        output = self.queue_fails("enqueue", self.URL)
+
+        self.assertIn("acme/widgets#12 is running in the queue", output)
+        self.assertNotIn("1. acme/widgets#12", self.afk("queue"))
+
+
+class QueueWatchTest(QueueTickTestCase):
+    def watch(self, sleeps=1):
+        """Run `afk queue watch` from the afk-queue session for `sleeps` ticks, until it's interrupted."""
+        self.run_fake.responses[("tmux", "display-message", "-p", "#{session_name}")] = "afk-queue\n"
+        out = io.StringIO()
+        with mock.patch.object(afk.time, "sleep", side_effect=[None] * (sleeps - 1) + [KeyboardInterrupt]):
+            code = afk.main(["queue", "watch"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                            clock=lambda: self.now)
+        self.assertEqual(code, 0, out.getvalue())
+        return out.getvalue()
+
+    def test_a_restarted_watcher_keeps_driving_the_running_queue_worker(self):
+        self.enqueue(12)
+        self.watch()
+        env = {"AFK_QUEUE": "1", "AFK_TICKET": "12"}
+        self.afk("report", "done", "Implemented", env=env)
+        self.afk("hook", "stop", stdin=json.dumps({"session_id": "s", "hook_event_name": "Stop"}), env=env)
+        loads = len(self.run_fake.find("tmux", "load-buffer"))
+
+        output = self.watch()
+
+        [load] = self.run_fake.find("tmux", "load-buffer")[loads:]
+        self.assertTrue(self.run_fake.inputs[self.run_fake.calls.index(load)].startswith("AFK phase: verify"))
+        self.assertIn("verify", output)
+        self.assertEqual(len(self.worktree_adds()), 1)
+
+    def test_the_watcher_runs_only_in_the_afk_queue_session_where_its_workers_open(self):
+        output = self.queue_fails("queue", "watch")
+
+        self.assertIn("afk-queue", output)
+        self.assertIn("tmux new-session -s afk-queue", output)
+
+
+class QueueWorkerRestrictionTest(QueueWorkerTestCase):
+    def denied(self, command):
+        settings = json.loads((self.state_home / "afk" / ".queue" / "workers" / "12" / "settings.json").read_text())
+        return any(fnmatch.fnmatchcase(f"Bash({command})", rule) for rule in settings["permissions"]["deny"])
+
+    def test_a_queue_worker_keeps_a_pr_mode_workers_deny_list(self):
+        for command in ["git push --force origin afk/queue-12", "git push origin main", "gh pr merge 7 --squash",
+                        "git worktree remove ../other", "afk drop 12 --discard"]:
+            self.assertTrue(self.denied(command), command)
+
+    def test_a_queue_worker_may_not_mark_its_pr_ready_wait_on_the_engineer_or_run_the_queue(self):
+        bin = shlex.quote(afk.AFK_BIN)
+        for command in ["gh pr ready", "gh pr ready 7", "afk report question 'Which database?'", "afk report question",
+                        f"{bin} report blocked",
+                        f"{bin} report blocked 'CI is down'", "afk enqueue https://github.com/acme/widgets/issues/13",
+                        "afk dequeue acme/widgets#13", "afk queue", "afk queue pause", f"{bin} queue resume"]:
+            self.assertTrue(self.denied(command), command)
+        for command in ["afk report done 'Opened the draft'", "gh pr create --draft --base main", "gh pr view"]:
+            self.assertFalse(self.denied(command), command)
+
+    def about_to(self, tool, env=None, **tool_input):
+        """What the worker's PreToolUse hook says to the tool call, or None if it lets it be."""
+        worktree = self.state_home / "afk" / ".queue" / "worktrees" / "12"
+        payload = {"session_id": "s", "transcript_path": str(self.tmp / "12.jsonl"), "hook_event_name": "PreToolUse",
+                   "cwd": str(worktree), "tool_name": tool, "tool_input": tool_input}
+        output = self.afk("hook", "activity", stdin=json.dumps(payload), env=env or self.worker_env())
+        return json.loads(output)["hookSpecificOutput"] if output.strip() else None
+
+    def test_a_queue_worker_may_edit_only_inside_its_worktree(self):
+        worktree = self.state_home / "afk" / ".queue" / "worktrees" / "12"
+        for tool, key, path in [("Edit", "file_path", str(self.repo / "widget.py")), ("Write", "file_path", "/etc/hosts"),
+                                ("MultiEdit", "file_path", str(worktree / ".." / "13" / "widget.py")),
+                                ("NotebookEdit", "notebook_path", str(self.tmp / "notes.ipynb"))]:
+            decision = self.about_to(tool, **{key: path})
+            self.assertEqual(decision["permissionDecision"], "deny", (tool, path))
+            self.assertIn("outside your worktree", decision["permissionDecisionReason"])
+        for tool, path in [("Edit", str(worktree / "widget.py")), ("Write", "docs/widgets.md")]:
+            self.assertIsNone(self.about_to(tool, file_path=path), path)
+        self.assertIsNone(self.about_to("Bash", command="git status"))
+
+    def test_a_project_worker_is_not_held_to_its_worktree(self):
+        self.ticket("03-ui", "Widget UI")
+        self.run_fake.responses[("tmux", "show-options")] = "widgets\n"
+        self.afk("init", str(self.scratch))
+        self.afk("start", "03")
+
+        self.assertIsNone(self.about_to("Edit", env={"AFK_PROJECT": "widgets", "AFK_TICKET": "03"},
+                                        file_path=str(self.repo / "widget.py")))
 
 
 class FrontierTest(AfkTestCase):

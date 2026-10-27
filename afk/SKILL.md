@@ -2,7 +2,7 @@
 name: afk
 description: Orchestrate AFK agent workers for one project in this tmux session — find unblocked tickets, start workers in their own worktree and tmux window, and track their status — or hand a standalone ticket to the machine-wide queue.
 disable-model-invocation: true
-argument-hint: <init [<spec>] [--land <pr|local>] [--target <branch>] | frontier | start <ticket> [--type <type>] | drop <ticket> [--discard] | watch | status | view | close [--force] | next | enqueue <issue URL> [--type <type>] | queue [pause|resume] | dequeue <ticket>>
+argument-hint: <init [<spec>] [--land <pr|local>] [--target <branch>] | frontier | start <ticket> [--type <type>] | drop <ticket> [--discard] | watch | status | view | close [--force] | next | enqueue <issue URL> [--type <type>] | queue [pause|resume|watch|tick] | dequeue <ticket>>
 ---
 
 # AFK
@@ -23,16 +23,17 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 - **`afk drop <ticket> --discard`** — abandon a local-mode worker's unlanded work, releasing its ticket back onto the frontier: see [Dropping](#dropping).
 - **`afk status`** — every worker's ticket, phase, state and last message, then the same "all tickets landed" line the watcher shows, while it holds.
 - **`afk view`** — the current project's config (`config.toml`): its spec, tracker, repo, session, `[landing]`, `[repos]`, `[limits]` and `[overrides]`.
-- **`afk enqueue <issue URL> [--type <type>] [--agent <agent>] [--model <model>] [--effort <effort>] [--repo <owner/name>]`**, **`afk queue [pause|resume]`**, **`afk dequeue <ticket>`** — add a standalone GitHub ticket to the machine-wide queue, list or pause it, or take a waiting ticket off it: see [Queue](#queue).
+- **`afk enqueue <issue URL> [--type <type>] [--agent <agent>] [--model <model>] [--effort <effort>] [--repo <owner/name>]`**, **`afk queue [pause|resume|watch|tick]`**, **`afk dequeue <ticket>`** — add a standalone GitHub ticket to the machine-wide queue, list, pause or watch it, or take a waiting ticket off it: see [Queue](#queue).
 - **`afk close [--force]`** — close the project: prune its clones' worktrees, unbind the tmux session, append a line to `${XDG_STATE_HOME:-~/.local/state}/afk/closed.log`, notify, and remove the project's state. It refuses while any worker or worktree is left, and while a ticket isn't done unless `--force` abandons the open ones. The watcher runs it on its own once every ticket is done, except in a project landing on an integration branch, which stays open until you run it.
 
 ## Handling the argument
 
 - `next`: follow [`/afk next`](#afk-next) below.
 - `init [<spec>] …`, `frontier`, `start <ticket> …`, `status`, `view`, `close [--force]`: run `afk $ARGUMENTS` and show the output.
-- `enqueue <issue URL> …`, `queue`, `queue pause`, `queue resume`, `dequeue <ticket>`: run `afk $ARGUMENTS` from wherever this session is, with no project needed, and show the output. If enqueue refuses, relay why: for a repo with no known clone, offer to add it under `[repos]` in the queue's `config.toml`; for one with no afk repo config, point the user at `/afk-setup` in that clone.
+- `enqueue <issue URL> …`, `queue`, `queue pause`, `queue resume`, `queue tick`, `dequeue <ticket>`: run `afk $ARGUMENTS` from wherever this session is, with no project needed, and show the output. If enqueue refuses, relay why: for a repo with no known clone, offer to add it under `[repos]` in the queue's `config.toml`; for one with no afk repo config, point the user at `/afk-setup` in that clone.
 - `drop <ticket> [--discard]`: run `afk $ARGUMENTS` and show the output. Never add `--discard` yourself: it deletes the worker's work, so only the user types it.
 - `watch`: it runs forever, so don't run it yourself. Tell the user to run `afk watch` in the orchestrator window's right pane.
+- `queue watch`: it runs forever too. Tell the user to start the queue's tmux session with it: `tmux new-session -d -s afk-queue afk queue watch`.
 - No argument: run `afk status`, then `afk frontier`, and ask which ticket to start.
 
 Start only tickets the user has named or approved.
@@ -52,16 +53,29 @@ The judgment points: stuck workers, then Gate 1, the user's gate for what work s
 
 ## Queue
 
-The queue is a standing, machine-wide line of standalone tickets that afk works through unattended, one at a time, each ending in a draft PR. It belongs to no project, never closes, and its commands work from any session, bound to a project or not (ADR 0002 in this skill's repo, `docs/adr/0002-queue-is-not-a-project.md`, says why). For now it only holds tickets: nothing picks them up yet. Its state lives in `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/`, and its optional config in `config.toml` there, which you write by hand. Its `[repos]` table registers clones the working-directory search misses, by absolute path or one starting `~/`:
+The queue is a standing, machine-wide line of standalone tickets that afk works through unattended, one at a time, each ending in a draft PR. It belongs to no project, never closes, and its commands work from any session, bound to a project or not (ADR 0002 in this skill's repo, `docs/adr/0002-queue-is-not-a-project.md`, says why). Its state lives in `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/`, and its optional config in `config.toml` there, which you write by hand. Its `[repos]` table registers clones the working-directory search misses, by absolute path or one starting `~/`. `[queue]` and `[queue.limits]` hold its own limits, apart from any project's:
 
 ```toml
 [repos]
 "acme/widgets" = "/home/me/code/widgets"
+
+[queue]
+max_workers = 1      # queue workers at once, at most 8; they never count toward a project's max_workers, nor its toward this
+
+[queue.limits]
+ci_rounds = 2        # rounds of CI fixes on a draft before listing what still fails
+# phase_minutes, idle_minutes and critique_rounds work as in a project's [limits], defaulting the same
 ```
 
 **`afk enqueue <GitHub issue URL>`** adds the ticket to the end of the queue and prints its position. Enqueueing a ticket that's already waiting changes nothing, flags included, and prints where it waits; to change its launch choices, dequeue it and enqueue it again. A pull request's URL is refused. The ticket's repo is its `Repo: owner/name` line, else the repo the issue lives in; `--repo` picks another. Its clone is found from the working directory as `afk init` finds clones (the checkout you're in, its submodules, its subdirectories and its siblings, matched by git remote; from a worktree, such as a worker's, the search starts at its main checkout), falling back to the queue's `[repos]`. Its type, agent, model and effort come from its `Type:` line or the repo's `default_type`, as `afk next` proposes them, corrected by `--type`, `--agent`, `--model` and `--effort`, and are stored with the queued ticket. Enqueue refuses, saying why and queuing nothing, a ticket that's closed, assigned to anyone but you, or `hitl` (by its `Type:` line or `--type`); one whose repo has no known clone, or a clone with no afk repo config (run `/afk-setup` there); and an unknown task type or agent.
 
-**`afk queue`** lists the waiting tickets, first in first out, each with its repo and launch choices, headed by a line saying so when the queue is paused. **`afk queue pause`** and **`afk queue resume`** set the queue's paused flag. **`afk dequeue <ticket>`** takes a waiting ticket off the queue, named by its URL or as `afk queue` names it (`owner/name#number`); it can be enqueued again later, at the end.
+**`afk queue`** lists the running tickets, each with its phase and state, then the waiting tickets, first in first out, each with its repo and launch choices and, when it was skipped, why: its open blockers, or why its worker failed to start, then the 10 most recent outcomes, newest first: `drafted` with the draft PR's URL, `removed` or `ended` with the reason. A line heads it when the queue is paused. **`afk queue pause`** stops anything new starting, letting a running worker finish; **`afk queue resume`** lets the queue pick tickets up again. **`afk dequeue <ticket>`** takes a waiting ticket off the queue, named by its URL or as `afk queue` names it (`owner/name#number`); it can be enqueued again later, at the end. Enqueueing a running ticket is refused, so no second worker starts on its branch.
+
+**`afk queue watch`** is the queue's watcher. It runs in the tmux session `afk-queue`, where its workers' windows open, and refuses to run anywhere else; keeping that session running is up to you (`tmux new-session -d -s afk-queue afk queue watch`). Like `afk watch` it needs no LLM, and a restarted watcher carries on driving the running workers. `afk queue tick` runs one step of it. Each step, unless the queue is paused, it takes the oldest waiting tickets while fewer than `max_workers` queue workers run, reading each again from GitHub first: a ticket closed, assigned to someone other than you, or gone since it was enqueued is removed from the queue with a notification; one with open blockers is skipped, keeping its place, and checked again a minute later, while the next is taken. A ticket whose worker fails to start (say, its bootstrap fails) is rolled back and skipped the same way, and you're notified once per distinct failure. A ticket numbered as one running from another repo waits for it to end. A ticket that passes is claimed (assigned to you), and its worker starts as a project's does, on branch `afk/queue-<number>` from the repo's base, in a worktree under the queue's state, on a slot counting down from 8, in a window of `afk-queue`.
+
+A queue worker goes through `implement → verify → prepr → critique → draft`: critique is the local-mode one, run against `origin/<base>`, which prepr merged, and the draft phase (`phase-draft.md`) pushes the branch, opens a draft PR against the base (or, where GitHub doesn't offer drafts, a normal PR labelled `Draft`), writes a description that links the ticket and ends with `## Questions for the engineer`, and waits for CI, fixing failures for up to `ci_rounds` rounds and listing any left. It skips bot-review triage, as bots skip drafts. A queue worker never waits on you: every prompt it gets ends with `queue-worker.md`, which has it make its best assumption for any question, and finish with what it has when blocked, noting both for that section. On top of a PR-mode worker's deny list it is denied `gh pr ready`, `afk report question` and `afk report blocked`, the queue's own commands (`afk enqueue`, `afk dequeue`, `afk queue`), and, by its PreToolUse hook, editing files outside its worktree. Its other limits are as a project worker's.
+
+Once it reports `done` in the draft phase and the watcher finds an open PR on its branch, its ticket ends: the ticket gets a comment linking the draft and stays open and assigned to you, the worker's window, worktree and local branch are cleaned up, a notification without the bell says where the draft is, and the next waiting ticket starts. Done without a PR on its branch needs attention instead. Cleanup is held up, `cleanup-pending`, by whatever would hold up a project worker's, such as unpushed commits, and the queue waits meanwhile. The watcher reads a queue worker's ticket and PR only once it's drafting, about once a minute: a ticket you close by then, or whose PR you merge or close, ends with its worker cleaned up, no comment and a notification saying how it ended. A worker that needed attention for having no PR ends as drafted once one turns up.
 
 ## Landing mode
 

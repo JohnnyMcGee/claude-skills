@@ -10,13 +10,13 @@ It uses a throwaway repo with three trivial tickets in a local `.scratch` spec:
 | 02 — `/version` endpoint | default | 01 | the next batch unblocked by a merge |
 | 03 — change the greeting | `hitl` | — | a guide-mode worker, `cleanup-pending` on a dirty worktree |
 
-Section 11 covers local landing mode, and section 12 a project run from Linear. Tick each box as you go. Where the result doesn't match **Expect**, note it in [Defects](#defects) and carry on if you can.
+Section 11 covers local landing mode, section 12 the queue, and section 13 a project run from Linear. Tick each box as you go. Where the result doesn't match **Expect**, note it in [Defects](#defects) and carry on if you can.
 
 ## Prerequisites
 
 - [ ] `afk` on PATH, pointing at this checkout's `afk.py`: `readlink -f "$(command -v afk)"`
 - [ ] `tmux`, `git`, `gh` (logged in: `gh auth status`), `claude`, Python 3.11+
-- [ ] For section 12 only: `linear`, logged in (`linear auth login`)
+- [ ] For section 13 only: `linear`, logged in (`linear auth login`)
 - [ ] The `afk`, `afk-setup` and `open-pr` skills installed from this checkout
 - [ ] No leftover state: `ls ${XDG_STATE_HOME:-~/.local/state}/afk/` has no `afk-e2e` directory
 
@@ -304,7 +304,44 @@ TMUX= tmux new -s afk-e2e-local -c ~/code/afk-e2e
 - [ ] The integration branch holds one commit per ticket: `git log --oneline main..afk-e2e-int` shows three. Open a PR from it to `main` with `gh pr create --base main --head afk-e2e-int`; that is the only PR in the run.
 - [ ] Add `issues/04-extra-endpoint.md` to the spec (copy 03's, renumbered). The all-landed line goes away; run it through to a land and the line returns with another notification, and `git log --oneline main..afk-e2e-int` shows four.
 
-## 12. Linear project (optional)
+## 12. Queue
+
+Re-uses the throwaway repo and its remote, with section 11 finished. The queue takes GitHub issues, so the tickets are issues on the remote. This checks that the queue picks tickets up unattended, works one through to a draft PR without ever waiting on you, and moves on. Check first that your own queue is empty (`afk queue`), as the queue is machine-wide.
+
+```bash
+cd ~/code/afk-e2e && git checkout main && git pull
+criteria=$'\n\n## Acceptance criteria\n\n- [ ] It returns 200\n- [ ] A unit test covers it'
+time_url=$(gh issue create --title "Add a /time endpoint" --body "\`GET /time\` returns the server time, in a format of your choosing.$criteria")
+date_url=$(gh issue create --title "Add a /date endpoint" --body "\`GET /date\` returns today's date.$criteria")
+now_url=$(gh issue create --title "Add a /now endpoint" --body "\`GET /now\` returns /time and /date together.$criteria"$'\n\n## Blocked by\n\n'"#${date_url##*/}")
+echo "$time_url $date_url $now_url"
+```
+
+**The watcher**
+
+- [ ] `afk queue watch` from your current session refuses, naming the `afk-queue` session and how to start it.
+- [ ] `tmux new-session -d -s afk-queue -c ~/code/afk-e2e afk queue watch`, then `tmux attach -t afk-queue` in another terminal to watch it. Its dashboard is empty.
+
+**Pick-up (/time)**
+
+- [ ] From any session, in `~/code/afk-e2e`, `/afk enqueue $time_url`, then `/afk enqueue $date_url`. Within a few seconds /time is assigned to you on GitHub and a window `<n>-add-a-time` opens in `afk-queue`. In its shell pane `git branch --show-current` is `afk/queue-<n>`, branched from `main`, and `echo $AFK_SLOT` prints `8`.
+- [ ] `afk queue` shows `running  …#<n>  Add a /time endpoint  (implement, working)`, then /date waiting at `1.`: one queue worker at a time.
+- [ ] In the worker's agent pane, ask it to run `gh pr ready`, `afk report question "test"` and `afk queue pause`: each is denied. Ask it to edit `~/code/afk-e2e/app.py`, the main checkout: the edit is denied as outside its worktree.
+
+**Through to a draft (/time)**
+
+- [ ] It runs implement → verify → prepr → critique → draft without ever reporting `question` or `blocked`, and the dashboard follows. Critique runs the reviewers over `git diff origin/main...HEAD`.
+- [ ] draft: a draft PR against `main` opens on its branch. Its description links the ticket and ends with `## Questions for the engineer`, which names the time format it chose. With no CI in this repo, it says so rather than waiting.
+- [ ] Once it reports `done`: /time's issue has a comment linking the draft, and is still open and assigned to you. The worker's window, worktree and local branch are gone (`git branch` in the repo has no `afk/queue-<n>`; the branch is still on the remote). You get a tmux message and a desktop notification with the draft's URL, and the bell doesn't ring. The draft is still a draft.
+- [ ] `afk queue` lists `drafted  …#<n>  Add a /time endpoint  <draft URL>`, and /date is now running, on slot 8 again.
+
+**Skips, removals, pause and restart**
+
+- [ ] `/afk enqueue $now_url` while /date runs. Once /date's draft opens, /now is skipped, not started: `afk queue` shows it waiting with `blocked by #<date's number>`, and nothing notifies. Close /date's issue on GitHub. Within about a minute /now starts.
+- [ ] While /now runs, `afk queue pause`. Enqueue /time again, then close its issue on GitHub. /now carries on to its draft, but nothing new starts. `afk queue resume`: within a few seconds /time is removed from the queue with a notification that it was closed, and `afk queue` lists it as `removed … it was closed`.
+- [ ] While a worker runs, stop the watcher with Ctrl-C in its pane, which closes it, and start another: `tmux new-window -t afk-queue afk queue watch`. It carries on driving that worker.
+
+## 13. Linear project (optional)
 
 Re-uses the throwaway repo, with the runs above finished and torn down from the afk side (stop their `afk watch`es; keep the repo and its remote). It checks that a project runs from Linear: tickets, claiming, blockers, release and completion all go through the `linear` CLI. It needs `linear` logged in (`linear auth login`) to a workspace with a team you can make throwaway issues in; `TEAM` below is its key. Make a parent issue and three sub-issues, noting each identifier `linear` prints (shown here as `P`, `L1`, `L2` and `L3`):
 
@@ -344,9 +381,9 @@ Split the window as in step 3. Everything below runs in this session.
 - [ ] Start L2 (as `afk start <L2, lower-cased>`: any case names it), take it through to review, approve and land it. Every ticket has ended, so the watcher closes the project and exits, and `closed.log` has a line for `<p>`.
 - [ ] Optional: make a throwaway Linear project holding one new issue with the same `Repo:` line, and `/afk init <the project's URL>` in a fresh session. The project is named by its URL's slug (`<name>-<slug id>`), and `afk frontier` lists the new issue. Close it with `afk close --force`.
 
-## 13. Tear down
+## 14. Tear down
 
-- [ ] Stop `afk watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, the tmux sessions, `~/code/afk-e2e`, the GitHub repo (`gh repo delete afk-e2e`), and, if you ran section 12, its Linear issues (`linear issue delete` each of P and L1–L3) and any throwaway Linear project.
+- [ ] Stop `afk watch` and `afk queue watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, and the queue's outcomes from this run (with `afk queue` empty and no worker running, `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/queue.json`). Remove the tmux sessions, `~/code/afk-e2e`, the GitHub repo (`gh repo delete afk-e2e`), and, if you ran section 13, its Linear issues (`linear issue delete` each of P and L1–L3) and any throwaway Linear project.
 
 ## Defects
 
