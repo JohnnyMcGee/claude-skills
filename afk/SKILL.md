@@ -1,15 +1,15 @@
 ---
 name: afk
-description: Orchestrate AFK agent workers for one project in this tmux session — find unblocked tickets, start workers in their own worktree and tmux window, and track their status.
+description: Orchestrate AFK agent workers for one project in this tmux session — find unblocked tickets, start workers in their own worktree and tmux window, and track their status — or hand a standalone ticket to the machine-wide queue.
 disable-model-invocation: true
-argument-hint: <init [<spec>] [--land <pr|local>] [--target <branch>] | frontier | start <ticket> [--type <type>] | drop <ticket> [--discard] | watch | status | view | close [--force] | next>
+argument-hint: <init [<spec>] [--land <pr|local>] [--target <branch>] | frontier | start <ticket> [--type <type>] | drop <ticket> [--discard] | watch | status | view | close [--force] | next | enqueue <issue URL> [--type <type>] | queue [pause|resume] | dequeue <ticket>>
 ---
 
 # AFK
 
 You drive the `afk` CLI; it does all the mechanical work. Run it with Bash and relay its output. Add judgment only where a step below asks for it.
 
-One project = one tmux session. `afk` resolves the project from the tmux session it runs in, so run every command from inside that session.
+One project = one tmux session. `afk` resolves the project from the tmux session it runs in, so run every command from inside that session. The exceptions are the [queue](#queue)'s commands, `enqueue`, `queue` and `dequeue`, which belong to no project and run from any session.
 
 ## Commands
 
@@ -23,12 +23,14 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 - **`afk drop <ticket> --discard`** — abandon a local-mode worker's unlanded work, releasing its ticket back onto the frontier: see [Dropping](#dropping).
 - **`afk status`** — every worker's ticket, phase, state and last message, then the same "all tickets landed" line the watcher shows, while it holds.
 - **`afk view`** — the current project's config (`config.toml`): its spec, tracker, repo, session, `[landing]`, `[repos]`, `[limits]` and `[overrides]`.
+- **`afk enqueue <issue URL> [--type <type>] [--agent <agent>] [--model <model>] [--effort <effort>] [--repo <owner/name>]`**, **`afk queue [pause|resume]`**, **`afk dequeue <ticket>`** — add a standalone GitHub ticket to the machine-wide queue, list or pause it, or take a waiting ticket off it: see [Queue](#queue).
 - **`afk close [--force]`** — close the project: prune its clones' worktrees, unbind the tmux session, append a line to `${XDG_STATE_HOME:-~/.local/state}/afk/closed.log`, notify, and remove the project's state. It refuses while any worker or worktree is left, and while a ticket isn't done unless `--force` abandons the open ones. The watcher runs it on its own once every ticket is done, except in a project landing on an integration branch, which stays open until you run it.
 
 ## Handling the argument
 
 - `next`: follow [`/afk next`](#afk-next) below.
 - `init [<spec>] …`, `frontier`, `start <ticket> …`, `status`, `view`, `close [--force]`: run `afk $ARGUMENTS` and show the output.
+- `enqueue <issue URL> …`, `queue`, `queue pause`, `queue resume`, `dequeue <ticket>`: run `afk $ARGUMENTS` from wherever this session is, with no project needed, and show the output. If enqueue refuses, relay why: for a repo with no known clone, offer to add it under `[repos]` in the queue's `config.toml`; for one with no afk repo config, point the user at `/afk-setup` in that clone.
 - `drop <ticket> [--discard]`: run `afk $ARGUMENTS` and show the output. Never add `--discard` yourself: it deletes the worker's work, so only the user types it.
 - `watch`: it runs forever, so don't run it yourself. Tell the user to run `afk watch` in the orchestrator window's right pane.
 - No argument: run `afk status`, then `afk frontier`, and ask which ticket to start.
@@ -47,6 +49,19 @@ The judgment points: stuck workers, then Gate 1, the user's gate for what work s
 6. **Choose the batch.** Up to `capacity` tickets that can be built in parallel. Weigh conflict risk: two tickets editing the same files, schema, migrations or shared interfaces collide, with each other and with running `workers`. Prefer the batch with the least overlap; defer the rest.
 7. **Present.** A table: ticket, title, repo (marked when inferred), type, agent, model, effort. Below it, the conflict-risk reasoning for the batch and why each deferred ticket waits. Ask the user to approve or correct any field.
 8. **Start.** For each approved ticket run `afk start <ticket>` with an option for each field the user corrected or you inferred (`--type`, `--agent`, `--model`, `--effort`, `--repo`); the worker's status persists them. Done when every approved ticket has started, or a start has failed: report the failure and stop.
+
+## Queue
+
+The queue is a standing, machine-wide line of standalone tickets that afk works through unattended, one at a time, each ending in a draft PR. It belongs to no project, never closes, and its commands work from any session, bound to a project or not (ADR 0002 in this skill's repo, `docs/adr/0002-queue-is-not-a-project.md`, says why). For now it only holds tickets: nothing picks them up yet. Its state lives in `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/`, and its optional config in `config.toml` there, which you write by hand. Its `[repos]` table registers clones the working-directory search misses, by absolute path or one starting `~/`:
+
+```toml
+[repos]
+"acme/widgets" = "/home/me/code/widgets"
+```
+
+**`afk enqueue <GitHub issue URL>`** adds the ticket to the end of the queue and prints its position. Enqueueing a ticket that's already waiting changes nothing, flags included, and prints where it waits; to change its launch choices, dequeue it and enqueue it again. A pull request's URL is refused. The ticket's repo is its `Repo: owner/name` line, else the repo the issue lives in; `--repo` picks another. Its clone is found from the working directory as `afk init` finds clones (the checkout you're in, its submodules, its subdirectories and its siblings, matched by git remote; from a worktree, such as a worker's, the search starts at its main checkout), falling back to the queue's `[repos]`. Its type, agent, model and effort come from its `Type:` line or the repo's `default_type`, as `afk next` proposes them, corrected by `--type`, `--agent`, `--model` and `--effort`, and are stored with the queued ticket. Enqueue refuses, saying why and queuing nothing, a ticket that's closed, assigned to anyone but you, or `hitl` (by its `Type:` line or `--type`); one whose repo has no known clone, or a clone with no afk repo config (run `/afk-setup` there); and an unknown task type or agent.
+
+**`afk queue`** lists the waiting tickets, first in first out, each with its repo and launch choices, headed by a line saying so when the queue is paused. **`afk queue pause`** and **`afk queue resume`** set the queue's paused flag. **`afk dequeue <ticket>`** takes a waiting ticket off the queue, named by its URL or as `afk queue` names it (`owner/name#number`); it can be enqueued again later, at the end.
 
 ## Landing mode
 

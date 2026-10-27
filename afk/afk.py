@@ -132,8 +132,11 @@ class Afk:
         candidates = [repo, *(repo / p for p in submodules)] + sorted(repo.iterdir()) + sorted(repo.parent.iterdir())
         found = {}
         for candidate in candidates:
-            if not (candidate / ".git").exists():
-                continue
+            try:
+                if not (candidate / ".git").exists():
+                    continue
+            except OSError:
+                continue  # unreadable, as some of /tmp's children are to all but their owner
             try:
                 remotes = self.run(["git", "-C", str(candidate), "remote", "-v"])
             except subprocess.CalledProcessError:
@@ -200,10 +203,7 @@ class Afk:
     def cmd_start(self, ticket_id, *options):
         project = self.current_project()
         config = self.config()
-        corrections = dict(zip(options[::2], options[1::2]))
-        if len(options) % 2 or set(corrections) - set(START_OPTIONS) or len(corrections) != len(options) // 2:
-            raise SystemExit("afk: usage: afk start <ticket> " + " ".join(f"[{o} <{o[2:]}>]" for o in START_OPTIONS))
-        corrections = {option[2:]: value for option, value in corrections.items()}
+        corrections = parse_corrections(options, "afk start <ticket>")
         tracker = self.tracker()
         ticket = tracker.get(ticket_id)
         pdir = self.project_dir(project)
@@ -219,11 +219,8 @@ class Afk:
         repo_config = self.repo_config(clone)
         task_types = repo_config.get("task_types", {})
         choices = launch_choices(ticket, repo_config.get("default_type"), task_types, corrections)
+        check_choices(ticket.id, choices, task_types)
         type_name = choices["type"]
-        if type_name and type_name not in task_types and type_name != HITL:
-            raise SystemExit(f"afk: unknown task type '{type_name}'; docs/agents/afk.md defines: {', '.join(task_types) or 'none'}")
-        if choices["agent"] not in AGENTS:
-            raise SystemExit(f"afk: ticket {ticket.id} would use agent '{choices['agent']}'; supported: {', '.join(AGENTS)}")
         task_type = task_types.get(type_name, {})
         base = repo_config.get("base", "main")
         landing = config.get("landing", {})
@@ -976,6 +973,142 @@ class Afk:
         self.out(f"# {path}")
         self.out(path.read_text().rstrip())
 
+    def cmd_enqueue(self, url=None, *options):
+        """Add a standalone ticket to the end of the machine-wide queue, from any session (ADR 0002)."""
+        usage = "afk enqueue <GitHub issue URL>"
+        if not url or not GITHUB_ISSUE.match(url):
+            raise SystemExit(f"afk: usage: {usage} {OPTIONS_USAGE}")
+        corrections = parse_corrections(options, usage)
+        tracker = GithubTracker(self.run, url)
+        ticket = tracker.get(GITHUB_ISSUE.match(url)["number"])
+        issue = GITHUB_ISSUE.match(ticket.path)
+        if issue is None:
+            raise SystemExit(f"afk: {url} is a pull request, not an issue")
+        id = f"{issue['owner']}/{issue['repo']}#{issue['number']}"
+
+        def already_waiting(state):
+            waiting = [t["id"].lower() for t in state["tickets"] if t["state"] == "waiting"]
+            if id.lower() not in waiting:
+                return False
+            self.out(f"{id} is already waiting, at position {waiting.index(id.lower()) + 1}" + (
+                "; its launch choices are unchanged: dequeue it and enqueue it again to change them" if corrections else ""))
+            return True
+
+        # Checked and resolved before taking the lock, which the watcher takes every tick: this calls gh and git.
+        if already_waiting(self.read_queue()):
+            return
+        if ticket.done:
+            raise SystemExit(f"afk: {id} is closed; the queue takes only open tickets")
+        others = tracker.others(ticket)
+        if others:
+            raise SystemExit(f"afk: {id} is assigned to {', '.join(others)}, so the queue leaves it to them")
+        hitl = f"afk: {id} is a hitl ticket, which is yours to work on; the queue takes only work an agent does alone"
+        if (corrections.get("type") or ticket.type) == HITL:
+            raise SystemExit(hitl)  # before looking for a clone, which a hitl ticket would never need
+        repo = corrections.pop("repo", None) or ticket.repo or f"{issue['owner']}/{issue['repo']}"
+        clone = self.queue_clone(repo)
+        layers = repo_config_layers(clone)
+        if not layers:
+            raise SystemExit(f"afk: no afk repo config in {clone} (docs/agents/afk.md); run /afk-setup there first")
+        repo_config = reduce(deep_merge, layers, {})
+        task_types = repo_config.get("task_types", {})
+        choices = launch_choices(ticket, repo_config.get("default_type"), task_types, corrections)
+        if choices["type"] == HITL:
+            raise SystemExit(hitl)
+        check_choices(id, choices, task_types)
+        with self.queue_state() as state:
+            if already_waiting(state):
+                return
+            state["tickets"].append({"id": id, "url": ticket.path, "tracker": "github", "title": ticket.title, "repo": repo,
+                                     "clone": str(clone), **choices, "state": "waiting", "enqueued_at": self.clock()})
+            position = sum(t["state"] == "waiting" for t in state["tickets"])
+        self.out(f"enqueued {id} at position {position}")
+
+    def cmd_queue(self, action=None):
+        """The queue's waiting tickets, first in first out; or pause or resume it."""
+        if action not in (None, "pause", "resume"):
+            raise SystemExit("afk: usage: afk queue [pause|resume]")
+        if action:
+            with self.queue_state() as state:
+                state["paused"] = action == "pause"
+            self.out(f"queue {action}d" + (": nothing new starts until `afk queue resume`" if state["paused"] else ""))
+            return
+        state = self.read_queue()
+        waiting = [t for t in state["tickets"] if t["state"] == "waiting"]
+        if state["paused"]:
+            self.out("paused: nothing new starts until `afk queue resume`")
+        if not waiting:
+            self.out("the queue is empty")
+        for position, t in enumerate(waiting, start=1):
+            choices = ", ".join(f"{key} {t[key]}" for key in ("type", "agent", "model", "effort") if t.get(key))
+            self.out(f"{position}. {t['id']}  {t['title']}  ({t['repo']}: {choices})")
+
+    def cmd_dequeue(self, ticket=None):
+        """Take a waiting ticket, named by its URL or its id, off the queue."""
+        if not ticket:
+            raise SystemExit("afk: usage: afk dequeue <ticket URL or owner/name#number>")
+        issue = GITHUB_ISSUE.match(ticket)
+        id = f"{issue['owner']}/{issue['repo']}#{issue['number']}" if issue else ticket
+        with self.queue_state() as state:
+            entry = next((t for t in state["tickets"] if t["state"] == "waiting" and t["id"].lower() == id.lower()), None)
+            if entry is None:
+                raise SystemExit(f"afk: {id} is not waiting in the queue; see `afk queue`")
+            state["tickets"].remove(entry)
+        self.out(f"removed {entry['id']} from the queue")
+
+    def queue_dir(self):
+        return self.state_root() / ".queue"  # dot-named: no project dir can be it
+
+    def read_queue(self):
+        """The queue's state as last written; written whole by rename, so it reads consistently without the lock."""
+        path = self.queue_dir() / "queue.json"
+        return read_json(path) if path.exists() else {"paused": False, "tickets": []}
+
+    @contextmanager
+    def queue_state(self):
+        """The queue's state, written back when the block ends, under its lock: enqueue may race the watcher."""
+        qdir = self.queue_dir()
+        qdir.mkdir(parents=True, exist_ok=True)
+        with locked(qdir):
+            state = self.read_queue()
+            yield state
+            write_json(qdir / "queue.json", state)
+
+    def queue_clone(self, repo):
+        """The clone of an owner/name repo for the queue: found from the working directory as `afk init` finds clones,
+        else in the queue's [repos] registry."""
+        try:
+            start = Path(self.run(["git", "rev-parse", "--show-toplevel"]).strip())
+            dirs = self.run(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"]).splitlines()
+            if len(dirs) == 2 and dirs[0] != dirs[1]:
+                start = Path(dirs[1]).parent  # a linked worktree, as a worker's is: its clone is the main checkout
+        except subprocess.CalledProcessError:
+            start = Path.cwd()  # not in a checkout: its subdirectories and siblings may still be
+        config = self.queue_dir() / "config.toml"
+        clone = self.find_clones(start, [repo]).get(repo)
+        # Read only when needed, so a typo in the hand-written file never stops a clone found nearby.
+        registered = clone is None and next(
+            ((r, c) for r, c in self.queue_config().get("repos", {}).items() if same(r, repo)), None)
+        if registered:
+            name, clone = registered
+            if not self.home_path(clone).is_dir():
+                raise SystemExit(f"afk: {name} = {clone} in [repos] is not a directory; fix it in {config}")
+        if clone is None:
+            raise SystemExit(f"afk: no clone of {repo} near {start}: clone it next to {start}, or add it under [repos] in {config}")
+        return self.home_path(clone)
+
+    def home_path(self, path):
+        """A path written by hand, perhaps starting from ~."""
+        return Path(self.env["HOME"]) / path[2:] if path.startswith("~/") else Path(path)
+
+    def queue_config(self):
+        """The queue's [queue], [queue.limits] and [repos] registry, all optional."""
+        path = self.queue_dir() / "config.toml"
+        try:
+            return tomllib.loads(path.read_text()) if path.exists() else {}
+        except tomllib.TOMLDecodeError as error:
+            raise SystemExit(f"afk: {path} is not valid TOML: {error}")
+
     def worker_status_path(self):
         ticket = self.env.get("AFK_TICKET")
         if not ticket:
@@ -1044,6 +1177,7 @@ FRONTIER_POLL = 60  # seconds between the watcher's reads of the tracker
 
 # Corrections the user can make at Gate 1, each a `afk start` option.
 START_OPTIONS = ("--type", "--agent", "--model", "--effort", "--repo")
+OPTIONS_USAGE = " ".join(f"[{o} <{o[2:]}>]" for o in START_OPTIONS)
 
 INIT_OPTIONS = ("--land", "--target")
 
@@ -1311,6 +1445,7 @@ class Ticket:
     path: Path
     type: str
     repo: str | None = None  # owner/name; None leaves it for Gate 1 to resolve
+    assignees: tuple = ()
 
     @property
     def done(self):
@@ -1442,6 +1577,7 @@ class GithubTracker:
         return Ticket(
             id=id, title=issue["title"], status=status, blocked_by=blocked_by, path=issue["html_url"],
             type=field(body, "Type"), repo=repo.group(0) if repo else None if same(own, self.repo) else own,
+            assignees=tuple(a["login"] for a in issue["assignees"]),
         )
 
     def get(self, ticket_id):
@@ -1457,6 +1593,11 @@ class GithubTracker:
         """Assignment is the cross-orchestrator lock: a claimed ticket drops out of every frontier."""
         repo, number = self.locate(ticket.id)
         self.run(["gh", "issue", "edit", number, "--repo", repo, "--add-assignee", "@me"])
+
+    def others(self, ticket):
+        """Whoever besides me the ticket is assigned to."""
+        me = self.run(["gh", "api", "user", "--jq", ".login"]).strip() if ticket.assignees else None
+        return [login for login in ticket.assignees if not same(login, me)]
 
     def release(self, ticket):
         repo, number = self.locate(ticket.id)
@@ -1541,6 +1682,23 @@ def launch_choices(ticket, default_type, task_types, corrections):
     choices = {"type": type_name, "agent": task_type.get("agent", "claude"), "model": task_type.get("model"),
                "effort": task_type.get("effort")}
     return {**choices, **{k: v for k, v in corrections.items() if k != "type"}}
+
+
+def parse_corrections(options, usage):
+    """`afk start` options as {field: value}, as `afk enqueue` takes them too; anything else fails with the usage."""
+    corrections = dict(zip(options[::2], options[1::2]))
+    if len(options) % 2 or set(corrections) - set(START_OPTIONS) or len(corrections) != len(options) // 2:
+        raise SystemExit(f"afk: usage: {usage} {OPTIONS_USAGE}")
+    return {option[2:]: value for option, value in corrections.items()}
+
+
+def check_choices(ticket_id, choices, task_types):
+    """Fail on a task type the repo doesn't define, or an agent afk can't launch."""
+    type_name = choices["type"]
+    if type_name and type_name not in task_types and type_name != HITL:
+        raise SystemExit(f"afk: unknown task type '{type_name}'; docs/agents/afk.md defines: {', '.join(task_types) or 'none'}")
+    if choices["agent"] not in AGENTS:
+        raise SystemExit(f"afk: ticket {ticket_id} would use agent '{choices['agent']}'; supported: {', '.join(AGENTS)}")
 
 
 def reviewer_list(reviewers, target):
@@ -1810,7 +1968,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|close|land|drop|status|view|hook|check|trial> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|close|land|drop|status|view|hook|check|trial|enqueue|queue|dequeue> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)

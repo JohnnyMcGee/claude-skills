@@ -798,6 +798,301 @@ class GithubCompleteTest(GithubTestCase):
         self.assertEqual(self.run_fake.find("gh", "issue", "close"), [])
 
 
+class QueueTestCase(GithubTestCase):
+    """The machine-wide queue, run from a session bound to no project: standalone GitHub issues via faked `gh`."""
+
+    URL = "https://github.com/acme/widgets/issues/12"
+
+    def setUp(self):
+        super().setUp()
+        self.run_fake.responses[("tmux", "show-options")] = "\n"  # no project here
+        self.run_fake.responses[("gh", "api", "user")] = "me\n"
+        self.clone(self.repo, "git@github.com:acme/widgets.git")
+        self.repo_config('default_type = "feature"\n\n[task_types.feature]\nmodel = "sonnet"\neffort = "medium"\n')
+        self.issue(12, "Widget export")
+
+    def queue_fails(self, *argv):
+        out = io.StringIO()
+        code = afk.main(list(argv), run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+        self.assertEqual(code, 1, out.getvalue())
+        return out.getvalue()
+
+
+class EnqueueTest(QueueTestCase):
+    def test_enqueue_from_a_session_bound_to_no_project_adds_the_ticket_to_the_queue(self):
+        output = self.afk("enqueue", self.URL)
+
+        self.assertIn("enqueued acme/widgets#12 at position 1", output)
+        self.assertEqual(self.run_fake.find("tmux"), [])
+        listing = self.afk("queue")
+        self.assertIn("1. acme/widgets#12  Widget export", listing)
+        self.assertIn("feature", listing)
+
+    def test_a_ticket_and_its_repo_are_named_as_github_names_them_whatever_the_urls_casing(self):
+        self.afk("enqueue", "https://github.com/ACME/Widgets/issues/12")
+
+        self.assertIn("1. acme/widgets#12  Widget export  (acme/widgets: ", self.afk("queue"))
+
+    def test_tickets_wait_in_the_order_they_were_enqueued(self):
+        self.issue(13, "Widget import")
+        self.issue(9, "Widget search")
+
+        for number in (12, 13, 9):
+            self.afk("enqueue", f"https://github.com/acme/widgets/issues/{number}")
+
+        listing = self.afk("queue").splitlines()
+        self.assertEqual([line.split("  ")[0] for line in listing],
+                         ["1. acme/widgets#12", "2. acme/widgets#13", "3. acme/widgets#9"])
+
+    def test_enqueueing_a_waiting_ticket_again_changes_nothing_and_says_where_it_waits(self):
+        self.issue(13, "Widget import")
+        self.afk("enqueue", self.URL)
+        self.afk("enqueue", "https://github.com/acme/widgets/issues/13")
+
+        output = self.afk("enqueue", "https://github.com/ACME/Widgets/issues/12", "--model", "opus")
+
+        self.assertIn("acme/widgets#12 is already waiting, at position 1", output)
+        self.assertIn("its launch choices are unchanged", output)
+        listing = self.afk("queue").splitlines()
+        self.assertEqual(len(listing), 2)
+        self.assertNotIn("opus", listing[0])
+
+
+class EnqueueChoicesTest(QueueTestCase):
+    def setUp(self):
+        super().setUp()
+        self.repo_config('default_type = "feature"\n\n[task_types.feature]\nmodel = "sonnet"\neffort = "medium"\n\n'
+                         '[task_types.bugfix]\nmodel = "haiku"\neffort = "low"\n')
+
+    def test_the_tickets_type_line_picks_its_launch_choices_over_the_repos_default(self):
+        self.issue(12, "Widget export", body="Type: bugfix\n")
+
+        self.afk("enqueue", self.URL)
+
+        self.assertIn("(acme/widgets: type bugfix, agent claude, model haiku, effort low)", self.afk("queue"))
+
+    def test_flags_correct_the_launch_choices_and_are_kept_with_the_queued_ticket(self):
+        self.afk("enqueue", self.URL, "--type", "bugfix", "--model", "opus")
+
+        self.assertIn("(acme/widgets: type bugfix, agent claude, model opus, effort low)", self.afk("queue"))
+
+    def test_malformed_options_fail_with_usage_and_queue_nothing(self):
+        for argv in (["--model"], ["--colour", "blue"], ["--model", "opus", "--model", "haiku"]):
+            self.assertIn("usage: afk enqueue", self.queue_fails("enqueue", self.URL, *argv))
+        self.assertIn("usage: afk enqueue", self.queue_fails("enqueue", "https://example.com/issues/12"))
+        self.assertIn("the queue is empty", self.afk("queue"))
+
+
+class EnqueueRefusalTest(QueueTestCase):
+    def refused(self, *argv):
+        output = self.queue_fails("enqueue", self.URL, *argv)
+        self.assertIn("the queue is empty", self.afk("queue"))
+        return output
+
+    def test_a_closed_ticket_is_refused(self):
+        self.issue(12, "Widget export", state="closed")
+
+        self.assertIn("acme/widgets#12 is closed", self.refused())
+
+    def test_a_ticket_assigned_to_someone_else_is_refused_naming_them(self):
+        self.issue(12, "Widget export", assignees=["me", "alice"])
+
+        self.assertIn("acme/widgets#12 is assigned to alice", self.refused())
+
+    def test_a_ticket_assigned_to_me_is_accepted(self):
+        self.issue(12, "Widget export", assignees=["Me"])
+
+        self.assertIn("enqueued acme/widgets#12", self.afk("enqueue", self.URL))
+
+    def test_a_hitl_ticket_is_refused_by_its_type_line_or_a_flag(self):
+        self.issue(12, "Widget export", body="Type: hitl\n")
+        self.assertIn("hitl", self.refused())
+
+        self.issue(12, "Widget export")
+        self.assertIn("hitl", self.refused("--type", "hitl"))
+
+    def test_a_hitl_ticket_is_refused_as_hitl_even_when_its_repo_has_no_clone(self):
+        self.issue(12, "Widget export", body="Type: hitl\nRepo: acme/nowhere\n")
+
+        self.assertIn("is a hitl ticket", self.refused())
+
+    def test_a_pull_request_is_refused(self):
+        self.issue(12, "Widget export")
+        self.issues[12]["html_url"] = "https://github.com/acme/widgets/pull/12"
+
+        self.assertIn(f"{self.URL} is a pull request, not an issue", self.refused())
+
+    def test_an_unknown_task_type_is_refused_naming_the_defined_ones(self):
+        self.assertIn("unknown task type 'chore'; docs/agents/afk.md defines: feature", self.refused("--type", "chore"))
+
+    def test_an_unsupported_agent_is_refused(self):
+        self.assertIn("agent 'codex'", self.refused("--agent", "codex"))
+
+
+class EnqueueCloneTest(QueueTestCase):
+    """The ticket's clone is searched for from the working directory, as `afk init` searches, then in [repos]."""
+
+    def setUp(self):
+        super().setUp()
+        self.issue(12, "Widget export", body="Repo: acme/api\n")
+
+    def api_clone(self, path):
+        """A clone of acme/api whose repo config is told apart from widgets' by its default type."""
+        self.clone(path, "git@github.com:acme/api.git")
+        (path / "docs" / "agents").mkdir(parents=True)
+        (path / "docs" / "agents" / "afk.md").write_text('+++\ndefault_type = "endpoint"\n\n[task_types.endpoint]\n+++\n')
+        return path
+
+    def register(self, repos):
+        (self.state_home / "afk" / ".queue").mkdir(parents=True, exist_ok=True)
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text(afk.to_toml({"queue": {"max_workers": 1}, "repos": repos}))
+
+    def test_a_clone_beside_the_working_checkout_is_found_by_its_remote(self):
+        self.api_clone(self.tmp / "api-checkout")
+
+        self.afk("enqueue", self.URL)
+
+        self.assertIn("(acme/api: type endpoint", self.afk("queue"))
+
+    def test_a_repo_with_no_clone_nearby_is_found_in_the_queues_repos_registry(self):
+        elsewhere = self.api_clone(self.tmp / "far" / "away" / "api")
+        self.register({"acme/web": str(self.tmp / "web"), "ACME/API": str(elsewhere)})
+
+        self.afk("enqueue", self.URL)
+
+        self.assertIn("(acme/api: type endpoint", self.afk("queue"))
+
+    def test_outside_any_checkout_the_registry_still_finds_the_clone(self):
+        def not_a_checkout(cmd):
+            raise subprocess.CalledProcessError(128, cmd, stderr="fatal: not a git repository")
+
+        self.run_fake.responses[("git", "rev-parse", "--show-toplevel")] = not_a_checkout
+        self.register({"acme/api": str(self.api_clone(self.tmp / "far" / "api"))})
+        nowhere = self.tmp / "nowhere" / "here"
+        nowhere.mkdir(parents=True)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(nowhere)
+
+        self.afk("enqueue", self.URL)
+
+        self.assertIn("(acme/api: type endpoint", self.afk("queue"))
+
+    def test_a_registered_path_may_start_from_home(self):
+        self.api_clone(self.tmp / "far" / "api")
+        self.register({"acme/api": "~/far/api"})
+
+        self.afk("enqueue", self.URL)
+
+        self.assertIn("(acme/api: type endpoint", self.afk("queue"))
+
+    def test_a_registered_path_that_is_not_a_directory_is_named_in_the_refusal(self):
+        self.register({"acme/api": str(self.tmp / "moved" / "api")})
+
+        self.assertIn(f"acme/api = {self.tmp / 'moved' / 'api'} in [repos] is not a directory",
+                      self.queue_fails("enqueue", self.URL))
+
+    def test_a_malformed_queue_config_is_read_only_when_needed_and_named_when_it_is(self):
+        (self.state_home / "afk" / ".queue").mkdir(parents=True)
+        config = self.state_home / "afk" / ".queue" / "config.toml"
+        config.write_text("[repos\n")
+
+        self.assertIn(f"afk: {config} is not valid TOML", self.queue_fails("enqueue", self.URL))
+        self.api_clone(self.tmp / "api-checkout")
+        self.assertIn("enqueued acme/widgets#12", self.afk("enqueue", self.URL))
+
+    def test_run_from_a_worktree_the_clone_is_its_main_checkout(self):
+        worktree = self.tmp / "state" / "afk" / "widgets-2" / "worktrees" / "7"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text(f"gitdir: {self.repo}/.git/worktrees/7\n")
+        self.run_fake.responses[("git", "rev-parse", "--show-toplevel")] = f"{worktree}\n"
+        self.run_fake.responses[("git", "rev-parse", "--path-format=absolute")] = f"{self.repo}/.git/worktrees/7\n{self.repo}/.git\n"
+        self.run_fake.responses[("git", "-C", str(worktree), "remote", "-v")] = "origin\tgit@github.com:acme/widgets.git (fetch)\n"
+
+        self.afk("enqueue", self.URL, "--repo", "acme/widgets")
+
+        [queued] = afk.read_json(self.state_home / "afk" / ".queue" / "queue.json")["tickets"]
+        self.assertEqual(queued["clone"], str(self.repo))
+
+    def test_the_repo_flag_picks_the_repo_over_the_tickets_repo_line(self):
+        self.api_clone(self.tmp / "api-checkout")
+
+        self.afk("enqueue", self.URL, "--repo", "acme/widgets")
+
+        self.assertIn("(acme/widgets: type feature", self.afk("queue"))
+
+    def test_a_repo_with_no_known_clone_is_refused_saying_where_to_put_one(self):
+        output = self.queue_fails("enqueue", self.URL)
+
+        self.assertIn("no clone of acme/api", output)
+        self.assertIn(str(self.state_home / "afk" / ".queue" / "config.toml"), output)
+        self.assertIn("the queue is empty", self.afk("queue"))
+
+    def test_a_clone_without_an_afk_repo_config_is_refused_pointing_at_afk_setup(self):
+        bare = self.clone(self.tmp / "api-checkout", "git@github.com:acme/api.git")
+
+        output = self.queue_fails("enqueue", self.URL)
+
+        self.assertIn(f"no afk repo config in {bare}", output)
+        self.assertIn("/afk-setup", output)
+        self.assertIn("the queue is empty", self.afk("queue"))
+
+
+class DequeueTest(QueueTestCase):
+    def setUp(self):
+        super().setUp()
+        for number in (12, 13, 14):
+            self.issue(number, f"Widget {number}")
+            self.afk("enqueue", f"https://github.com/acme/widgets/issues/{number}")
+
+    def ids(self):
+        return [line.split("  ")[0].split(". ")[1] for line in self.afk("queue").splitlines()]
+
+    def test_dequeue_removes_a_waiting_ticket_keeping_the_others_in_order(self):
+        output = self.afk("dequeue", "acme/widgets#13")
+
+        self.assertIn("removed acme/widgets#13 from the queue", output)
+        self.assertEqual(self.ids(), ["acme/widgets#12", "acme/widgets#14"])
+
+    def test_a_ticket_is_named_by_its_url_or_its_id_in_any_casing(self):
+        self.afk("dequeue", "https://github.com/acme/widgets/issues/12")
+        self.afk("dequeue", "ACME/Widgets#14")
+
+        self.assertEqual(self.ids(), ["acme/widgets#13"])
+
+    def test_a_dequeued_ticket_can_be_enqueued_again_at_the_end(self):
+        self.afk("dequeue", "acme/widgets#12")
+
+        self.assertIn("at position 3", self.afk("enqueue", self.URL))
+        self.assertEqual(self.ids(), ["acme/widgets#13", "acme/widgets#14", "acme/widgets#12"])
+
+    def test_a_ticket_not_in_the_queue_is_refused(self):
+        self.assertIn("acme/widgets#99 is not waiting in the queue", self.queue_fails("dequeue", "acme/widgets#99"))
+        self.assertIn("usage: afk dequeue", self.queue_fails("dequeue"))
+        self.assertEqual(len(self.ids()), 3)
+
+
+class QueuePauseTest(QueueTestCase):
+    def test_pause_and_resume_set_the_queues_paused_flag_which_the_listing_shows(self):
+        self.afk("enqueue", self.URL)
+
+        self.assertIn("queue paused", self.afk("queue", "pause"))
+        listing = self.afk("queue")
+        self.assertIn("paused", listing.splitlines()[0])
+        self.assertIn("1. acme/widgets#12", listing)
+
+        self.assertIn("queue resumed", self.afk("queue", "resume"))
+        self.assertNotIn("paused", self.afk("queue"))
+
+    def test_an_empty_queue_can_be_paused(self):
+        self.afk("queue", "pause")
+
+        self.assertIn("paused", self.afk("queue"))
+        self.assertIn("the queue is empty", self.afk("queue"))
+
+    def test_an_unknown_subcommand_fails_with_usage(self):
+        self.assertIn("usage: afk queue", self.queue_fails("queue", "flush"))
+
+
 class FrontierTest(AfkTestCase):
     def test_frontier_lists_open_tickets_whose_blockers_are_all_done(self):
         self.ticket("01-schema", "Widget schema", status="resolved")
