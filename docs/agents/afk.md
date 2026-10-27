@@ -30,6 +30,8 @@ None. What stands in for one is a skill's state directory. Skills that keep stat
 
 Set `XDG_STATE_HOME` **on the command only**, never `export` it in your shell: `afk report` reads the same variable to find this worker's status, so an exported override hides your reports from the watcher. Remove the directory when you are done: `rm -rf /tmp/afk-state-$AFK_SLOT`.
 
+You run inside the human's tmux server, and `$TMUX` points every bare `tmux` command at it, even with `TMUX_TMPDIR` set. Give every tmux command a test of yours runs, cleanup included, its own server with `-S <socket>` or `-L <name>`; `unset TMUX` alone isn't enough, as without `TMUX_TMPDIR` it falls back to the human's default socket. Never run `tmux kill-server` without `-S` or `-L`: it kills the human's server and every worker in it.
+
 ## Reviewers
 
 Critique runs CodeRabbit and Copilot over the branch's diff. CodeRabbit keeps a local checkpoint per worktree and branch, so a later round prints only new findings and points at `coderabbit review findings` for the earlier ones. Its `file:line` comes wrapped in a terminal-hyperlink escape; ignore it. Each CodeRabbit run counts against the account's included reviews; Copilot's against its AI credits.
