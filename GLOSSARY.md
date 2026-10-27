@@ -31,3 +31,17 @@ _Avoid_: abort, discard, close
 **Critique**:
 Local adversarial review of a worker's diff by reviewer CLIs, standing in for the bot reviewers on a PR.
 _Avoid_: local review, bot review
+
+## Queue
+
+**Queue**:
+A standing, machine-wide line of standalone tickets that afk works through unattended, one at a time, each ending in a draft PR. It belongs to no project and never closes.
+_Avoid_: backlog, background project, inbox
+
+**Enqueue**:
+To add a ticket to the end of the queue.
+_Avoid_: submit, schedule, push
+
+**Abandon**:
+To give up on the queue's running ticket, after its wrap-up or on the human's word, keeping whatever it pushed and moving on to the next. Unlike a drop, nothing pushed is deleted.
+_Avoid_: drop (for the queue), kill, fail
