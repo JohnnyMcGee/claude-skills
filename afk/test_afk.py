@@ -2,6 +2,7 @@ import fnmatch
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -111,6 +112,11 @@ class AfkTestCase(unittest.TestCase):
     @property
     def project_dir(self):
         return self.state_home / "afk" / "widgets"
+
+    def clone(self, path, remote):
+        (path / ".git").mkdir(parents=True)
+        self.run_fake.responses[("git", "-C", str(path), "remote", "-v")] = f"origin\t{remote} (fetch)\norigin\t{remote} (push)\n"
+        return path
 
     def repo_config(self, frontmatter, name="afk.md", body="# AFK\n\nRun `npm run dev`.\n"):
         """Write the repo's AFK config doc: TOML frontmatter between +++ lines, then prose."""
@@ -282,11 +288,6 @@ class GithubTestCase(AfkTestCase):
             "html_url": f"https://github.com/{repo}/issues/{number}",
             "repository_url": f"https://api.github.com/repos/{repo}",
         }
-
-    def clone(self, path, remote):
-        (path / ".git").mkdir(parents=True)
-        self.run_fake.responses[("git", "-C", str(path), "remote", "-v")] = f"origin\t{remote} (fetch)\norigin\t{remote} (push)\n"
-        return path
 
     @property
     def project_dir(self):
@@ -796,6 +797,314 @@ class GithubCompleteTest(GithubTestCase):
         tracker.complete(tracker.get("4"))
 
         self.assertEqual(self.run_fake.find("gh", "issue", "close"), [])
+
+
+class GithubCommentTest(GithubTestCase):
+    def test_a_comment_is_posted_on_the_tickets_issue_in_its_own_repo(self):
+        self.issue(4, "Widget API")
+        self.issue(9, "Widget page", repo="acme/web")
+        tracker = afk.GithubTracker(self.run_fake, self.SPEC)
+
+        tracker.comment(tracker.get("4"), "Draft: https://github.com/acme/widgets/pull/12")
+        tracker.comment(tracker.get("web#9"), "Abandoned: it ran past ticket_minutes")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "comment"), [
+            ["gh", "issue", "comment", "4", "--repo", "acme/widgets", "--body", "Draft: https://github.com/acme/widgets/pull/12"],
+            ["gh", "issue", "comment", "9", "--repo", "acme/web", "--body", "Abandoned: it ran past ticket_minutes"],
+        ])
+
+
+class LinearTestCase(AfkTestCase):
+    """A project whose spec is Linear issue ENG-1 and whose tickets are its sub-issues, all via a faked `linear` CLI.
+
+    The fake answers afk's GraphQL reads from the issues and blocked-by relations it holds, and applies the issue
+    updates afk makes, so their effect shows in later reads.
+    """
+
+    SPEC = "https://linear.app/acme/issue/ENG-1/widgets-spec"
+    PROJECT = "https://linear.app/acme/project/widgets-redesign-8f3c2a1b9d0e/overview"
+
+    def setUp(self):
+        super().setUp()
+        self.issues = {}  # identifier -> the issue's fields
+        self.blocked_by = {}  # identifier -> the identifiers of the issues that block it
+        self.run_fake.responses[("git", "rev-parse", "--show-toplevel")] = f"{self.repo}\n"
+        self.run_fake.responses[("tmux", "show-options")] = "eng1\n"
+        self.run_fake.responses[("linear", "api")] = self.linear_api
+        self.run_fake.responses[("linear", "issue", "update")] = self.linear_update
+
+    def issue(self, identifier, title, state="unstarted", assignee=None, description="", child=True):
+        """A Linear issue in a state of the given type; a child is a sub-issue of ENG-1 and in the project."""
+        self.issues[identifier] = {"title": title, "state": state, "assignee": assignee, "description": description,
+                                   "child": child}
+
+    def node(self, identifier):
+        issue = self.issues[identifier]
+        blockers = [{"type": "blocks", "issue": {"identifier": b, "state": {"type": self.issues[b]["state"]}}}
+                    for b in self.blocked_by.get(identifier, [])]
+        related = [{"type": "related", "issue": {"identifier": "ENG-99", "state": {"type": "started"}}}]
+        return {
+            "identifier": identifier, "title": issue["title"], "description": issue["description"] or None,
+            "url": f"https://linear.app/acme/issue/{identifier}/{afk.slug(issue['title'])}",
+            "state": {"type": issue["state"]},
+            "assignee": issue["assignee"] and {"displayName": issue["assignee"]},
+            "inverseRelations": {"nodes": blockers + related},
+        }
+
+    def linear_api(self, cmd):
+        document, variables = cmd[2], json.loads(cmd[cmd.index("--variables-json") + 1])
+        # As the CLI does for any GraphQL error: the errors on stdout, exit 3 for an entity not found and 1 for the rest.
+        fail = lambda code, message: subprocess.CalledProcessError(
+            code, cmd, output=json.dumps({"errors": [{"message": message}], "data": None}), stderr="")
+        # Linear's documented complexity: 1 per object and 0.1 per field, a connection's nodes counted `first` times.
+        # An issue as afk reads it is 3.6, and each of its relations 3.3.
+        pages = [int(n) for n in re.findall(r"first:\s*(\d+)", document)]
+        complexity = pages[0] * (3.6 + 3.3 * pages[1]) if len(pages) == 2 else 3.6 + 3.3 * pages[0]
+        if complexity > 10000:
+            raise fail(1, f"The query is too complex. Complexity: {int(complexity)}. Maximum allowed complexity: 10000.")
+        children = [self.node(i) for i, issue in self.issues.items() if issue["child"]]
+        start = int(variables.get("after") or 0)
+        page = {"nodes": children[start:start + pages[0]],
+                "pageInfo": {"hasNextPage": start + pages[0] < len(children), "endCursor": str(start + pages[0])}}
+        if "children" in document:
+            if variables["id"] != "ENG-1":
+                raise fail(3, "Entity not found: Issue")
+            data = {"issue": {"children": page}}
+        elif "project(" in document:
+            if variables["id"] != "8f3c2a1b9d0e":
+                raise fail(3, "Entity not found: Project")
+            data = {"project": {"issues": page}}
+        elif variables["id"] in self.issues:
+            data = {"issue": self.node(variables["id"])}
+        else:
+            raise fail(3, "Entity not found: Issue")
+        return json.dumps({"data": data})
+
+    def linear_update(self, cmd):
+        issue = self.issues[cmd[3]]
+        options = cmd[4:]
+        if "--assignee" in options:
+            issue["assignee"] = "Me" if options[options.index("--assignee") + 1] == "@me" else None
+        if "--unassign" in options:
+            issue["assignee"] = None
+        if "--state" in options:
+            issue["state"] = options[options.index("--state") + 1]
+        return ""
+
+    def config(self):
+        return tomllib.loads((self.project_dir / "config.toml").read_text())
+
+    @property
+    def project_dir(self):
+        return self.state_home / "afk" / "eng1"
+
+
+class LinearInitTest(LinearTestCase):
+    def test_init_from_a_parent_issue_url_records_the_linear_tracker_and_the_local_checkout(self):
+        output = self.afk("init", self.SPEC)
+
+        config = self.config()
+        self.assertEqual(config["spec"], self.SPEC)
+        self.assertEqual(config["tracker"], "linear")
+        self.assertEqual(config["repo"], str(self.repo))
+        self.assertEqual(self.run_fake.find("tmux", "set-option"), [["tmux", "set-option", "-t", "work", "@afk_project", "eng1"]])
+        # Named without the spec's identifier, so a worker's branch names only its own ticket to Linear's GitHub integration.
+        self.assertIn("afk project 'eng1' bound to tmux session 'work'", output)
+
+    def test_init_from_a_project_url_names_the_project_by_its_slug_and_takes_its_issues_as_tickets(self):
+        self.run_fake.responses[("tmux", "show-options")] = "widgets-redesign-8f3c2a1b9d0e\n"
+        self.issue("ENG-2", "Widget API")
+
+        output = self.afk("init", self.PROJECT)
+
+        project_dir = self.state_home / "afk" / "widgets-redesign-8f3c2a1b9d0e"
+        self.assertEqual(tomllib.loads((project_dir / "config.toml").read_text())["tracker"], "linear")
+        self.assertIn("afk project 'widgets-redesign-8f3c2a1b9d0e' bound", output)
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-2  Widget API"])
+
+    def test_a_parent_issue_url_is_read_in_any_form_linear_gives_it(self):
+        self.issue("ENG-2", "Widget API")
+        for url in ("https://linear.app/acme/issue/ENG-1", "https://linear.app/acme/issue/eng-1/widgets-spec/",
+                    "https://linear.app/acme/issue/ENG-1?view=sub-issues", "https://linear.app/acme/issue/ENG-1/widgets-spec#comment-4f2a"):
+            with self.subTest(url):
+                output = self.afk("init", url)
+
+                self.assertIn("afk project 'eng1' bound", output)
+                self.assertEqual(self.afk("frontier").splitlines(), ["ENG-2  Widget API"])  # the fake reads only ENG-1's
+
+    def test_a_project_url_is_read_in_any_form_linear_gives_it(self):
+        self.run_fake.responses[("tmux", "show-options")] = "widgets-redesign-8f3c2a1b9d0e\n"
+        self.issue("ENG-2", "Widget API")
+        for url in ("https://linear.app/acme/project/widgets-redesign-8f3c2a1b9d0e",
+                    "https://linear.app/acme/project/widgets-redesign-8f3c2a1b9d0e/issues?layout=board",
+                    "https://linear.app/acme/project/widgets-redesign-8f3c2a1b9d0e#overview"):
+            with self.subTest(url):
+                output = self.afk("init", url)
+
+                self.assertIn("afk project 'widgets-redesign-8f3c2a1b9d0e' bound", output)
+                self.assertEqual(self.afk("frontier").splitlines(), ["ENG-2  Widget API"])  # the fake reads only 8f3c2a1b9d0e's
+
+    def test_reinit_without_a_spec_keeps_the_linear_project(self):
+        self.afk("init", self.SPEC)
+        self.issue("ENG-2", "Widget page", description="Repo: acme/web\n")
+        web = self.clone(self.tmp / "web", "git@github.com:acme/web.git")
+
+        self.afk("init")
+
+        self.assertEqual({k: self.config()[k] for k in ("spec", "tracker", "repos")},
+                         {"spec": self.SPEC, "tracker": "linear", "repos": {"acme/web": str(web)}})
+
+    def test_a_linear_error_is_shown_and_nothing_is_written(self):
+        out = io.StringIO()
+
+        code = afk.main(["init", "https://linear.app/acme/issue/ENG-404"], run=self.run_fake, env=self.env,
+                        stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertTrue(out.getvalue().rstrip().endswith("failed: Entity not found: Issue"), out.getvalue())
+        self.assertEqual(self.run_fake.find("tmux", "set-option"), [])
+
+    def test_init_maps_the_repos_tickets_name_on_their_repo_lines_to_clones(self):
+        web = self.clone(self.tmp / "web", "git@github.com:acme/web.git")
+        self.issue("ENG-2", "Widget page", description="## What to build\n\nThe page.\n\n**Repo:** acme/web\n")
+        self.issue("ENG-3", "Widget endpoints", description="Repo: acme/api\n")
+
+        output = self.afk("init", self.SPEC)
+
+        self.assertEqual(self.config()["repos"], {"acme/web": str(web)})
+        self.assertIn("no local clone of acme/api", output)
+
+
+class LinearFrontierTest(LinearTestCase):
+    def test_frontier_lists_open_unassigned_issues_whose_blockers_have_all_ended_with_their_repos(self):
+        self.issue("ENG-2", "Widget schema", state="completed")
+        self.issue("ENG-3", "Widget API", description="Repo: acme/api\n")
+        self.issue("ENG-4", "Widget UI", assignee="Someone Else")
+        self.issue("ENG-5", "Widget export", state="canceled")
+        self.issue("ENG-6", "Widget search", description="Repo: acme/web\n")
+        self.issue("ENG-7", "Widget audit")
+        self.issue("OPS-8", "Upstream fix", state="started", child=False)
+        self.blocked_by = {"ENG-3": ["ENG-2", "ENG-5"], "ENG-6": ["ENG-3"], "ENG-7": ["OPS-8"]}
+        self.afk("init", self.SPEC)
+
+        output = self.afk("frontier")
+
+        self.assertEqual(output.splitlines(), ["ENG-3  Widget API  (acme/api)"])
+        self.issues["ENG-3"]["state"] = self.issues["OPS-8"]["state"] = "completed"
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-6  Widget search  (acme/web)", "ENG-7  Widget audit"])
+
+
+    def test_a_spec_of_more_issues_than_a_page_holds_is_read_whole(self):
+        for n in range(2, 302):
+            self.issue(f"ENG-{n}", f"Widget part {n}")
+        self.afk("init", self.SPEC)
+
+        output = self.afk("frontier").splitlines()
+
+        self.assertEqual((len(output), output[0], output[-1]), (300, "ENG-2  Widget part 2", "ENG-301  Widget part 301"))
+
+
+class LinearNextTest(LinearTestCase):
+    def test_each_candidate_takes_its_repo_and_clone_from_its_repo_line_and_its_type_from_its_type_line(self):
+        api = self.clone(self.tmp / "api", "git@github.com:acme/api.git")
+        (api / "docs" / "agents").mkdir(parents=True)
+        (api / "docs" / "agents" / "afk.md").write_text('+++\ndefault_type = "service"\n[task_types.service]\nmodel = "haiku"\n+++\n')
+        self.repo_config(TASK_TYPES)
+        self.issue("ENG-2", "Widget endpoints", description="Repo: acme/api\n")
+        self.issue("ENG-3", "Widget UI", description="Type: frontend\n")
+        self.issue("ENG-4", "Widget app", description="Repo: acme/mobile\n")
+        self.afk("init", self.SPEC)
+
+        tickets = {t["id"]: t for t in json.loads(self.afk("next"))["tickets"]}
+
+        pick = lambda t: {k: t[k] for k in ("repo", "clone", "type", "model", "path")}
+        self.assertEqual(pick(tickets["ENG-2"]), {"repo": "acme/api", "clone": str(api), "type": "service", "model": "haiku",
+                                                  "path": "https://linear.app/acme/issue/ENG-2/widget-endpoints"})
+        self.assertEqual(pick(tickets["ENG-3"]), {"repo": None, "clone": str(self.repo), "type": "frontend", "model": "sonnet",
+                                                  "path": "https://linear.app/acme/issue/ENG-3/widget-ui"})
+        self.assertEqual(pick(tickets["ENG-4"]), {"repo": "acme/mobile", "clone": None, "type": None, "model": None,
+                                                  "path": "https://linear.app/acme/issue/ENG-4/widget-app"})
+
+
+class LinearSplitTest(LinearTestCase):
+    def test_split_is_refused_leaving_the_ticket_as_it_is(self):
+        self.issue("ENG-2", "Widget export")
+        self.afk("init", self.SPEC)
+
+        out = io.StringIO()
+        code = afk.main(["split", "ENG-2"], run=self.run_fake, env=self.env, stdin=io.StringIO(json.dumps(SPLIT_PARTS)), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("can't split a Linear ticket yet", out.getvalue())
+        self.assertEqual([c for c in self.run_fake.calls if c[0] == "linear" and c[1] != "api"], [])
+
+
+class LinearStartTest(LinearTestCase):
+    CLAIM = ["linear", "issue", "update", "ENG-2", "--assignee", "@me", "--no-input"]
+
+    def setUp(self):
+        super().setUp()
+        self.issue("ENG-2", "Widget API")
+        self.afk("init", self.SPEC)
+
+    def test_start_claims_the_ticket_by_assigning_it_to_me_before_setting_up_the_worker(self):
+        self.afk("start", "ENG-2")
+
+        self.assertEqual(self.run_fake.find("linear", "issue", "update"), [self.CLAIM])
+        [add] = self.run_fake.find("git", "-C", str(self.repo), "worktree", "add")
+        self.assertLess(self.run_fake.calls.index(self.CLAIM), self.run_fake.calls.index(add))
+        self.assertEqual(add[5:7], ["-b", "afk/eng1-ENG-2"])
+        [send] = self.run_fake.find("tmux", "send-keys")
+        self.assertIn("https://linear.app/acme/issue/ENG-2/widget-api", shlex.split(send[4])[-1])
+        self.assertEqual(self.afk("frontier"), "")
+
+    def test_status_and_the_dashboard_line_a_long_identifier_up_with_its_columns(self):
+        self.issue("ENG-12345", "Widget search")
+        self.run_fake.responses[("tmux", "new-window")] = lambda cmd: "%5\n"
+        self.afk("start", "ENG-2")
+        self.afk("start", "ENG-12345")
+
+        for output in (self.afk("status"), self.afk("tick")):
+            header, *rows = [line for line in output.splitlines() if line.startswith(("TICKET", "ENG-"))]
+            with self.subTest(header):
+                self.assertEqual([row.split()[:2] for row in rows], [["ENG-12345", "implement"], ["ENG-2", "implement"]])
+                self.assertEqual({row.index("implement") for row in rows}, {header.index("PHASE")})
+
+    def test_a_ticket_is_named_in_any_case(self):
+        self.afk("start", "eng-2")
+
+        self.assertEqual(self.run_fake.find("linear", "issue", "update"), [self.CLAIM])
+
+    def test_an_assigned_or_ended_ticket_cannot_be_started(self):
+        self.issue("ENG-3", "Widget UI", assignee="Someone Else")
+        self.issue("ENG-4", "Widget export", state="completed")
+
+        for identifier in ("ENG-3", "ENG-4"):
+            out = io.StringIO()
+            code = afk.main(["start", identifier], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+            self.assertNotEqual(code, 0)
+            self.assertIn("not open", out.getvalue())
+        self.assertEqual(self.run_fake.find("linear", "issue", "update"), [])
+
+    def test_an_unknown_ticket_is_named_as_such(self):
+        out = io.StringIO()
+        code = afk.main(["start", "ENG-404"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("no ticket 'ENG-404'", out.getvalue())
+
+    def test_failed_start_releases_the_claim(self):
+        def split_fails(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="no space for new pane")
+
+        self.run_fake.responses[("tmux", "split-window")] = split_fails
+        code = afk.main(["start", "ENG-2"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=io.StringIO())
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.run_fake.find("linear", "issue", "update"),
+                         [self.CLAIM, ["linear", "issue", "update", "ENG-2", "--unassign", "--no-input"]])
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-2  Widget API"])
 
 
 class QueueTestCase(GithubTestCase):
@@ -3619,14 +3928,10 @@ class GitRun(FakeRun):
         return afk.default_run(cmd, input, cwd)
 
 
-class LandTestCase(WorkerTestCase):
-    """Worker 03 of a local-mode project, of task type TYPE, in a real git clone with an origin, landing on INIT's target."""
+class RealGit:
+    """A real git clone with an origin at self.repo, in place of the faked git: landing is git's work."""
 
-    INIT = ("--land", "local", "--target", "widgets-v2")
-    TYPE = None
-
-    def setUp(self):
-        AfkTestCase.setUp(self)
+    def real_git(self):
         identity = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "Ada",
                     "GIT_AUTHOR_EMAIL": "ada@example.com", "GIT_COMMITTER_NAME": "Ada", "GIT_COMMITTER_EMAIL": "ada@example.com"}
         patcher = mock.patch.dict(os.environ, identity)
@@ -3641,12 +3946,6 @@ class LandTestCase(WorkerTestCase):
         self.commit("README.md", "widgets\n", "Initial commit", at=self.now - 3600)
         self.git("remote", "add", "origin", str(self.origin))
         self.git("push", "-q", "origin", "main")
-        self.ticket("03-ui", "Widget UI", type=self.TYPE)
-        self.afk("init", str(self.scratch), *self.INIT)
-        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
-        self.afk("start", "03")
-        self.calls_before = len(self.run_fake.calls)
-        self.worktree = self.project_dir / "worktrees" / "03"
 
     def git(self, *args, cwd=None, at=None):
         env = {**os.environ, **({"GIT_AUTHOR_DATE": f"@{int(at)} +0000", "GIT_COMMITTER_DATE": f"@{int(at)} +0000"} if at else {})}
@@ -3659,6 +3958,23 @@ class LandTestCase(WorkerTestCase):
         self.git("add", name, cwd=cwd)
         self.git("commit", "-q", "-m", message, cwd=cwd, at=at or self.now)
         return self.git("rev-parse", "HEAD", cwd=cwd)
+
+
+class LandTestCase(RealGit, WorkerTestCase):
+    """Worker 03 of a local-mode project, of task type TYPE, in a real git clone with an origin, landing on INIT's target."""
+
+    INIT = ("--land", "local", "--target", "widgets-v2")
+    TYPE = None
+
+    def setUp(self):
+        AfkTestCase.setUp(self)
+        self.real_git()
+        self.ticket("03-ui", "Widget UI", type=self.TYPE)
+        self.afk("init", str(self.scratch), *self.INIT)
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.afk("start", "03")
+        self.calls_before = len(self.run_fake.calls)
+        self.worktree = self.project_dir / "worktrees" / "03"
 
     def work(self, name="widget.py", text="widget = 1\n", message="Add the widget"):
         """The worker commits on its branch, a minute ago."""
@@ -4222,6 +4538,113 @@ class DropPrModeTest(DropTestCase):
         self.work()
 
         self.assertRefused("03 lands by PR: close its PR instead", "03", "--discard")
+
+
+class LinearWorkerTest(LinearTestCase):
+    """Linear ticket ENG-2's worker, landing by PR, as its PR ends; ENG-3 is someone else's, so the project stays open.
+    ENG-2 is a hitl ticket, so its PR is polled from the start."""
+
+    def setUp(self):
+        super().setUp()
+        self.issue("ENG-2", "Widget API", description="Type: hitl\n")
+        self.issue("ENG-3", "Widget UI", assignee="Someone Else")
+        self.afk("init", self.SPEC)
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"  # its idle shell pane
+        self.afk("start", "ENG-2")
+
+    def updates(self):
+        """The issue updates afk made after claiming ENG-2."""
+        return self.run_fake.find("linear", "issue", "update")[1:]
+
+    def test_a_merged_ticket_is_marked_done(self):
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("MERGED")
+
+        self.afk("tick")
+
+        self.assertEqual(self.updates(), [["linear", "issue", "update", "ENG-2", "--state", "completed", "--no-input"]])
+        self.assertEqual(self.run_fake.find("linear", "issue", "comment"), [])
+        self.assertFalse((self.project_dir / "workers" / "ENG-2").exists())
+
+    def test_a_ticket_whose_pr_closed_unmerged_is_unassigned_back_onto_the_frontier(self):
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("CLOSED")
+
+        self.afk("tick")
+
+        self.assertEqual(self.updates(), [["linear", "issue", "update", "ENG-2", "--unassign", "--no-input"]])
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-2  Widget API"])
+
+    def test_the_project_closes_once_its_last_ticket_merges(self):
+        self.issues["ENG-3"]["state"] = "completed"
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("MERGED")
+
+        self.afk("tick")
+
+        self.assertFalse(self.project_dir.exists())
+        [entry] = (self.state_home / "afk" / "closed.log").read_text().splitlines()
+        self.assertEqual(entry.split("\t")[1:], ["eng1", self.SPEC, "2 tickets done"])
+
+
+class LinearCloseTest(LinearTestCase):
+    def test_close_refuses_while_a_ticket_is_open_and_closes_once_every_ticket_has_ended(self):
+        self.issue("ENG-2", "Widget API", state="completed")
+        self.issue("ENG-3", "Widget UI")
+        self.afk("init", self.SPEC)
+        out = io.StringIO()
+
+        code = afk.main(["close"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+
+        self.assertEqual(code, 1)
+        self.assertIn("tickets ENG-3 aren't done", out.getvalue())
+        self.issues["ENG-3"]["state"] = "canceled"
+        self.assertIn("project eng1 finished: 2 tickets done", self.afk("close"))
+        self.assertFalse(self.project_dir.exists())
+
+
+class LinearDropTest(LinearTestCase):
+    def test_a_dropped_workers_ticket_is_unassigned_back_onto_the_frontier(self):
+        self.issue("ENG-2", "Widget API")
+        self.afk("init", self.SPEC, "--land", "local")
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+        self.afk("start", "ENG-2")
+        self.run_fake.responses[("git", "-C", str(self.repo), "rev-list")] = "1\n"
+
+        self.afk("drop", "ENG-2", "--discard")
+
+        self.assertEqual(self.run_fake.find("linear", "issue", "update")[1:],
+                         [["linear", "issue", "update", "ENG-2", "--unassign", "--no-input"]])
+        self.assertEqual(self.afk("frontier").splitlines(), ["ENG-2  Widget API"])
+
+
+class LinearLandTest(RealGit, LinearTestCase):
+    """Linear ticket ENG-2's local-mode worker, in a real git clone, landing on base."""
+
+    def setUp(self):
+        super().setUp()
+        self.issue("ENG-2", "Widget API")
+        self.issue("ENG-3", "Widget UI", assignee="Someone Else")
+        self.afk("init", self.SPEC, "--land", "local")
+        self.real_git()
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "zsh\n"
+        self.afk("start", "ENG-2")
+
+    def test_a_landed_ticket_is_marked_done_with_a_comment_naming_where_it_landed(self):
+        env = {"AFK_PROJECT": "eng1", "AFK_TICKET": "ENG-2"}
+        worktree = self.project_dir / "worktrees" / "ENG-2"
+        self.commit("widget.py", "widget = 1\n", "Add the widget", cwd=worktree, at=self.now - 60)
+        self.afk("hook", "prompt", stdin=json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": "lgtm"}), env=env)
+        self.afk("land", "feat(widgets): add the widget\n\nTicket: ENG-2\n", env=env)
+        sha = self.git("rev-parse", "main")
+
+        self.afk("tick")
+
+        self.assertEqual(self.run_fake.find("linear", "issue", "update")[1:],
+                         [["linear", "issue", "update", "ENG-2", "--state", "completed", "--no-input"]])
+        self.assertEqual(self.run_fake.find("linear", "issue", "comment"),
+                         [["linear", "issue", "comment", "add", "ENG-2", "--body", f"Landed in {sha} on main", "--yes", "--no-input"]])
+        self.assertFalse((self.project_dir / "workers" / "ENG-2").exists())
 
 
 class LimitsTest(unittest.TestCase):

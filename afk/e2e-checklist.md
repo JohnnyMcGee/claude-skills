@@ -1,6 +1,6 @@
 # AFK end-to-end checklist
 
-A manual run of the whole loop with real tmux and real `claude`: init → Gate 1 → phases → Ready → merge → cleanup → next batch. The unit tests (`python3 -m unittest` in this folder) fake tmux, git and GitHub. This checklist is the only check that the pieces work together. Run it after any change to the watcher, the phase prompts or worker launch.
+A manual run of the whole loop with real tmux and real `claude`: init → Gate 1 → phases → Ready → merge → cleanup → next batch. The unit tests (`python3 -m unittest` in this folder) fake tmux, git, GitHub and Linear. This checklist is the only check that the pieces work together. Run it after any change to the watcher, the phase prompts or worker launch.
 
 It uses a throwaway repo with three trivial tickets in a local `.scratch` spec:
 
@@ -10,12 +10,13 @@ It uses a throwaway repo with three trivial tickets in a local `.scratch` spec:
 | 02 — `/version` endpoint | default | 01 | the next batch unblocked by a merge |
 | 03 — change the greeting | `hitl` | — | a guide-mode worker, `cleanup-pending` on a dirty worktree |
 
-Section 11 covers local landing mode. Tick each box as you go. Where the result doesn't match **Expect**, note it in [Defects](#defects) and carry on if you can.
+Section 11 covers local landing mode, and section 12 a project run from Linear. Tick each box as you go. Where the result doesn't match **Expect**, note it in [Defects](#defects) and carry on if you can.
 
 ## Prerequisites
 
 - [ ] `afk` on PATH, pointing at this checkout's `afk.py`: `readlink -f "$(command -v afk)"`
 - [ ] `tmux`, `git`, `gh` (logged in: `gh auth status`), `claude`, Python 3.11+
+- [ ] For section 12 only: `linear`, logged in (`linear auth login`)
 - [ ] The `afk`, `afk-setup` and `open-pr` skills installed from this checkout
 - [ ] No leftover state: `ls ${XDG_STATE_HOME:-~/.local/state}/afk/` has no `afk-e2e` directory
 
@@ -303,9 +304,49 @@ TMUX= tmux new -s afk-e2e-local -c ~/code/afk-e2e
 - [ ] The integration branch holds one commit per ticket: `git log --oneline main..afk-e2e-int` shows three. Open a PR from it to `main` with `gh pr create --base main --head afk-e2e-int`; that is the only PR in the run.
 - [ ] Add `issues/04-extra-endpoint.md` to the spec (copy 03's, renumbered). The all-landed line goes away; run it through to a land and the line returns with another notification, and `git log --oneline main..afk-e2e-int` shows four.
 
-## 12. Tear down
+## 12. Linear project (optional)
 
-- [ ] Stop `afk watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, both tmux sessions, `~/code/afk-e2e`, and the GitHub repo (`gh repo delete afk-e2e`).
+Re-uses the throwaway repo, with the runs above finished and torn down from the afk side (stop their `afk watch`es; keep the repo and its remote). It checks that a project runs from Linear: tickets, claiming, blockers, release and completion all go through the `linear` CLI. It needs `linear` logged in (`linear auth login`) to a workspace with a team you can make throwaway issues in; `TEAM` below is its key. Make a parent issue and three sub-issues, noting each identifier `linear` prints (shown here as `P`, `L1`, `L2` and `L3`):
+
+| Ticket | Blocked by | Exercises |
+| --- | --- | --- |
+| L1 — `/hello` endpoint | — | claim on start, a merge marking it done |
+| L2 — `/bye` endpoint | L1 | a blocks relation, unblocked by L1's merge |
+| L3 — `/noop` endpoint | — | release on a closed PR, then a land with its comment |
+
+```bash
+linear issue create --team TEAM --title "AFK E2E Linear" --description "Throwaway parent for the afk e2e run." --yes
+for name in hello bye noop; do
+  linear issue create --team TEAM --parent P --title "/$name endpoint" --yes \
+    --description "Repo: <you>/afk-e2e
+
+\`GET /$name\` returns 200 with body \`$name\`.
+
+## Acceptance criteria
+
+- [ ] \`GET /$name\` returns 200
+- [ ] A unit test covers it"
+done
+linear issue relation add L1 blocks L2
+cd ~/code/afk-e2e && git checkout main && git pull
+TMUX= tmux new -s afk-e2e-linear -c ~/code/afk-e2e
+```
+
+Split the window as in step 3. Everything below runs in this session.
+
+- [ ] `/afk init <P's URL>` → `afk project '<p>' bound to tmux session 'afk-e2e-linear'`, where `<p>` is P's identifier lower-cased without its hyphen (e.g. `eng42`). `afk view` shows `tracker = "linear"`, and no `no local clone` line: the `Repo:` lines name this repo.
+- [ ] `afk frontier` lists L1 and L3, each with `(<you>/afk-e2e)`, and not L2.
+- [ ] Start `afk watch`. `/afk next` proposes L1 and L3, reading each with `linear issue view`. Approve both. In Linear, both are assigned to you, and `afk frontier` lists neither. Their branches are `afk/<p>-L1` and `afk/<p>-L3`.
+- [ ] Run L1 through to Ready and merge its PR. Within about a minute it is cleaned up and L1 is in its team's completed state in Linear. In Linear the PR is linked to L1 alone, and P is still open. `afk frontier` now lists L2.
+- [ ] Once L3 has a PR, close the PR without merging. Within about a minute L3 is cleaned up, unassigned in Linear, still not completed, and back in `afk frontier`.
+- [ ] `afk split L3` with any parts on stdin refuses, saying to split it in Linear by hand, and changes nothing in Linear.
+- [ ] Stop `afk watch`, run `afk close --force`, then `/afk init <P's URL> --land local` and `afk watch` again. Start L3, take it through to review, approve and land it. Once it is cleaned up, L3 is completed in Linear with the comment `Landed in <sha> on main`.
+- [ ] Start L2 (as `afk start <L2, lower-cased>`: any case names it), take it through to review, approve and land it. Every ticket has ended, so the watcher closes the project and exits, and `closed.log` has a line for `<p>`.
+- [ ] Optional: make a throwaway Linear project holding one new issue with the same `Repo:` line, and `/afk init <the project's URL>` in a fresh session. The project is named by its URL's slug (`<name>-<slug id>`), and `afk frontier` lists the new issue. Close it with `afk close --force`.
+
+## 13. Tear down
+
+- [ ] Stop `afk watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, the tmux sessions, `~/code/afk-e2e`, the GitHub repo (`gh repo delete afk-e2e`), and, if you ran section 12, its Linear issues (`linear issue delete` each of P and L1–L3) and any throwaway Linear project.
 
 ## Defects
 

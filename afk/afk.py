@@ -71,6 +71,12 @@ class Afk:
             tracker, project = "github", f"{issue['repo']}-{issue['number']}"
             repo = Path(self.run(["git", "rev-parse", "--show-toplevel"]).strip())  # run from inside the clone
             tickets = GithubTracker(self.run, spec)
+        elif linear := LINEAR_ISSUE.match(spec) or LINEAR_PROJECT.match(spec):
+            # A parent issue's identifier loses its hyphen, so a worker's branch names no issue to Linear's GitHub
+            # integration but its own ticket, and merging it can't complete the parent.
+            tracker, project = "linear", (linear.groupdict().get("slug") or linear["id"].replace("-", "")).lower()
+            repo = Path(self.run(["git", "rev-parse", "--show-toplevel"]).strip())  # run from inside the clone
+            tickets = LinearTracker(self.run, spec)
         else:
             spec = Path(spec).resolve()
             if spec.is_file():
@@ -955,9 +961,10 @@ class Afk:
     def cmd_status(self):
         owner = self.project()
         rows = owner.statuses()
-        self.out(f"{'TICKET':<8}{'PHASE':<11}{'STATE':<17}MESSAGE")
+        width = ticket_width(rows)
+        self.out(f"{'TICKET':<{width}}{'PHASE':<11}{'STATE':<17}MESSAGE")
         for s in rows:
-            self.out(f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<17}{s.get('message', '')}".rstrip())
+            self.out(f"{s['ticket']:<{width}}{s['phase']:<11}{s['state']:<17}{s.get('message', '')}".rstrip())
         landed = self.landed(owner, rows)
         if landed:
             self.out(landed)
@@ -1131,7 +1138,8 @@ class Afk:
     def project(self, config=None):
         """The current project, as the owner of its workers."""
         project, config = self.current_project(), config or self.config()
-        tracker = GithubTracker(self.run, config["spec"]) if config["tracker"] == "github" else LocalTracker(Path(config["spec"]))
+        remote = {"github": GithubTracker, "linear": LinearTracker}.get(config["tracker"])
+        tracker = remote(self.run, config["spec"]) if remote else LocalTracker(Path(config["spec"]))
         return Owner(name=project, state_dir=self.project_dir(project), session=config["session"], tracker=tracker,
                      repo=Path(config["repo"]), repos=config.get("repos", {}), overrides=config.get("overrides", {}),
                      limits=config.get("limits", {}), env=(f"AFK_PROJECT={project}",))
@@ -1410,6 +1418,23 @@ def same(a, b):
 
 GITHUB_ISSUE = re.compile(r"https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)/?$")
 
+# A Linear issue's URL, by its identifier (ENG-123), perhaps followed by its title's slug, a query and a fragment.
+LINEAR_ISSUE = re.compile(r"https://linear\.app/[^/]+/issue/(?P<id>[A-Za-z][A-Za-z0-9]*-\d+)(?:/[^/?#]*)?/?(?:[?#].*)?$")
+# A Linear project's URL: its name's slug ending in its slug id, perhaps followed by the tab it shows, a query and a
+# fragment.
+LINEAR_PROJECT = re.compile(
+    r"https://linear\.app/[^/]+/project/(?P<slug>(?:[^/?#]*-)?(?P<id>[^/?#-]+))(?:/[^/?#]*)?/?(?:[?#].*)?$")
+
+# The workflow state types of a Linear issue that has ended, done or not.
+LINEAR_ENDED = {"completed", "canceled", "duplicate"}
+
+# What afk reads of a Linear issue: an issue that blocks it is the source of a `blocks` relation pointing at it.
+LINEAR_FIELDS = ("identifier title description url state { type } assignee { displayName } "
+                 "inverseRelations(first: 50) { nodes { type issue { identifier state { type } } } }")
+# Issues per request: Linear refuses a query whose complexity passes 10,000, and each issue as afk reads it costs about
+# 3.3 per relation it may hold, so 50 issues of 50 relations come to about 8,500.
+LINEAR_PAGE = 50
+
 # The owner/name a git remote URL points at, over SSH or HTTPS.
 REMOTE_REPO = re.compile(r"[:/](?P<owner>[\w.-]+)/(?P<name>[\w.-]+?)(?:\.git)?/?$")
 
@@ -1648,6 +1673,10 @@ class GithubTracker:
             self.run(["gh", "issue", "close", number, "--repo", repo, "--reason", "completed",
                       "--comment", f"Landed in {sha} on {target}"])
 
+    def comment(self, ticket, body):
+        repo, number = self.locate(ticket.id)
+        self.run(["gh", "issue", "comment", number, "--repo", repo, "--body", body])
+
     def blockers(self, ticket):
         """Native blocked-by dependencies; failing those, the issues the body's "Blocked by" section names."""
         repo, number = self.locate(ticket.id)
@@ -1691,6 +1720,102 @@ class GithubTracker:
     def frontier(self):
         # Blockers carry their own state, so one outside this spec's sub-issues still counts.
         return [t for t in self.tickets() if t.open and all(b["state"] == "closed" for b in self.blockers(t))]
+
+
+class LinearTracker:
+    """Tickets as the sub-issues of a Linear issue, or the issues of a Linear project, read through the `linear` CLI
+    and its stored credentials. A ticket's id is its issue's identifier, like ENG-123."""
+
+    def __init__(self, run, spec_url):
+        self.run = run
+        issue, project = LINEAR_ISSUE.match(spec_url), LINEAR_PROJECT.match(spec_url)
+        self.parent = issue and issue["id"].upper()
+        self.project = project and project["id"]
+
+    def api(self, document, **variables):
+        """The data of a GraphQL request; variables go as JSON, so an id of digits stays a string."""
+        try:
+            return json.loads(self.run(["linear", "api", document, "--variables-json", json.dumps(variables)]))["data"]
+        except subprocess.CalledProcessError as error:
+            # The CLI prints GraphQL's errors on stdout, so they're moved to where a failure's reason is shown.
+            try:
+                messages = [e["message"] for e in json.loads(error.output)["errors"]]
+            except (TypeError, ValueError, KeyError):
+                raise error
+            error.stderr = "; ".join(filter(None, [(error.stderr or "").strip(), *messages]))
+            raise
+
+    def issues(self):
+        """The spec's issues as Linear gives them, a page at a time."""
+        root, connection, id = ("issue", "children", self.parent) if self.parent else ("project", "issues", self.project)
+        query = (f"query($id: String!, $after: String) {{ {root}(id: $id) {{ {connection}(first: {LINEAR_PAGE}, after: $after) "
+                 f"{{ nodes {{ {LINEAR_FIELDS} }} pageInfo {{ hasNextPage endCursor }} }} }} }}")
+        issues, after = [], None
+        while True:
+            page = self.api(query, id=id, after=after)[root][connection]
+            issues += page["nodes"]
+            if not page["pageInfo"]["hasNextPage"]:
+                return issues
+            after = page["pageInfo"]["endCursor"]
+
+    def tickets(self):
+        return [self.ticket(issue) for issue in self.issues()]
+
+    def repos(self):
+        """The repos the tickets' Repo: lines name."""
+        return list(dict.fromkeys(t.repo for t in self.tickets() if t.repo))
+
+    def ticket(self, issue):
+        if issue["state"]["type"] in LINEAR_ENDED:
+            status = "closed"
+        elif issue["assignee"]:
+            status = "claimed"  # by another orchestrator or a human
+        else:
+            status = "open"
+        description = issue.get("description") or ""
+        repo = re.fullmatch(r"[\w.-]+/[\w.-]+", field(description, "Repo"))
+        return Ticket(
+            id=issue["identifier"], title=issue["title"], status=status,
+            blocked_by=[r["issue"]["identifier"] for r in issue["inverseRelations"]["nodes"] if r["type"] == "blocks"],
+            path=issue["url"], type=field(description, "Type"), repo=repo and repo.group(0),
+            assignees=(issue["assignee"]["displayName"],) if issue["assignee"] else (),
+        )
+
+    def get(self, ticket_id):
+        try:
+            issue = self.api(f"query($id: String!) {{ issue(id: $id) {{ {LINEAR_FIELDS} }} }}", id=ticket_id.upper())
+        except subprocess.CalledProcessError as error:
+            if error.returncode != 3:  # the CLI's exit status for an entity not found
+                raise
+            raise SystemExit(f"afk: no ticket '{ticket_id}'")
+        return self.ticket(issue["issue"])
+
+    def claim(self, ticket):
+        """Assignment is the cross-orchestrator lock, as on GitHub: an assigned ticket drops out of every frontier."""
+        self.run(["linear", "issue", "update", ticket.id, "--assignee", "@me", "--no-input"])
+
+    def release(self, ticket):
+        self.run(["linear", "issue", "update", ticket.id, "--unassign", "--no-input"])
+
+    def complete(self, ticket, landed=None):
+        """Merged, or landed as (sha, target): marked done, whatever Linear's own GitHub integration does on a merge."""
+        self.run(["linear", "issue", "update", ticket.id, "--state", "completed", "--no-input"])
+        if landed:
+            sha, target = landed
+            self.comment(ticket, f"Landed in {sha} on {target}")
+
+    def comment(self, ticket, body):
+        self.run(["linear", "issue", "comment", "add", ticket.id, "--body", body, "--yes", "--no-input"])
+
+    def split(self, ticket, parts):
+        raise SystemExit(f"afk: can't split a Linear ticket yet; split {ticket.id} in Linear by hand, one issue per repo, "
+                         "then run /afk next again")
+
+    def frontier(self):
+        # Each blocker comes with its state, so one outside the spec still counts, at no further request.
+        blocked = lambda issue: any(r["type"] == "blocks" and r["issue"]["state"]["type"] not in LINEAR_ENDED
+                                    for r in issue["inverseRelations"]["nodes"])
+        return [t for issue in self.issues() if (t := self.ticket(issue)).open and not blocked(issue)]
 
 
 def parse_ticket(path):
@@ -1799,10 +1924,16 @@ def worker_settings(base, target=None, denies=()):
 
 
 def dashboard(statuses, now):
-    yield f"{'TICKET':<8}{'PHASE':<11}{'STATE':<17}{'ELAPSED':<9}PR"  # wide enough for cleanup-pending
+    width = ticket_width(statuses)
+    yield f"{'TICKET':<{width}}{'PHASE':<11}{'STATE':<17}{'ELAPSED':<9}PR"  # wide enough for cleanup-pending
     for s in statuses:
         elapsed = duration(now - s.get("phase_started_at", now))
-        yield f"{s['ticket']:<8}{s['phase']:<11}{s['state']:<17}{elapsed:<9}{s.get('pr', '-')}"
+        yield f"{s['ticket']:<{width}}{s['phase']:<11}{s['state']:<17}{elapsed:<9}{s.get('pr', '-')}"
+
+
+def ticket_width(statuses):
+    """The TICKET column's width: 8, or wider for a long ticket id such as a Linear identifier, with a gap after it."""
+    return max([6, *(len(s["ticket"]) for s in statuses)]) + 2
 
 
 def duration(seconds):

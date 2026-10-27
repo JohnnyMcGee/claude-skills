@@ -6,7 +6,7 @@ A small collection of [Claude Code skills](https://code.claude.com/docs/en/skill
 
 ### afk
 
-An orchestrator for AFK agent workers: you choose the work, agents build it in parallel, and you merge. One project per tmux session. Tickets come from a local `.scratch` spec or a GitHub spec issue's sub-issues. `/afk next` proposes a batch of unblocked tickets that won't collide with each other or with running workers (Gate 1), and offers to split any ticket that spans repos. Each ticket you approve gets its own worktree, branch, port slot and tmux window with an interactive `claude` worker. The repo's `docs/agents/afk.md` sets these up, and a deny list keeps the worker from force-pushing, pushing to base or merging.
+An orchestrator for AFK agent workers: you choose the work, agents build it in parallel, and you merge. One project per tmux session. Tickets come from a local `.scratch` spec, a GitHub spec issue's sub-issues, or Linear: a parent issue's sub-issues or a project's issues. `/afk next` proposes a batch of unblocked tickets that won't collide with each other or with running workers (Gate 1), and offers to split any ticket that spans repos. Each ticket you approve gets its own worktree, branch, port slot and tmux window with an interactive `claude` worker. The repo's `docs/agents/afk.md` sets these up, and a deny list keeps the worker from force-pushing, pushing to base or merging.
 
 `afk watch` then drives each worker through implement → verify → prepr → pr → review. It shows a dashboard, colours windows by state, and notifies you when a worker has a question, is blocked, stalls, trips a runaway limit, or has a PR Ready. Merging is up to you. Once a PR merges, the watcher removes the worker's worktree, branch and window, but only if the shell pane is idle and the worktree is clean. It then prompts you for the next batch, and once every ticket is done it closes the project, removing its state, and exits (a project landing on an integration branch stays open until you run `afk close`). A `hitl` ticket gets the same setup, but its worker runs in guide mode and helps you do the work yourself.
 
@@ -116,7 +116,7 @@ Each skill is a folder containing a `SKILL.md` (plus any supporting files) — s
 
 ### Putting `afk` on PATH
 
-The `afk` skill drives a CLI that both you and its worker agents call. `/afk-setup` symlinks it onto your PATH on first use; to do it by hand (Python 3.11+, `tmux`, `git` required; `gh` for GitHub specs):
+The `afk` skill drives a CLI that both you and its worker agents call. `/afk-setup` symlinks it onto your PATH on first use; to do it by hand (Python 3.11+, `tmux`, `git` required; `gh` for GitHub specs, and the `linear` CLI, logged in, for Linear ones):
 
 ```bash
 mkdir -p ~/.local/bin
