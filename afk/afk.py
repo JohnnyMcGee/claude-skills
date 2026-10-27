@@ -1009,16 +1009,22 @@ class Afk:
 
     def cmd_enqueue(self, url=None, *options):
         """Add a standalone ticket to the end of the machine-wide queue, from any session (ADR 0002)."""
-        usage = "afk enqueue <GitHub issue URL>"
-        if not url or not GITHUB_ISSUE.match(url):
+        usage = "afk enqueue <GitHub or Linear issue URL>"
+        if not url or not (GITHUB_ISSUE.match(url) or LINEAR_ISSUE.match(url)):
             raise SystemExit(f"afk: usage: {usage} {OPTIONS_USAGE}")
         corrections = parse_corrections(options, usage)
-        tracker = GithubTracker(self.run, url)
-        ticket = tracker.get(GITHUB_ISSUE.match(url)["number"])
-        issue = GITHUB_ISSUE.match(ticket.path)
-        if issue is None:
-            raise SystemExit(f"afk: {url} is a pull request, not an issue")
-        id = f"{issue['owner']}/{issue['repo']}#{issue['number']}"
+        if GITHUB_ISSUE.match(url):
+            kind, tracker = "github", GithubTracker(self.run, url)
+            ticket = tracker.get(GITHUB_ISSUE.match(url)["number"])
+            issue = GITHUB_ISSUE.match(ticket.path)
+            if issue is None:
+                raise SystemExit(f"afk: {url} is a pull request, not an issue")
+            own = f"{issue['owner']}/{issue['repo']}"
+            id = f"{own}#{issue['number']}"
+        else:
+            kind, tracker = "linear", LinearTracker(self.run, url)
+            ticket = tracker.get(LINEAR_ISSUE.match(url)["id"])
+            id, own = ticket.id, None  # a Linear issue lives in no repo
 
         def already_waiting(state):
             if any(t["id"].lower() == id.lower() for t in state["tickets"] if t["state"] == "running"):
@@ -1041,7 +1047,9 @@ class Afk:
         hitl = f"afk: {id} is a hitl ticket, which is yours to work on; the queue takes only work an agent does alone"
         if (corrections.get("type") or ticket.type) == HITL:
             raise SystemExit(hitl)  # before looking for a clone, which a hitl ticket would never need
-        repo = corrections.pop("repo", None) or ticket.repo or f"{issue['owner']}/{issue['repo']}"
+        repo = corrections.pop("repo", None) or ticket.repo or own
+        if repo is None:
+            raise SystemExit(f"afk: {id} names no repo: give it a `Repo: owner/name` line, or pass --repo <owner/name>")
         clone = self.queue_clone(repo)
         layers = repo_config_layers(clone)
         if not layers:
@@ -1055,7 +1063,7 @@ class Afk:
         with self.queue_state() as state:
             if already_waiting(state):
                 return
-            state["tickets"].append({"id": id, "url": ticket.path, "tracker": "github", "title": ticket.title, "repo": repo,
+            state["tickets"].append({"id": id, "url": ticket.path, "tracker": kind, "title": ticket.title, "repo": repo,
                                      "clone": str(clone), **choices, "state": "waiting", "enqueued_at": self.clock()})
             position = sum(t["state"] == "waiting" for t in state["tickets"])
         self.out(f"enqueued {id} at position {position}")
@@ -1101,9 +1109,9 @@ class Afk:
     def cmd_dequeue(self, ticket=None):
         """Take a waiting ticket, named by its URL or its id, off the queue."""
         if not ticket:
-            raise SystemExit("afk: usage: afk dequeue <ticket URL or owner/name#number>")
-        issue = GITHUB_ISSUE.match(ticket)
-        id = f"{issue['owner']}/{issue['repo']}#{issue['number']}" if issue else ticket
+            raise SystemExit("afk: usage: afk dequeue <ticket URL, owner/name#number or Linear identifier>")
+        issue, linear = GITHUB_ISSUE.match(ticket), LINEAR_ISSUE.match(ticket)
+        id = f"{issue['owner']}/{issue['repo']}#{issue['number']}" if issue else linear["id"] if linear else ticket
         with self.queue_state() as state:
             entry = next((t for t in state["tickets"] if t["state"] == "waiting" and t["id"].lower() == id.lower()), None)
             if entry is None:
@@ -1160,19 +1168,19 @@ class Afk:
                 break
             if now - entry.get("checked_at", float("-inf")) < FRONTIER_POLL:
                 continue
-            worker = entry["id"].rpartition("#")[2]  # its id in its own repo's tracker, which names its worker
+            worker = queue_worker(entry)
             if (owner.workers / worker).exists():
-                continue  # the same number in another repo is running: it waits its turn, keeping its place
-            tracker = GithubTracker(self.run, entry["url"])
+                continue  # the same id running, as a GitHub number in another repo: it waits its turn, keeping its place
+            tracker = queue_tracker(self.run, entry)
             try:
                 try:
                     ticket = tracker.get(worker)
                 except SystemExit:
                     ticket = None  # deleted, or out of reach: nothing a worker could do
                 others = ticket and tracker.others(ticket)
-                blockers = ticket and [tracker.ref(b) for b in tracker.blockers(ticket) if b["state"] != "closed"]
+                blockers = ticket and tracker.open_blockers(ticket)
             except subprocess.CalledProcessError as error:
-                # Say a blocker gone, or GitHub out of reach: it may pass next time, and the queue moves on meanwhile.
+                # Say a blocker gone, or its tracker out of reach: it may pass next time, and the queue moves on meanwhile.
                 self.skip(entry["id"], f"couldn't check it: `{shlex.join(error.cmd)}` failed: {(error.stderr or '').strip()}")
                 continue
             if not ticket or ticket.done or others:
@@ -1184,7 +1192,7 @@ class Afk:
             if blockers:
                 self.skip(entry["id"], f"blocked by {', '.join(blockers)}")
                 continue
-            free -= self.start_queued(owner, entry, ticket)
+            free -= self.start_queued(owner, entry, dataclasses.replace(ticket, id=worker))
 
     def skip(self, id, why):
         """Leave a waiting ticket in its place, saying why, to be tried again a poll later; whether why is news."""
@@ -1210,7 +1218,7 @@ class Afk:
             if pr != "OPEN":  # gone since the poll that ended it, so there's no draft to link
                 ended = "merged" if pr == "MERGED" else "closed"
         if ended == "drafted":
-            ticket = owner.find_ticket(status["ticket"])  # None once it's gone from GitHub, with nothing to comment on
+            ticket = owner.find_ticket(status["ticket"])  # None once it's gone from its tracker, with nothing to comment on
             if ticket:
                 owner.tracker.comment(ticket, f"afk opened a draft PR for this ticket: {url}")
             self.settle(entry["id"], state="drafted", prs=[url])
@@ -1666,7 +1674,7 @@ DONE_STATUSES = {"resolved", "done", "closed"}
 BLOCKER_REF = re.compile(r"(?<![\w/.-])((?:[\w.-]+/[\w.-]+)?)#(\d+)\b")
 
 def same(a, b):
-    """GitHub owner and repo names match in any case."""
+    """GitHub owner and repo names match in any case, as a queue worker's id matches its Linear identifier."""
     return a.lower() == b.lower()
 
 
@@ -1947,6 +1955,10 @@ class GithubTracker:
         refs = (ref.rpartition("#") for ref in ticket.blocked_by)
         return [json.loads(self.run(["gh", "api", f"repos/{repo}/issues/{n}"])) for repo, _, n in refs]
 
+    def open_blockers(self, ticket):
+        """How the ticket's blockers that are still open are referred to."""
+        return [self.ref(b) for b in self.blockers(ticket) if b["state"] != "closed"]
+
     def split(self, ticket, parts):
         """Create the parts as sub-issues of the spec, point the ticket's dependents at them, then close the ticket."""
         blocked_by = "\n".join(f"- {self.ref(b)}" for b in self.blockers(ticket)) or "None — can start immediately"
@@ -2043,30 +2055,49 @@ class LinearTracker:
         )
 
     def get(self, ticket_id):
+        return self.ticket(self.issue(ticket_id))
+
+    def issue(self, ticket_id):
+        """The issue a ticket id names, in any case, as Linear gives it."""
         try:
-            issue = self.api(f"query($id: String!) {{ issue(id: $id) {{ {LINEAR_FIELDS} }} }}", id=ticket_id.upper())
+            return self.api(f"query($id: String!) {{ issue(id: $id) {{ {LINEAR_FIELDS} }} }}", id=ticket_id.upper())["issue"]
         except subprocess.CalledProcessError as error:
             if error.returncode != 3:  # the CLI's exit status for an entity not found
                 raise
             raise SystemExit(f"afk: no ticket '{ticket_id}'")
-        return self.ticket(issue["issue"])
+
+    @staticmethod
+    def blocking(issue):
+        """The identifiers of the issues blocking an issue that haven't ended; each comes with its state, so one outside
+        the spec still counts, with no request of its own."""
+        return [r["issue"]["identifier"] for r in issue["inverseRelations"]["nodes"]
+                if r["type"] == "blocks" and r["issue"]["state"]["type"] not in LINEAR_ENDED]
+
+    def open_blockers(self, ticket):
+        return self.blocking(self.issue(ticket.id))
 
     def claim(self, ticket):
-        """Assignment is the cross-orchestrator lock, as on GitHub: an assigned ticket drops out of every frontier."""
-        self.run(["linear", "issue", "update", ticket.id, "--assignee", "@me", "--no-input"])
+        """Assignment is the cross-orchestrator lock, as on GitHub: an assigned ticket drops out of every frontier.
+        Like every update here, it names the issue as Linear does, whatever the case of the ticket's id."""
+        self.run(["linear", "issue", "update", ticket.id.upper(), "--assignee", "@me", "--no-input"])
+
+    def others(self, ticket):
+        """Whoever besides me the ticket is assigned to, by display name, which Linear keeps unique in a workspace."""
+        me = self.api("query { viewer { displayName } }")["viewer"]["displayName"] if ticket.assignees else None
+        return [name for name in ticket.assignees if name != me]
 
     def release(self, ticket):
-        self.run(["linear", "issue", "update", ticket.id, "--unassign", "--no-input"])
+        self.run(["linear", "issue", "update", ticket.id.upper(), "--unassign", "--no-input"])
 
     def complete(self, ticket, landed=None):
         """Merged, or landed as (sha, target): marked done, whatever Linear's own GitHub integration does on a merge."""
-        self.run(["linear", "issue", "update", ticket.id, "--state", "completed", "--no-input"])
+        self.run(["linear", "issue", "update", ticket.id.upper(), "--state", "completed", "--no-input"])
         if landed:
             sha, target = landed
             self.comment(ticket, f"Landed in {sha} on {target}")
 
     def comment(self, ticket, body):
-        self.run(["linear", "issue", "comment", "add", ticket.id, "--body", body, "--yes", "--no-input"])
+        self.run(["linear", "issue", "comment", "add", ticket.id.upper(), "--body", body, "--yes", "--no-input"])
 
     def split(self, ticket, parts):
         """Create the parts beside the ticket, in its team, under its parent and in its project, then close it."""
@@ -2092,10 +2123,7 @@ class LinearTracker:
         return [part["identifier"] for part in created]
 
     def frontier(self):
-        # Each blocker comes with its state, so one outside the spec still counts, at no further request.
-        blocked = lambda issue: any(r["type"] == "blocks" and r["issue"]["state"]["type"] not in LINEAR_ENDED
-                                    for r in issue["inverseRelations"]["nodes"])
-        return [t for issue in self.issues() if (t := self.ticket(issue)).open and not blocked(issue)]
+        return [t for issue in self.issues() if (t := self.ticket(issue)).open and not self.blocking(issue)]
 
 
 class QueueTracker:
@@ -2106,10 +2134,11 @@ class QueueTracker:
         self.read_queue = read_queue  # read afresh, so a ticket picked up after the tracker was made is found
 
     def tracker(self, ticket_id):
-        entry = next((t for t in self.read_queue()["tickets"] if t["state"] == "running" and t["worker"] == ticket_id), None)
+        """The running ticket's tracker; a ticket's id there may differ in case from its worker's, as a Linear one does."""
+        entry = next((t for t in self.read_queue()["tickets"] if t["state"] == "running" and same(t["worker"], ticket_id)), None)
         if entry is None:
             raise SystemExit(f"afk: no ticket '{ticket_id}' running in the queue")
-        return GithubTracker(self.run, entry["url"])
+        return queue_tracker(self.run, entry)
 
     def get(self, ticket_id):
         return self.tracker(ticket_id).get(ticket_id)
@@ -2121,10 +2150,22 @@ class QueueTracker:
         self.tracker(ticket.id).release(ticket)
 
     def complete(self, ticket, landed=None):
-        self.tracker(ticket.id).complete(ticket, landed)
+        """Nothing: the queue never closes a ticket, nor sets a Linear issue's workflow state, which is left to the
+        engineer and their tracker's own automation. Its tickets never land, so a GitHub one's complete is nothing too."""
 
     def comment(self, ticket, body):
         self.tracker(ticket.id).comment(ticket, body)
+
+
+def queue_tracker(run, entry):
+    """The tracker of a ticket in the queue."""
+    return (LinearTracker if entry["tracker"] == "linear" else GithubTracker)(run, entry["url"])
+
+
+def queue_worker(entry):
+    """The id that names a queued ticket's worker, worktree and branch: its id in its own tracker, a GitHub issue's
+    number, or a Linear issue's identifier lower-cased, as Linear's GitHub integration finds it in afk/queue-eng-123."""
+    return entry["id"].lower() if entry["tracker"] == "linear" else entry["id"].rpartition("#")[2]
 
 
 def parse_ticket(path):

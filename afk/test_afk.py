@@ -819,24 +819,13 @@ class GithubCommentTest(GithubTestCase):
         ])
 
 
-class LinearTestCase(AfkTestCase):
-    """A project whose spec is Linear issue ENG-1 and whose tickets are its sub-issues, all via a faked `linear` CLI.
+class FakeLinear:
+    """The `linear` CLI: it answers afk's GraphQL reads from the issues and blocked-by relations it holds, and
+    applies the issue updates afk makes, so their effect shows in later reads."""
 
-    The fake answers afk's GraphQL reads from the issues and blocked-by relations it holds, and applies the issue
-    updates afk makes, so their effect shows in later reads.
-    """
-
-    SPEC = "https://linear.app/acme/issue/ENG-1/widgets-spec"
-    PROJECT = "https://linear.app/acme/project/widgets-redesign-8f3c2a1b9d0e/overview"
-
-    def setUp(self):
-        super().setUp()
+    def __init__(self):
         self.issues = {}  # identifier -> the issue's fields
         self.blocked_by = {}  # identifier -> the identifiers of the issues that block it
-        self.run_fake.responses[("git", "rev-parse", "--show-toplevel")] = f"{self.repo}\n"
-        self.run_fake.responses[("tmux", "show-options")] = "eng1\n"
-        self.run_fake.responses[("linear", "api")] = self.linear_api
-        self.run_fake.responses[("linear", "issue", "update")] = self.linear_update
 
     def issue(self, identifier, title, state="unstarted", assignee=None, description="", child=True, parent=True):
         """A Linear issue in a state of the given type; a child is in the project, and a sub-issue of ENG-1 unless it
@@ -863,8 +852,10 @@ class LinearTestCase(AfkTestCase):
                           + [{"type": "related", "relatedIssue": {"identifier": "ENG-99"}}]},
         }
 
-    def linear_api(self, cmd):
+    def api(self, cmd):
         document, variables = cmd[2], json.loads(cmd[cmd.index("--variables-json") + 1])
+        if "viewer" in document:
+            return json.dumps({"data": {"viewer": {"displayName": "Me"}}})  # whoever `--assignee @me` assigns
         # As the CLI does for any GraphQL error: the errors on stdout, exit 3 for an entity not found and 1 for the rest.
         fail = lambda code, message: subprocess.CalledProcessError(
             code, cmd, output=json.dumps({"errors": [{"message": message}], "data": None}), stderr="")
@@ -893,7 +884,7 @@ class LinearTestCase(AfkTestCase):
             raise fail(3, "Entity not found: Issue")
         return json.dumps({"data": data})
 
-    def linear_update(self, cmd):
+    def update(self, cmd):
         issue = self.issues[cmd[3]]
         options = cmd[4:]
         if "--assignee" in options:
@@ -903,6 +894,25 @@ class LinearTestCase(AfkTestCase):
         if "--state" in options:
             issue["state"] = options[options.index("--state") + 1]
         return ""
+
+
+class LinearTestCase(AfkTestCase):
+    """A project whose spec is Linear issue ENG-1 and whose tickets are its sub-issues, all via a faked `linear` CLI."""
+
+    SPEC = "https://linear.app/acme/issue/ENG-1/widgets-spec"
+    PROJECT = "https://linear.app/acme/project/widgets-redesign-8f3c2a1b9d0e/overview"
+
+    def setUp(self):
+        super().setUp()
+        self.linear = FakeLinear()
+        self.issues, self.blocked_by = self.linear.issues, self.linear.blocked_by
+        self.run_fake.responses[("git", "rev-parse", "--show-toplevel")] = f"{self.repo}\n"
+        self.run_fake.responses[("tmux", "show-options")] = "eng1\n"
+        self.run_fake.responses[("linear", "api")] = self.linear.api
+        self.run_fake.responses[("linear", "issue", "update")] = self.linear.update
+
+    def issue(self, *args, **kwargs):
+        self.linear.issue(*args, **kwargs)
 
     def config(self):
         return tomllib.loads((self.project_dir / "config.toml").read_text())
@@ -997,7 +1007,7 @@ class LinearFrontierTest(LinearTestCase):
         self.issue("ENG-6", "Widget search", description="Repo: acme/web\n")
         self.issue("ENG-7", "Widget audit")
         self.issue("OPS-8", "Upstream fix", state="started", child=False)
-        self.blocked_by = {"ENG-3": ["ENG-2", "ENG-5"], "ENG-6": ["ENG-3"], "ENG-7": ["OPS-8"]}
+        self.blocked_by.update({"ENG-3": ["ENG-2", "ENG-5"], "ENG-6": ["ENG-3"], "ENG-7": ["OPS-8"]})
         self.afk("init", self.SPEC)
 
         output = self.afk("frontier")
@@ -1044,25 +1054,26 @@ class LinearSplitTest(LinearTestCase):
 
     def setUp(self):
         super().setUp()
+        self.run_fake.responses[("linear", "api")] = self.linear_api
         self.run_fake.responses[("linear", "issue", "relation", "add")] = self.linear_relation_add
         self.issue("ENG-3", "Widget schema", state="completed")
         self.issue("ENG-5", "Widget export", description="## What to build\n\nExport.\n")
         self.issue("ENG-6", "Widget report")
         self.issue("ENG-7", "Widget audit")
-        self.blocked_by = {"ENG-5": ["ENG-3"], "ENG-6": ["ENG-5"], "ENG-7": ["ENG-5"]}
+        self.blocked_by.update({"ENG-5": ["ENG-3"], "ENG-6": ["ENG-5"], "ENG-7": ["ENG-5"]})
         self.afk("init", self.SPEC)
 
     def linear_api(self, cmd):
         document, variables = cmd[2], json.loads(cmd[cmd.index("--variables-json") + 1])
         if "issueCreate" not in document:
-            return super().linear_api(cmd)
+            return self.linear.api(cmd)
         fields = variables["input"]
         identifier = f"ENG-{max(int(i.split('-')[1]) for i in self.issues) + 1}"
         # In ENG's team and the project, it is one of the project's issues; under ENG-1 too, one of ENG-1's sub-issues.
         child = (fields.get("teamId"), fields.get("projectId")) == ("team-ENG", "uuid-8f3c2a1b9d0e")
         self.issue(identifier, fields["title"], description=fields["description"], child=child,
                    parent=fields.get("parentId") == "uuid-ENG-1")
-        return json.dumps({"data": {"issueCreate": {"issue": {"identifier": identifier, "url": self.node(identifier)["url"]}}}})
+        return json.dumps({"data": {"issueCreate": {"issue": {"identifier": identifier, "url": self.linear.node(identifier)["url"]}}}})
 
     def linear_relation_add(self, cmd):
         issue, relation, related = cmd[4:7]
@@ -2099,6 +2110,193 @@ class QueueWorkerRestrictionTest(QueueWorkerTestCase):
 
         self.assertIsNone(self.about_to("Edit", env={"AFK_PROJECT": "widgets", "AFK_TICKET": "03"},
                                         file_path=str(self.repo / "widget.py")))
+
+
+class LinearQueueTestCase(QueueTickTestCase):
+    """The queue with a standalone Linear issue, ENG-123, via a faked `linear` CLI."""
+
+    URL = "https://linear.app/acme/issue/ENG-123/widget-export"
+
+    def setUp(self):
+        super().setUp()
+        self.linear = FakeLinear()
+        self.run_fake.responses[("linear", "api")] = self.linear.api
+        self.run_fake.responses[("linear", "issue", "update")] = self.linear.update
+        self.linear.issue("ENG-123", "Widget export", description="Repo: acme/widgets\n", child=False)
+
+
+class LinearEnqueueTest(LinearQueueTestCase):
+    def test_a_linear_issue_is_enqueued_by_its_identifier_for_the_repo_its_description_names(self):
+        self.assertIn("enqueued ENG-123 at position 1", self.afk("enqueue", self.URL))
+
+        self.assertIn("1. ENG-123  Widget export  (acme/widgets: type feature, agent claude, model sonnet, effort medium)",
+                      self.afk("queue"))
+
+
+class LinearQueueTickTest(LinearQueueTestCase):
+    CLAIM = ["linear", "issue", "update", "ENG-123", "--assignee", "@me", "--no-input"]
+
+    def test_a_tick_claims_a_linear_ticket_on_a_branch_named_by_its_lower_cased_identifier(self):
+        self.afk("enqueue", self.URL)
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.run_fake.find("linear", "issue", "update"), [self.CLAIM])
+        [add] = self.worktree_adds()
+        self.assertEqual(add[5:7], ["-b", "afk/queue-eng-123"])
+        self.assertEqual(add[2], str(self.repo))
+        [send] = self.run_fake.find("tmux", "send-keys")
+        launch = shlex.split(send[4])
+        self.assertIn("AFK_TICKET=eng-123", launch)
+        self.assertIn(self.URL, launch[-1])
+        self.assertTrue(self.afk("queue").startswith("running  ENG-123  Widget export  (implement, working)"))
+
+    def test_a_ticket_ended_while_it_waited_is_removed_with_a_notification(self):
+        self.afk("enqueue", self.URL)
+        self.linear.issues["ENG-123"]["state"] = "canceled"
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.worktree_adds(), [])
+        self.assertEqual(self.run_fake.find("linear", "issue", "update"), [])
+        self.assertIn("ENG-123 removed from the queue: it was closed", self.desktop_notifications()[0])
+
+    def test_a_ticket_assigned_to_someone_else_while_it_waited_is_removed_naming_them(self):
+        self.afk("enqueue", self.URL)
+        self.linear.issues["ENG-123"]["assignee"] = "Alice"
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.worktree_adds(), [])
+        self.assertIn("removed  ENG-123  Widget export  it was assigned to Alice", self.afk("queue"))
+
+    def test_a_blocked_ticket_is_skipped_keeping_its_place_and_started_once_its_blocker_ends(self):
+        self.linear.issue("ENG-100", "Widget schema", child=False)
+        self.linear.blocked_by["ENG-123"] = ["ENG-100"]
+        self.afk("enqueue", self.URL)
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.worktree_adds(), [])
+        self.assertEqual(self.desktop_notifications(), [])
+        self.assertIn("1. ENG-123  Widget export  (acme/widgets: type feature, agent claude, model sonnet, effort medium)"
+                      "  blocked by ENG-100", self.afk("queue"))
+
+        self.linear.issues["ENG-100"]["state"] = "completed"
+        self.now += 60
+        self.afk("queue", "tick")
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-eng-123"])
+
+
+class LinearQueueDraftTest(LinearQueueTestCase):
+    """ENG-123's queue worker through to its draft PR."""
+
+    DRAFT = "https://github.com/acme/widgets/pull/7"
+
+    def setUp(self):
+        super().setUp()
+        self.afk("enqueue", self.URL)
+        self.afk("queue", "tick")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"  # its shell pane is idle
+        for _ in range(4):
+            self.finish_phase()
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("OPEN", url=self.DRAFT)
+        self.now += 60
+
+    def finish_phase(self, message="Done"):
+        env = {"AFK_QUEUE": "1", "AFK_TICKET": "eng-123"}
+        self.afk("report", "done", message, env=env)
+        payload = {"session_id": "s", "transcript_path": str(self.tmp / "eng-123.jsonl"), "hook_event_name": "Stop"}
+        self.afk("hook", "stop", stdin=json.dumps(payload), env=env)
+        return self.afk("queue", "tick")
+
+    def updates(self):
+        """The issue updates afk made after claiming the ticket."""
+        return self.run_fake.find("linear", "issue", "update")[1:]
+
+    def test_the_draft_is_linked_from_the_linear_issue_whose_workflow_state_is_left_to_linear(self):
+        self.finish_phase("Draft open, CI green")
+
+        [comment] = self.run_fake.find("linear", "issue", "comment")
+        self.assertEqual(comment[:5], ["linear", "issue", "comment", "add", "ENG-123"])
+        self.assertIn(self.DRAFT, comment[comment.index("--body") + 1])
+        self.assertEqual(self.updates(), [])
+        self.assertEqual(self.run_fake.find("gh", "pr", "view")[-1][3], "afk/queue-eng-123")
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
+                         [["git", "-C", str(self.repo), "branch", "-D", "afk/queue-eng-123"]])
+        self.assertIn(f"drafted  ENG-123  Widget export  {self.DRAFT}", self.afk("queue"))
+
+    def test_a_pr_the_engineer_merges_mid_draft_leaves_the_issues_workflow_state_to_linear(self):
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("MERGED", url=self.DRAFT)
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.updates(), [])
+        self.assertIn("ended  ENG-123  Widget export  its PR was merged", self.afk("queue"))
+
+    def test_an_issue_the_engineer_ends_mid_draft_ends_the_ticket_without_a_comment_or_update(self):
+        self.linear.issues["ENG-123"]["state"] = "canceled"
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.run_fake.find("linear", "issue", "comment"), [])
+        self.assertEqual(self.updates(), [])
+        self.assertIn("ended  ENG-123  Widget export  its ticket was closed", self.afk("queue"))
+
+    def test_a_pr_the_engineer_closes_mid_draft_unassigns_the_issue_and_sets_no_workflow_state(self):
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("CLOSED", url=self.DRAFT)
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.updates(), [["linear", "issue", "update", "ENG-123", "--unassign", "--no-input"]])
+
+
+class LinearDequeueTest(LinearQueueTestCase):
+    def test_a_linear_ticket_is_named_by_its_url_or_its_identifier_in_any_casing(self):
+        self.linear.issue("ENG-124", "Widget import", description="Repo: acme/widgets\n", child=False)
+        self.afk("enqueue", self.URL)
+        self.afk("enqueue", "https://linear.app/acme/issue/ENG-124")
+
+        self.assertIn("removed ENG-123 from the queue", self.afk("dequeue", "https://linear.app/acme/issue/eng-123/widget-export"))
+        self.assertIn("removed ENG-124 from the queue", self.afk("dequeue", "eng-124"))
+        self.assertIn("the queue is empty", self.afk("queue"))
+
+
+class LinearEnqueueRefusalTest(LinearQueueTestCase):
+    def refused(self, *argv):
+        output = self.queue_fails("enqueue", self.URL, *argv)
+        self.assertIn("the queue is empty", self.afk("queue"))
+        return output
+
+    def test_a_ticket_naming_no_repo_is_refused_unless_one_is_passed(self):
+        self.linear.issue("ENG-123", "Widget export", child=False)
+
+        self.assertIn("ENG-123 names no repo: give it a `Repo: owner/name` line, or pass --repo", self.refused())
+        self.assertIn("enqueued ENG-123", self.afk("enqueue", self.URL, "--repo", "acme/widgets"))
+
+    def test_an_ended_ticket_is_refused(self):
+        for state in ("completed", "canceled"):
+            self.linear.issue("ENG-123", "Widget export", state=state, description="Repo: acme/widgets\n", child=False)
+
+            self.assertIn("ENG-123 is closed", self.refused())
+
+    def test_a_ticket_assigned_to_someone_else_is_refused_naming_them(self):
+        self.linear.issue("ENG-123", "Widget export", assignee="Alice", description="Repo: acme/widgets\n", child=False)
+
+        self.assertIn("ENG-123 is assigned to Alice", self.refused())
+
+    def test_a_ticket_assigned_to_me_is_accepted(self):
+        self.linear.issue("ENG-123", "Widget export", assignee="Me", description="Repo: acme/widgets\n", child=False)
+
+        self.assertIn("enqueued ENG-123", self.afk("enqueue", self.URL))
+
+    def test_a_hitl_ticket_is_refused(self):
+        self.linear.issue("ENG-123", "Widget export", description="Type: hitl\nRepo: acme/widgets\n", child=False)
+
+        self.assertIn("ENG-123 is a hitl ticket", self.refused())
+
+    def test_an_unknown_issue_is_refused(self):
+        self.assertIn("no ticket 'ENG-404'", self.queue_fails("enqueue", "https://linear.app/acme/issue/ENG-404"))
 
 
 class FrontierTest(AfkTestCase):

@@ -10,7 +10,7 @@ It uses a throwaway repo with three trivial tickets in a local `.scratch` spec:
 | 02 — `/version` endpoint | default | 01 | the next batch unblocked by a merge |
 | 03 — change the greeting | `hitl` | — | a guide-mode worker, `cleanup-pending` on a dirty worktree |
 
-Section 11 covers local landing mode, section 12 the queue, and section 13 a project run from Linear. Tick each box as you go. Where the result doesn't match **Expect**, note it in [Defects](#defects) and carry on if you can.
+Section 11 covers local landing mode, section 12 the queue, and section 13 a project run from Linear and a Linear ticket queued. Tick each box as you go. Where the result doesn't match **Expect**, note it in [Defects](#defects) and carry on if you can.
 
 ## Prerequisites
 
@@ -306,7 +306,7 @@ TMUX= tmux new -s afk-e2e-local -c ~/code/afk-e2e
 
 ## 12. Queue
 
-Re-uses the throwaway repo and its remote, with section 11 finished. The queue takes GitHub issues, so the tickets are issues on the remote. This checks that the queue picks tickets up unattended, works one through to a draft PR without ever waiting on you, and moves on. Check first that your own queue is empty (`afk queue`), as the queue is machine-wide.
+Re-uses the throwaway repo and its remote, with section 11 finished. Its tickets are GitHub issues on the remote; section 13 queues a Linear one. This checks that the queue picks tickets up unattended, works one through to a draft PR without ever waiting on you, and moves on. Check first that your own queue is empty (`afk queue`), as the queue is machine-wide.
 
 ```bash
 cd ~/code/afk-e2e && git checkout main && git pull
@@ -384,9 +384,25 @@ Split the window as in step 3. Everything below runs in this session.
 - [ ] Start L2 (as `afk start <L2, lower-cased>`: any case names it), take it through to review, approve and land it. Every ticket has ended, so the watcher closes the project and exits, and `closed.log` has a line for `<p>`.
 - [ ] Optional: make a throwaway Linear project holding one new issue with the same `Repo:` line, and `/afk init <the project's URL>` in a fresh session. The project is named by its URL's slug (`<name>-<slug id>`), and `afk frontier` lists the new issue. Close it with `afk close --force`.
 
+**Queueing a Linear ticket**
+
+This checks that a Linear ticket goes through the queue as a GitHub one does, and that Linear's GitHub integration, not afk, moves it through the team's workflow. It needs the integration connected to this repo's GitHub account, and section 12's `afk-queue` session (start it again as there if you stopped it). Make two more issues, noted as `Q1` and `Q2`; Q1 names no repo:
+
+```bash
+linear issue create --team TEAM --title "/echo endpoint" --yes --description "\`GET /echo\` returns 200 with body \`echo\`."
+linear issue create --team TEAM --title "/clock endpoint" --yes --description "Repo: <you>/afk-e2e
+
+\`GET /clock\` returns 200 with body \`tick\`."
+```
+
+- [ ] From any session, in `~/code/afk-e2e`, `/afk enqueue <Q1's URL>` refuses, saying Q1 names no repo. `/afk enqueue <Q1's URL> --repo <you>/afk-e2e` enqueues it as `Q1`, then `/afk enqueue <Q2's URL>` enqueues Q2 behind it.
+- [ ] Within a few seconds Q1 is assigned to you in Linear, and a window `<q1>-echo-endpo` opens in `afk-queue`. In its shell pane `git branch --show-current` is `afk/queue-<q1>`, Q1's identifier lower-cased (e.g. `afk/queue-eng-45`). `afk queue` shows `running  Q1  /echo endpoint  (implement, working)`, then Q2 waiting at `1.`.
+- [ ] `afk dequeue <Q2, lower-cased>` takes Q2 off the queue: any case names it.
+- [ ] Once Q1's worker reports `done` with its draft open: Q1 has a comment in Linear linking the draft, and is still assigned to you. In Linear the draft is linked to Q1 by the GitHub integration, which has moved Q1 through the team's workflow as its settings say; none of Q1's state changes comes from afk, which would show in its history as yours, made through the API rather than attributed to the GitHub integration. `afk queue` lists `drafted  Q1  /echo endpoint  <draft URL>`.
+
 ## 14. Tear down
 
-- [ ] Stop `afk watch` and `afk queue watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, and the queue's outcomes from this run (with `afk queue` empty and no worker running, `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/queue.json`). Remove the tmux sessions, `~/code/afk-e2e`, the GitHub repo (`gh repo delete afk-e2e`), and, if you ran section 13, its Linear issues (`linear issue delete` each of P and L1–L6) and any throwaway Linear project.
+- [ ] Stop `afk watch` and `afk queue watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, and the queue's outcomes from this run (with `afk queue` empty and no worker running, `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/queue.json`). Remove the tmux sessions, `~/code/afk-e2e`, the GitHub repo (`gh repo delete afk-e2e`), and, if you ran section 13, its Linear issues (`linear issue delete` each of P, L1–L6, Q1 and Q2) and any throwaway Linear project.
 
 ## Defects
 
