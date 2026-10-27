@@ -2,7 +2,7 @@
 name: afk
 description: Orchestrate AFK agent workers for one project in this tmux session — find unblocked tickets, start workers in their own worktree and tmux window, and track their status.
 disable-model-invocation: true
-argument-hint: <init [<spec>] [--land <pr|local>] [--target <branch>] | frontier | start <ticket> [--type <type>] | drop <ticket> [--discard] | watch | status | view | next>
+argument-hint: <init [<spec>] [--land <pr|local>] [--target <branch>] | frontier | start <ticket> [--type <type>] | drop <ticket> [--discard] | watch | status | view | close [--force] | next>
 ---
 
 # AFK
@@ -23,11 +23,12 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 - **`afk drop <ticket> --discard`** — abandon a local-mode worker's unlanded work, releasing its ticket back onto the frontier: see [Dropping](#dropping).
 - **`afk status`** — every worker's ticket, phase, state and last message, then the same "all tickets landed" line the watcher shows, while it holds.
 - **`afk view`** — the current project's config (`config.toml`): its spec, tracker, repo, session, `[landing]`, `[repos]`, `[limits]` and `[overrides]`.
+- **`afk close [--force]`** — close the project: prune its clones' worktrees, unbind the tmux session, append a line to `${XDG_STATE_HOME:-~/.local/state}/afk/closed.log`, notify, and remove the project's state. It refuses while any worker or worktree is left, and while a ticket isn't done unless `--force` abandons the open ones. The watcher runs it on its own once every ticket is done, except in a project landing on an integration branch, which stays open until you run it.
 
 ## Handling the argument
 
 - `next`: follow [`/afk next`](#afk-next) below.
-- `init [<spec>] …`, `frontier`, `start <ticket> …`, `status`, `view`: run `afk $ARGUMENTS` and show the output.
+- `init [<spec>] …`, `frontier`, `start <ticket> …`, `status`, `view`, `close [--force]`: run `afk $ARGUMENTS` and show the output.
 - `drop <ticket> [--discard]`: run `afk $ARGUMENTS` and show the output. Never add `--discard` yourself: it deletes the worker's work, so only the user types it.
 - `watch`: it runs forever, so don't run it yourself. Tell the user to run `afk watch` in the orchestrator window's right pane.
 - No argument: run `afk status`, then `afk frontier`, and ask which ticket to start.
@@ -94,6 +95,8 @@ A ticket of the built-in `hitl` type is the user's to work on. `afk start` sets 
 ## Merge and cleanup
 
 The watcher looks up each `pr`, `review` and `hitl` worker's PR by its branch (`afk/<project>-<ticket>`) with `gh pr view` about once a minute, so a PR is found whoever opened it and whether or not its URL was reported. A local-mode worker opens none, so it is never looked up, unless it's a hitl worker. A worker stopped in `pr` without reporting `done` moves on to `review` only once its open PR carries the `Ready for Review` label, which `/open-pr` adds when the automated gates are clear. An open PR alone isn't enough, because `/open-pr` stops between turns while it waits on checks and reviewers. If you opened or finished a stuck worker's PR yourself, add the label to hand it over. A `review` worker whose branch has no PR needs attention until one is found. It never merges a PR or requests reviewers: merging is the user's call. At the same cadence it reads the worker's ticket from the tracker. The worker's work has ended once it has landed, its PR is merged, its PR is closed unmerged, or its ticket is closed. Then the watcher removes the worker's window, worktree and local branch, which frees its slot, and notifies the user to run `/afk next` for the next batch. A merged ticket is marked done. A landed ticket is completed: a local ticket is marked done, and a GitHub issue is closed as completed with the comment `Landed in <sha> on <target>` (on an integration branch too: closed means done on the target, not on base). A ticket whose PR was closed unmerged is released back onto the frontier (on GitHub, unassigned). A closed ticket is left as it is, as is any PR still open on its branch. It does this only when the worker's shell pane is idle at a shell prompt (or gone, as when its window was closed), the worktree has no uncommitted changes and, unless the PR merged or the branch landed, the branch has no commits that were never pushed (a landed branch's work is in the target; a local-mode branch is never pushed, so for it these are the commits on neither a remote nor its target). Otherwise the worker becomes `cleanup-pending` and the user is notified once. A local-mode worker whose ticket was closed stays `cleanup-pending` on its unpushed commits until the user drops them with `afk drop <ticket> --discard`, which its message says. The watcher checks again every tick and cleans up as soon as it's safe. Tell the user what is holding cleanup up. Don't clean up by hand.
+
+Once no worker is left and every ticket is done, the watcher closes the project as `afk close` does, prints and notifies a summary, and exits. A blocked or claimed ticket isn't done, so an empty frontier alone doesn't close it. Nor does it close a `local`-mode project landing on an integration branch: it shows the "all tickets landed" line instead, and the user runs `afk close` once they've taken the branch to base. A worktree left behind holds the project open: the user is notified once, and runs `afk close` after removing it. The tmux session and its windows are left alone.
 
 ## Worker protocol
 

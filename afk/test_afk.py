@@ -1788,6 +1788,7 @@ class WorkerTestCase(AfkTestCase):
     def setUp(self):
         super().setUp()
         self.ticket("03-ui", "Widget UI")
+        self.ticket("09-docs", "Widget docs", status="claimed")  # someone else's, so the project never finishes
         self.afk("init", str(self.scratch), *self.INIT)
         self.run_fake.responses[("tmux", "split-window")] = "%6\n"  # the worker's shell pane
         self.afk("start", "03")
@@ -2455,6 +2456,74 @@ class WatchTest(WorkerTestCase):
 
         launch = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])
         self.assertIn("AFK_SLOT=1", launch)
+
+    def finish_others(self):
+        self.ticket("09-docs", "Widget docs", status="done")
+
+    def test_once_the_last_ticket_merges_the_watcher_closes_the_project_and_stops(self):
+        self.finish_others()
+        self.reach_review()
+        self.merge()
+        self.now += afk.FRONTIER_POLL
+        out = io.StringIO()
+
+        with mock.patch.object(afk.time, "sleep", side_effect=KeyboardInterrupt):
+            code = afk.main(["watch"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                            clock=lambda: self.now)
+
+        self.assertEqual(code, 0)  # it returned without sleeping: the loop broke on its own
+        self.assertFalse(self.project_dir.exists())
+        self.assertIn("project widgets finished: 2 tickets done", out.getvalue())
+        self.assertIn("afk: widgets project widgets finished: 2 tickets done", self.desktop_notifications())
+        self.assertIn(["tmux", "set-option", "-u", "-t", "work", "@afk_project"], self.run_fake.calls)
+
+    def test_the_watcher_leaves_a_project_open_while_a_ticket_is_still_blocked(self):
+        self.finish_others()
+        self.ticket("05-export", "Widget export", blocked_by="07")
+        self.ticket("07-import", "Widget import", status="claimed")  # someone else's, still in progress
+        self.reach_review()
+        self.merge()
+        self.afk("tick")
+        self.now += afk.FRONTIER_POLL
+
+        self.afk("tick")
+
+        self.assertTrue((self.project_dir / "config.toml").exists())
+
+    def test_the_watcher_exits_cleanly_once_another_process_closes_the_project(self):
+        sleeps = []
+
+        def closed_elsewhere(seconds):
+            if sleeps:
+                raise KeyboardInterrupt  # it ticked on: stop it, so the test fails rather than hangs
+            sleeps.append(seconds)
+            shutil.rmtree(self.project_dir)
+            self.run_fake.responses[("tmux", "show-options")] = "\n"  # `afk close` unbound the session
+
+        out = io.StringIO()
+        with mock.patch.object(afk.time, "sleep", side_effect=closed_elsewhere):
+            code = afk.main(["watch"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                            clock=lambda: self.now)
+
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("afk: the project was closed", out.getvalue())
+        self.assertFalse(self.project_dir.exists())  # the watcher didn't recreate it
+
+    def test_a_finished_project_with_a_worktree_left_behind_notifies_once_and_stays_open(self):
+        self.reach_review()
+        self.merge()
+        self.afk("tick")
+        (self.project_dir / "worktrees" / "03").mkdir()  # as after a cleanup git didn't finish
+        self.finish_others()
+        self.now += afk.FRONTIER_POLL
+
+        self.afk("tick")
+        self.now += afk.FRONTIER_POLL
+        self.afk("tick")
+
+        self.assertTrue((self.project_dir / "config.toml").exists())
+        [notification] = [n for n in self.desktop_notifications() if "finished" in n]
+        self.assertIn("worktrees/03", notification)
 
     def test_merged_pr_with_a_busy_shell_pane_is_left_cleanup_pending_and_notifies_once(self):
         self.reach_review()
@@ -4137,6 +4206,115 @@ class UnblockedTest(AfkTestCase):
         self.assertNotIn("unblocked", output)
 
 
+class CloseTest(AfkTestCase):
+    """`afk close` removes a project's state once nothing in it can lose the user's work."""
+
+    def setUp(self):
+        super().setUp()
+        self.ticket("03-ui", "Widget UI")
+        self.afk("init", str(self.scratch))
+
+    def close(self, *args):
+        out = io.StringIO()
+        code = afk.main(["close", *args], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+        return code, out.getvalue()
+
+    def notifications(self):
+        return [" ".join(c[1:]) for c in self.run_fake.calls if c[0] == "notify-send"]
+
+    def test_closing_a_finished_project_removes_its_state_unbinds_the_session_and_logs_it(self):
+        self.ticket("03-ui", "Widget UI", status="done")
+
+        code, out = self.close()
+
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.project_dir.exists())
+        self.assertIn(["git", "-C", str(self.repo), "worktree", "prune"], self.run_fake.calls)
+        self.assertIn(["tmux", "set-option", "-u", "-t", "work", "@afk_project"], self.run_fake.calls)
+        self.assertEqual(self.notifications(), ["afk: widgets project widgets finished: 1 ticket done"])
+        [entry] = (self.state_home / "afk" / "closed.log").read_text().splitlines()
+        self.assertIn("widgets", entry)
+        self.assertIn(str(self.scratch), entry)
+        self.assertIn("1 ticket done", entry)
+
+    def test_a_close_that_fails_keeps_the_session_bound_so_it_can_be_retried(self):
+        self.ticket("03-ui", "Widget UI", status="done")
+        (self.state_home / "afk" / "closed.log").mkdir()  # so the log can't be appended to
+
+        with self.assertRaises(OSError):
+            self.close()
+
+        self.assertEqual(self.run_fake.find("tmux", "set-option", "-u"), [])
+        self.assertTrue((self.project_dir / "config.toml").exists())
+
+    def test_close_refuses_a_project_with_open_tickets(self):
+        code, out = self.close()
+
+        self.assertEqual(code, 1)
+        self.assertIn("03", out)
+        self.assertIn("--force", out)
+        self.assertTrue(self.project_dir.exists())
+
+    def test_force_closes_a_project_with_open_tickets(self):
+        self.ticket("05-export", "Widget export", status="done")
+
+        code, out = self.close("--force")
+
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.project_dir.exists())
+        self.assertEqual(self.notifications(), ["afk: widgets project widgets closed: 1 ticket done, 1 open"])
+
+    def test_close_refuses_while_a_worker_remains_even_when_forced(self):
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        self.afk("start", "03")
+
+        code, out = self.close("--force")
+
+        self.assertEqual(code, 1)
+        self.assertIn("03", out)
+        self.assertTrue((self.project_dir / "workers" / "03").exists())
+
+    def test_a_start_racing_a_close_cannot_start_a_worker_the_close_then_removes(self):
+        self.ticket("05-export", "Widget export")
+        self.run_fake.responses[("tmux", "split-window")] = "%6\n"
+        codes = []
+
+        def start_05():
+            out = io.StringIO()
+            codes.append(afk.main(["start", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out))
+
+        other = threading.Thread(target=start_05)
+
+        def start_arrives_mid_close(cmd):
+            if cmd[3:5] == ["worktree", "prune"] and not other.is_alive() and not codes:
+                other.start()
+                other.join(timeout=0.2)  # without a lock it starts its worker now, after the close's checks
+            return git(cmd)
+
+        self.run_fake.responses[("git", "-C")] = start_arrives_mid_close
+        code, out = self.close("--force")
+        other.join()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(codes, [1])
+        self.assertFalse((self.project_dir / "config.toml").exists())
+
+    def test_close_refuses_while_a_worktree_is_left_behind(self):
+        self.ticket("03-ui", "Widget UI", status="done")
+        (self.project_dir / "worktrees" / "03").mkdir(parents=True)
+
+        code, out = self.close()
+
+        self.assertEqual(code, 1)
+        self.assertIn(str(self.project_dir / "worktrees" / "03"), out)
+        self.assertTrue(self.project_dir.exists())
+
+    def test_close_rejects_unknown_options(self):
+        code, out = self.close("--now")
+
+        self.assertEqual(code, 1)
+        self.assertIn("usage: afk close [--force]", out)
 class ProjectLandedTest(AfkTestCase):
     """A local-mode project landing on an integration branch tells the human once all its tickets have landed there."""
 
@@ -4163,6 +4341,7 @@ class ProjectLandedTest(AfkTestCase):
         self.now += 120
         _, later = self.tick()
         self.assertEqual(later, [])
+        self.assertTrue((self.project_dir / "config.toml").exists())  # kept open until the human closes it
 
     def test_a_ticket_added_later_reopens_the_project_until_it_too_lands(self):
         self.afk("init", str(self.scratch), "--land", "local", "--target", "widgets-v2")
@@ -4179,7 +4358,7 @@ class ProjectLandedTest(AfkTestCase):
         self.assertNotIn(self.LANDED, output.splitlines())
         self.assertEqual(landed, [f"afk: widgets {self.LANDED}"])
 
-    def test_no_notice_in_pr_mode_or_when_the_target_is_base(self):
+    def test_no_notice_in_pr_mode_or_when_the_target_is_base_where_the_finished_project_closes(self):
         for init in [(), ("--land", "local"), ("--land", "local", "--target", "main")]:
             with self.subTest(init=init):
                 shutil.rmtree(self.project_dir, ignore_errors=True)
@@ -4188,7 +4367,8 @@ class ProjectLandedTest(AfkTestCase):
                 output, notifications = self.tick()
 
                 self.assertNotIn("all tickets landed", output)
-                self.assertEqual(notifications, [])
+                self.assertEqual(notifications, ["afk: widgets project widgets finished: 2 tickets done"])
+                self.assertFalse(self.project_dir.exists())
 
     def test_no_notice_while_a_worker_is_left(self):
         self.ticket("07-import", "Widget import")

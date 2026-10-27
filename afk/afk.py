@@ -37,6 +37,7 @@ class Afk:
         self.stdin = stdin
         self.stdout = stdout
         self.clock = clock
+        self.closed = False  # set once the project is closed, which ends `afk watch`
 
     def out(self, line):
         print(line, file=self.stdout)
@@ -362,6 +363,8 @@ class Afk:
         workers = worker_dir.parent
         workers.mkdir(parents=True, exist_ok=True)
         with locked(workers):
+            if not (workers.parent / "config.toml").exists():
+                raise SystemExit("afk: the project was closed; run `afk init <spec>` to start it again")
             if worker_dir.exists():
                 raise SystemExit(f"afk: ticket {worker_dir.name} is already started; see `afk status`")
             max_workers = self.max_workers()
@@ -559,8 +562,13 @@ class Afk:
 
     def cmd_watch(self, interval="2"):
         """Loop around tick for the orchestrator window's right pane. Needs no LLM, so waiting is free."""
+        ticked = False
         try:
             while True:
+                if ticked and not self.project_open():
+                    self.out("afk: the project was closed")  # by `afk close`, in another process
+                    return 0
+                ticked = True
                 self.stdout.write("\033[H\033[2J")  # redraw the dashboard in place
                 try:
                     self.cmd_tick()
@@ -571,9 +579,17 @@ class Afk:
                     # Whatever broke, the watcher is all that drives the workers, so it reports and keeps going.
                     self.out(f"afk: tick failed: {type(error).__name__}: {error}")
                 self.stdout.flush()
+                if self.closed:
+                    return 0
                 time.sleep(float(interval))
         except KeyboardInterrupt:
             return 0
+
+    def project_open(self):
+        try:
+            return (self.project_dir(self.current_project()) / "config.toml").exists()
+        except SystemExit:
+            return False  # closing unbound the session
 
     def cmd_tick(self):
         # One tick at a time, so an overlapping tick (say `afk tick` beside `afk watch`) can't act on a stale snapshot.
@@ -626,9 +642,11 @@ class Afk:
                 shown.append(status)
         for line in dashboard(shown, now):
             self.out(line)
-        self.surface_unblocked(shown, now)
+        polled = self.surface_unblocked(shown, now)
         if failures:
             raise failures[0]
+        if polled and not self.worker_dirs():
+            self.close_if_finished()
 
     def surface_unblocked(self, statuses, now):
         """The Gate 1 judgment point: unblocked tickets and a free worker slot. The user decides with /afk next. And
@@ -664,6 +682,89 @@ class Afk:
                 seen["notified"] = candidates
         if seen != before:
             write_json(path, seen)
+        return seen["polled_at"] == now
+
+    def close_if_finished(self):
+        """Close the project once every ticket is done, so the watcher stops. Called only when no worker is left,
+        each having passed cleanup_blocker, and at the tracker's poll cadence.
+
+        A blocked or claimed ticket isn't done, so an empty frontier alone never closes a project. Nor does one
+        landed on an integration branch: the human takes it to base, and a ticket added meanwhile reopens it, so
+        they close it by hand. Anything left behind holds the project open, and the user is notified once per reason.
+        """
+        path = self.project_dir(self.current_project()) / "frontier.json"
+        seen = read_json(path)
+        if seen.get("landed"):
+            return
+        tickets = self.tracker().tickets()
+        if not tickets or not all(t.done for t in tickets):
+            return
+        reason = self.close_blocker()
+        if reason is None:
+            self.close_project(tickets)
+            return
+        message = f"project finished but not closed: {reason}; fix it, then run `afk close`"
+        self.out(message)
+        if seen.get("close_blocked") != reason:
+            self.notify(message)
+            write_json(path, {**seen, "close_blocked": reason})
+
+    def cmd_close(self, *options):
+        """Close the project by hand: once it's finished, or with --force to abandon its open tickets."""
+        if options not in ((), ("--force",)):
+            raise SystemExit("afk: usage: afk close [--force]")
+        self.workers_dir().mkdir(parents=True, exist_ok=True)
+        # The lock claim_worker takes, so no worker can start between the checks and the state's removal.
+        with locked(self.workers_dir()):
+            self.close_unless_blocked(options)
+
+    def close_unless_blocked(self, options):
+        workers = self.worker_dirs()
+        if workers:
+            raise SystemExit(f"afk: workers {', '.join(workers)} remain; close or merge their PRs and let `afk watch` "
+                             "clean them up first")
+        tickets = self.tracker().tickets()
+        unfinished = [t.id for t in tickets if not t.done]
+        if unfinished and not options:
+            raise SystemExit(f"afk: tickets {', '.join(unfinished)} aren't done; pass --force to close the project anyway")
+        reason = self.close_blocker()
+        if reason:
+            raise SystemExit(f"afk: {reason}")
+        self.close_project(tickets)
+
+    def worker_dirs(self):
+        """The tickets with a worker dir left: removing it is a worker cleanup's commit point."""
+        workers = self.workers_dir()
+        return sorted(p.name for p in workers.iterdir() if p.is_dir()) if workers.exists() else []
+
+    def close_blocker(self):
+        """What closing the project would leave behind, or None. A worktree outlives its worker only when git didn't
+        finish removing it, and it may hold work."""
+        worktrees = self.project_dir(self.current_project()) / "worktrees"
+        left = sorted(str(p) for p in worktrees.iterdir()) if worktrees.exists() else []
+        return f"worktrees left in {', '.join(left)}; remove each with `git worktree remove`" if left else None
+
+    def close_project(self, tickets):
+        """Remove the project's state and unbind its session, keeping a line in the state root's closed.log.
+
+        The tmux session and its windows are the user's, so they stay.
+        """
+        project, config = self.current_project(), self.config()
+        done = sum(t.done for t in tickets)
+        open_ = len(tickets) - done
+        counts = f"{done} ticket{'s' * (done != 1)} done" + (f", {open_} open" if open_ else "")
+        message = f"project {project} {'closed' if open_ else 'finished'}: {counts}"
+        for clone in dict.fromkeys([config["repo"], *config.get("repos", {}).values()]):
+            self.best_effort(["git", "-C", clone, "worktree", "prune"])  # forget the removed workers' worktrees
+        self.notify(message)  # before the config it reads is gone
+        stamp = datetime.fromtimestamp(self.clock()).isoformat(timespec="seconds")
+        with open(self.state_root() / "closed.log", "a") as log:
+            log.write(f"{stamp}\t{project}\t{config['spec']}\t{counts}\n")
+        shutil.rmtree(self.project_dir(project))
+        # Last, so a close that fails before here can be retried from the session it was run in.
+        self.best_effort(["tmux", "set-option", "-u", "-t", config["session"], "@afk_project"])
+        self.out(message)
+        self.closed = True
 
     def landed(self, statuses):
         """The human's next step once every ticket of a project landing on an integration branch has landed, else None:
@@ -1709,7 +1810,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|land|drop|status|view|hook|check|trial> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|close|land|drop|status|view|hook|check|trial> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)
