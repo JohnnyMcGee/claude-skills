@@ -341,6 +341,14 @@ echo "$time_url $date_url $now_url"
 - [ ] While /now runs, `afk queue pause`. Enqueue /time again, then close its issue on GitHub. /now carries on to its draft, but nothing new starts. `afk queue resume`: within a few seconds /time is removed from the queue with a notification that it was closed, and `afk queue` lists it as `removed … it was closed`.
 - [ ] While a worker runs, stop the watcher with Ctrl-C in its pane, which closes it, and start another: `tmux new-window -t afk-queue afk queue watch`. It carries on driving that worker.
 
+**Wrap-up and abandonment (optional)**
+
+Write `[queue.limits]` with `ticket_minutes = 2` and `wrap_up_minutes = 1` into `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/config.toml`, then enqueue a fresh issue (any small endpoint).
+
+- [ ] Within about two minutes of its start, the worker is interrupted and pasted `AFK phase: wrap-up`, naming `over 2m on the ticket`; it isn't `stuck` and nothing notifies. If it reports `done` within the minute, it ends as `drafted` with its draft's `## Questions for the engineer` listing what's unfinished.
+- [ ] Enqueue another and, once its wrap-up prompt is pasted, interrupt it with Escape and leave it. A minute later it's abandoned: its window, worktree and local branch are gone, whatever it pushed is still on the remote, its issue has a comment with the reason and is still open and assigned to you, the bell rings with a notification, `afk queue` lists `abandoned  …  it didn't wrap up within 1m …`, and the next waiting ticket starts.
+- [ ] Remove the `[queue.limits]`, then enqueue one more and, while it runs, `/afk dequeue <its id>`: it refuses, naming `--abandon`, and the worker carries on. `afk dequeue <its id> --abandon` stops and cleans it up at once, its issue gets a comment saying so, and `afk queue` lists it as `abandoned`.
+
 ## 13. Linear project (optional)
 
 Re-uses the throwaway repo, with the runs above finished and torn down from the afk side (stop their `afk watch`es; keep the repo and its remote). It checks that a project runs from Linear: tickets, claiming, blockers, release and completion all go through the `linear` CLI. It needs `linear` logged in (`linear auth login`) to a workspace with a team you can make throwaway issues in; `TEAM` below is its key. Make a parent issue and four sub-issues, noting each identifier `linear` prints (shown here as `P` and `L1` to `L4`):

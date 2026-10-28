@@ -647,6 +647,7 @@ class Afk:
             with locked(path.parent):
                 before = read_json(path)
                 given = dict(may_verify=verify.may_start(before), limits=owner.limits, owner_tells=bool(owner.on_end),
+                             wraps_up=owner.wraps_up,
                              phases=owner.phases[before.get("landing", "pr")],  # workers started before landing modes landed by PR
                              last_activity=last_write(before.get("transcript_path")))
                 try:
@@ -820,10 +821,10 @@ class Afk:
 
     def perform(self, owner, kind, *args):
         if kind == "prompt":
-            ticket_id, pane, phase = args
+            ticket_id, pane, phase, *reason = args  # the wrap-up prompt names the limit the worker went over
             status = read_json(owner.workers / ticket_id / "status.json")
             prompt = self.phase_prompt(owner, ticket_id, phase, owner.worker_clone(status), status.get("landing", "pr"),
-                                       status.get("target"))
+                                       status.get("target"), reason=reason[0] if reason else None)
             self.send_prompt(ticket_id, pane, prompt)
         elif kind == "window":
             # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
@@ -917,8 +918,11 @@ class Afk:
         except (OSError, subprocess.CalledProcessError):
             pass
 
-    def phase_prompt(self, owner, ticket_id, phase, clone, landing="pr", target=None):
-        """The phase's prompt for the worker's landing mode: phase-<phase>-<landing>.md where the mode has its own."""
+    def phase_prompt(self, owner, ticket_id, phase, clone, landing="pr", target=None, reason=None):
+        """The phase's prompt for the worker's landing mode: phase-<phase>-<landing>.md where the mode has its own.
+
+        reason is the limit a wrapping-up queue worker went over.
+        """
         ticket = owner.tracker.get(ticket_id)
         repo_config = owner.repo_config(clone)
         base = repo_config.get("base", "main")
@@ -935,6 +939,8 @@ class Afk:
             target=target,
             reviewers=reviewer_list(repo_config.get("reviewers", []), target),
             ci_rounds=owner.limits.get("ci_rounds"),
+            reason=reason,
+            grace=owner.limits.get("wrap_up_minutes"),
         ) + owner.guidance
 
     def first_prompt(self, owner, ticket, phase, task_type, clone, landing="pr", target=None):
@@ -1106,18 +1112,40 @@ class Afk:
         for t in reversed(state.get("outcomes", [])):  # most recent first
             self.out(f"{t['state']}  {t['id']}  {t['title']}  {t.get('reason') or ' '.join(t['prs'])}")
 
-    def cmd_dequeue(self, ticket=None):
-        """Take a waiting ticket, named by its URL or its id, off the queue."""
-        if not ticket:
-            raise SystemExit("afk: usage: afk dequeue <ticket URL, owner/name#number or Linear identifier>")
-        issue, linear = GITHUB_ISSUE.match(ticket), LINEAR_ISSUE.match(ticket)
-        id = f"{issue['owner']}/{issue['repo']}#{issue['number']}" if issue else linear["id"] if linear else ticket
+    def cmd_dequeue(self, *args):
+        """Take a waiting ticket, named by its URL or its id, off the queue; or, with --abandon, abandon the running one."""
+        if not args or args[0].startswith("-") or set(args[1:]) - {"--abandon"}:
+            raise SystemExit("afk: usage: afk dequeue <ticket URL, owner/name#number or Linear identifier> [--abandon]")
+        issue, linear = GITHUB_ISSUE.match(args[0]), LINEAR_ISSUE.match(args[0])
+        id = f"{issue['owner']}/{issue['repo']}#{issue['number']}" if issue else linear["id"] if linear else args[0]
         with self.queue_state() as state:
-            entry = next((t for t in state["tickets"] if t["state"] == "waiting" and t["id"].lower() == id.lower()), None)
+            entry = next((t for t in state["tickets"] if t["id"].lower() == id.lower()), None)
             if entry is None:
-                raise SystemExit(f"afk: {id} is not waiting in the queue; see `afk queue`")
-            state["tickets"].remove(entry)
-        self.out(f"removed {entry['id']} from the queue")
+                raise SystemExit(f"afk: {id} is not in the queue; see `afk queue`")
+            if entry["state"] == "waiting":
+                state["tickets"].remove(entry)
+        if entry["state"] == "waiting":
+            self.out(f"removed {entry['id']} from the queue")
+            return
+        if "--abandon" not in args:
+            raise SystemExit(f"afk: {entry['id']} is running; `afk dequeue {entry['id']} --abandon` stops its worker, "
+                             "keeping only what it has pushed")
+        self.abandon(entry["id"])
+
+    def abandon(self, id):
+        """Abandon the running ticket on the engineer's word, as its grace period running out would."""
+        # Under the tick's locks, as a tick takes them, so the watcher can't act on the worker meanwhile.
+        with locked(self.queue_dir(), "tick.lock"):
+            entry = next((t for t in self.read_queue()["tickets"] if t["id"] == id and t["state"] == "running"), None)
+            owner = self.queue_owner()
+            worker_dir = entry and owner.workers / entry["worker"]
+            if not entry or not (worker_dir / "status.json").exists():
+                raise SystemExit(f"afk: {id} is no longer running; see `afk queue`")
+            with locked(owner.workers), locked(worker_dir):
+                status = {**read_json(worker_dir / "status.json"), "abandoned": "abandoned with `afk dequeue --abandon`"}
+                write_json(worker_dir / "status.json", status)  # what clean_up hands the queue to tell the ticket
+                self.clean_up(owner, entry["worker"], status["pane"], "abandoned")
+        self.out(f"abandoned {id}: its worker is stopped and cleaned up, keeping only what it pushed")
 
     def queue_tick(self):
         """One step of the queue's watcher: tick its workers, then start the oldest waiting tickets it has room for."""
@@ -1217,12 +1245,23 @@ class Afk:
             pr, url, _ = self.pr_state(owner, status)
             if pr != "OPEN":  # gone since the poll that ended it, so there's no draft to link
                 ended = "merged" if pr == "MERGED" else "closed"
+        # The ticket gets a comment saying where its work went; None once it's gone from its tracker, with nothing to comment on.
+        ticket = owner.find_ticket(status["ticket"]) if ended in ("drafted", "abandoned") else None
         if ended == "drafted":
-            ticket = owner.find_ticket(status["ticket"])  # None once it's gone from its tracker, with nothing to comment on
             if ticket:
                 owner.tracker.comment(ticket, f"afk opened a draft PR for this ticket: {url}")
             self.settle(entry["id"], state="drafted", prs=[url])
             message = f"{entry['id']} draft PR opened: {url}"
+        elif ended == "abandoned":
+            reason = status.get("abandoned") or (
+                f"it didn't wrap up within {owner.limits['wrap_up_minutes']}m of going {status['wrap_up']}")
+            if ticket:
+                owner.tracker.comment(ticket, f"afk abandoned this ticket: {reason}. Whatever its worker pushed stays on "
+                                              f"branch `{owner.branch(status['ticket'])}`.")
+            self.settle(entry["id"], state="abandoned", reason=reason)
+            # The queue moved on without it, so the human hears now, unless they abandoned it themselves.
+            self.notify(owner, f"{entry['id']} abandoned: {reason}", bell="abandoned" not in status)
+            return
         else:
             self.settle(entry["id"], state="ended", reason=QUEUE_ENDINGS[ended])
             message = f"{entry['id']} ended: {QUEUE_ENDINGS[ended]}"
@@ -1285,7 +1324,7 @@ class Afk:
                      limits={**QUEUE_LIMITS, **queue.get("limits", {}),
                              "max_workers": min(queue.get("max_workers", 1), len(QUEUE_SLOTS))},
                      slots=QUEUE_SLOTS, phases={"pr": QUEUE_PHASES}, denies=QUEUE_DENIES, env=("AFK_QUEUE=1",), closes=False,
-                     guidance=(SKILL_DIR / "queue-worker.md").read_text(), on_end=self.queue_ended)
+                     guidance=(SKILL_DIR / "queue-worker.md").read_text(), on_end=self.queue_ended, wraps_up=True)
 
     def queue_dir(self):
         return self.state_root() / ".queue"  # dot-named: no project dir can be it
@@ -1424,7 +1463,7 @@ EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 # How a queue worker's ticket ends, other than in a draft: by the engineer's hand, mid-run.
 QUEUE_ENDINGS = {"merged": "its PR was merged", "closed": "its PR was closed", "ticket closed": "its ticket was closed"}
 # The queue's own limits, beside LIMITS; its config.toml [queue.limits] overrides any of them.
-QUEUE_LIMITS = {"ci_rounds": 2}
+QUEUE_LIMITS = {"ci_rounds": 2, "ticket_minutes": 240, "wrap_up_minutes": 15}
 
 RECENT_OUTCOMES = 10  # how many finished tickets `afk queue` shows
 
@@ -1494,7 +1533,7 @@ def ending(status, polled, pr_state, ticket_closed=False):
 
 def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None,
          polled=False, pr_state=None, pr_url=None, pr_ready=False, ticket_closed=False, cleanup_blocker=None, phases=None,
-         owner_tells=False):
+         owner_tells=False, wraps_up=False):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
@@ -1507,6 +1546,7 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
     cleanup_blocker, for a merged or closed PR or a closed ticket, says why cleaning up now could lose the human's work.
     phases are the worker's phases in order, by default its landing mode's.
     owner_tells says the worker's owner tells the human how its work ended, once it's cleaned up.
+    wraps_up says the worker's owner, the queue, has a worker over a limit wrap up rather than wait on the human.
     A status of None out means the worker is cleaned up and gone.
     """
     ended = ending(status, polled, pr_state, ticket_closed)
@@ -1532,16 +1572,20 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
         status, effects = {**status, "state": "yours"}, []
     else:
         limits = {**LIMITS, **(limits or {})}
-        status, effects = advance(ticket, status, now, agent_running, may_verify, limits, pr_state, pr_ready, phases)
+        if abandoned(status, now, limits):
+            # Its grace period is over, so nothing it left unpushed is waited on: the queue moves on.
+            return None, [("cleanup", ticket, status["pane"], "abandoned")]
+        status, effects = advance(ticket, status, now, agent_running, may_verify, limits, pr_state, pr_ready, phases, wraps_up)
         if not effects:
-            status, effects = enforce(ticket, status, now, limits, last_activity)
+            status, effects = enforce(ticket, status, now, limits, last_activity, wraps_up, agent_running)
     if status["state"] != status.get("shown"):
         status = {**status, "shown": status["state"]}
         effects.append(("window", status["pane"], status["window"], status["state"]))
     return status, effects
 
 
-def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=None, pr_ready=False, phases=None):
+def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=None, pr_ready=False, phases=None,
+            wraps_up=False):
     state, phase, message = status["state"], status["phase"], status.get("message", "")
     if phase == "pr" and pr_state == "OPEN" and pr_ready and state in ("working", "blocked", "attention", "stuck") and status.get("idle"):
         # The worker stopped without reporting done, but its PR carries the label /open-pr adds once the gates are
@@ -1586,6 +1630,9 @@ def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=Non
             if rounds >= limits["critique_rounds"]:
                 # As with fix loops, it has already stopped, and counting restarts for after the human has looked.
                 reason = f"still fixing after {limits['critique_rounds']} critique rounds"
+                if wraps_up:  # its reason follows "went", in the prompt and on the ticket
+                    return wrap_up(ticket, status, now, f"over {limits['critique_rounds']} critique rounds", interrupt=False,
+                                   prompt=agent_running)
                 return {**status, "state": "stuck", "message": reason, "critique_rounds": 0}, [("notify", f"{ticket} stuck: {reason}")]
             status = {**status, "state": "working", "message": "", "idle": False, "phase_started_at": now, "critique_rounds": rounds}
             return status, [("prompt", ticket, status["pane"], "critique")]
@@ -1613,17 +1660,24 @@ def enter_review(ticket, status, now, effects):
     return status, effects + [("notify", f"{ticket} {ready} ready for review" + (f": {pr}" if pr else ""))]
 
 
-def enforce(ticket, status, now, limits, last_activity):
+def enforce(ticket, status, now, limits, last_activity, wraps_up=False, agent_running=True):
     """Trip a runaway limit: interrupt the worker, mark it stuck and notify. Never kill it. A worker that stopped
     without reporting and stayed quiet is instead marked attention, with nothing to interrupt.
 
     last_activity is when the worker's session last wrote anything; a phase prompt counts as activity.
+    wraps_up says the worker is told to wrap up instead, as a queue worker is, if its agent is running to be told.
     """
     # A worker that reported done but hasn't stopped is still running. Review has no phase clock: it waits on the human.
     running = status["state"] == "working" or (status["state"] == "done" and not status.get("idle"))
     # A limit trips once per phase: after the human has looked, a recovered worker isn't interrupted again.
     tripped = status.get("tripped") == status["phase_started_at"]
-    if not running or tripped or status["phase"] == "review":
+    # A queue ticket's own clock runs in every phase and state, bar done, which ends it once its draft is found.
+    finished = status["state"] == "done" and status.get("idle")
+    if wraps_up and "wrap_up" not in status and not finished and now - status["started_at"] > limits["ticket_minutes"] * 60:
+        return wrap_up(ticket, status, now, f"over {limits['ticket_minutes']}m on the ticket",
+                       interrupt=running and not status.get("idle"), prompt=agent_running)
+    # A queue worker is told to wrap up once: after that, only its grace period holds it.
+    if not running or tripped or status["phase"] == "review" or "wrap_up" in status:
         return status, []
     quiet = now - max(last_activity or 0, status["phase_started_at"]) > limits["idle_minutes"] * 60
     if status["state"] == "working" and status.get("idle"):
@@ -1632,6 +1686,9 @@ def enforce(ticket, status, now, limits, last_activity):
         # interrupt.
         if not quiet:
             return status, []
+        if wraps_up:
+            return wrap_up(ticket, status, now, f"idle for over {limits['idle_minutes']}m", interrupt=False,
+                           prompt=agent_running)
         reports = status.get("reports", 0) + 1
         status = {**status, "state": "attention", "message": NO_REPORT, "reports": reports, "notified": reports}
         return status, [("notify", f"{ticket} needs attention: {NO_REPORT}")]
@@ -1641,8 +1698,28 @@ def enforce(ticket, status, now, limits, last_activity):
         reason = f"idle for over {limits['idle_minutes']}m"
     else:
         return status, []
+    if wraps_up:
+        return wrap_up(ticket, status, now, reason, interrupt=True, prompt=agent_running)
     status = {**status, "state": "stuck", "message": reason, "tripped": status["phase_started_at"]}
     return status, [("interrupt", status["pane"]), ("notify", f"{ticket} stuck: {reason}")]
+
+
+def abandoned(status, now, limits):
+    """Whether a queue worker is abandoned: told to wrap up, it let its grace period pass without reporting done and
+    stopping; or it was abandoned already, on the engineer's word, by a cleanup cut short that this one finishes."""
+    finished = status["state"] == "done" and status.get("idle")
+    return "abandoned" in status or (
+        "wrap_up_at" in status and not finished and now - status["wrap_up_at"] > limits["wrap_up_minutes"] * 60)
+
+
+def wrap_up(ticket, status, now, reason, interrupt, prompt):
+    """Tell a queue worker over a limit to wrap up: push what it has, open its draft and say what's unfinished. It
+    finishes as a draft does, interrupted first if it's still running. One whose agent has exited can't be told, so
+    its grace period runs out."""
+    status = {**status, "phase": "draft", "state": "working", "message": f"wrapping up: {reason}", "idle": False,
+              "phase_started_at": now, "wrap_up": reason, "wrap_up_at": now}
+    effects = [("interrupt", status["pane"])] if interrupt else []
+    return status, effects + ([("prompt", ticket, status["pane"], "wrap-up", reason)] if prompt else [])
 
 
 class VerifyQueue:
@@ -1740,6 +1817,7 @@ class Owner:
     closes: bool = True  # a project closes once its tickets are done; the queue never does
     guidance: str = ""  # appended to every phase prompt its workers get
     on_end: object = None  # on_end(owner, status, ended) after an ended worker's tracker steps; it tells the human
+    wraps_up: bool = False  # a worker over a limit is told to wrap up, and abandoned if it doesn't, never left stuck
 
     @property
     def workers(self):

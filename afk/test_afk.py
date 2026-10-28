@@ -1471,7 +1471,7 @@ class DequeueTest(QueueTestCase):
         self.assertEqual(self.ids(), ["acme/widgets#13", "acme/widgets#14", "acme/widgets#12"])
 
     def test_a_ticket_not_in_the_queue_is_refused(self):
-        self.assertIn("acme/widgets#99 is not waiting in the queue", self.queue_fails("dequeue", "acme/widgets#99"))
+        self.assertIn("acme/widgets#99 is not in the queue", self.queue_fails("dequeue", "acme/widgets#99"))
         self.assertIn("usage: afk dequeue", self.queue_fails("dequeue"))
         self.assertEqual(len(self.ids()), 3)
 
@@ -2005,6 +2005,250 @@ class QueueDraftTest(QueueWorkerTestCase):
 
         self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
         self.assertIn(f"drafted  acme/widgets#12  Widget export  {self.DRAFT}", self.afk("queue"))
+
+
+class QueueWrapUpTest(QueueWorkerTestCase):
+    """A queue worker over a limit: told once to wrap up, and abandoned if it hasn't within the grace period."""
+
+    def limits(self, **limits):
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text(
+            "[queue.limits]\n" + "".join(f"{k} = {v}\n" for k, v in limits.items()))
+
+    def interrupts(self):
+        return [c for c in self.run_fake.calls[self.calls_before:] if c[:2] == ["tmux", "send-keys"] and c[-1] == "Escape"]
+
+    def test_a_worker_over_its_phase_limit_is_interrupted_and_told_to_wrap_up_instead_of_going_stuck(self):
+        self.limits(phase_minutes=5)
+        self.now += 6 * 60
+
+        self.afk("queue", "tick")
+
+        self.assertNotEqual(self.status()["state"], "stuck")
+        self.assertEqual(len(self.interrupts()), 1)
+        [wrap_up] = self.prompts_sent()
+        self.assertTrue(wrap_up.startswith("AFK phase: wrap-up"), wrap_up)
+        self.assertIn("over 5m in implement", wrap_up)
+        self.assertIn(self.URL, wrap_up)
+        self.assertNotIn("{{", wrap_up)
+
+    def test_a_worker_working_but_quiet_past_its_idle_limit_is_interrupted_and_told_to_wrap_up(self):
+        self.limits(idle_minutes=10)
+        self.now += 11 * 60
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(len(self.interrupts()), 1)
+        [wrap_up] = self.prompts_sent()
+        self.assertIn("idle for over 10m", wrap_up)
+
+    def test_a_worker_that_stopped_without_reporting_and_stayed_quiet_is_told_to_wrap_up_without_an_interrupt(self):
+        self.limits(idle_minutes=10)
+        self.afk("hook", "stop", stdin=json.dumps({"session_id": "s", "hook_event_name": "Stop"}), env=self.worker_env())
+        self.now += 11 * 60
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.interrupts(), [])
+        [wrap_up] = self.prompts_sent()
+        self.assertTrue(wrap_up.startswith("AFK phase: wrap-up"), wrap_up)
+        self.assertNotEqual(self.status()["state"], "attention")
+        self.assertEqual(self.desktop_notifications(), [])
+
+    def test_a_worker_still_fixing_after_its_critique_rounds_is_told_to_wrap_up(self):
+        self.limits(critique_rounds=2)
+        for _ in range(3):
+            self.finish_phase()
+
+        self.finish_phase("round: fixed a null check")
+        self.finish_phase("round: fixed the fix")
+
+        self.assertNotEqual(self.status()["state"], "stuck")
+        self.assertEqual(self.interrupts(), [])
+        *_, critique, wrap_up = self.prompts_sent()
+        self.assertTrue(critique.startswith("AFK phase: critique"), critique)
+        self.assertTrue(wrap_up.startswith("AFK phase: wrap-up"), wrap_up)
+        self.assertIn("over 2 critique rounds", wrap_up)
+
+    def test_a_ticket_over_its_ticket_minutes_is_told_to_wrap_up_though_its_phase_has_just_begun(self):
+        self.limits(ticket_minutes=30)
+        self.now += 20 * 60
+        self.finish_phase()
+        self.now += 9 * 60
+        self.afk("queue", "tick")
+        self.assertEqual(len(self.prompts_sent()), 1)
+
+        self.now += 2 * 60
+        self.afk("queue", "tick")
+
+        self.assertEqual(len(self.interrupts()), 1)
+        verify, wrap_up = self.prompts_sent()
+        self.assertTrue(wrap_up.startswith("AFK phase: wrap-up"), wrap_up)
+        self.assertIn("over 30m on the ticket", wrap_up)
+
+    def test_ticket_minutes_defaults_to_four_hours(self):
+        self.limits(phase_minutes=1000, idle_minutes=1000)
+        self.now += 239 * 60
+        self.afk("queue", "tick")
+        self.assertEqual(self.prompts_sent(), [])
+
+        self.now += 2 * 60
+        self.afk("queue", "tick")
+
+        [wrap_up] = self.prompts_sent()
+        self.assertIn("over 240m on the ticket", wrap_up)
+
+    def test_a_worker_that_reports_done_but_never_stops_is_abandoned_after_the_grace_period(self):
+        self.limits(phase_minutes=5, wrap_up_minutes=10)
+        self.now += 6 * 60
+        self.afk("queue", "tick")
+        self.afk("report", "done", "Wrapped up", env=self.worker_env())  # but it carries on, hung in a tool call
+
+        self.now += 11 * 60
+        self.afk("queue", "tick")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertIn("abandoned  acme/widgets#12", self.afk("queue"))
+
+    def test_a_worker_whose_agent_has_exited_gets_no_wrap_up_prompt_and_is_abandoned_after_the_grace_period(self):
+        self.limits(idle_minutes=10, wrap_up_minutes=10)
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%5")] = "bash\n"
+        self.now += 11 * 60
+        self.afk("queue", "tick")
+        self.assertEqual(self.prompts_sent(), [])
+        self.assertNotEqual(self.status()["state"], "stuck")
+
+        self.now += 11 * 60
+        self.afk("queue", "tick")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertIn("abandoned  acme/widgets#12", self.afk("queue"))
+
+    def test_the_wrap_up_prompt_is_sent_only_once(self):
+        self.limits(phase_minutes=5, idle_minutes=5, wrap_up_minutes=30)
+        self.now += 6 * 60
+        self.afk("queue", "tick")
+
+        self.now += 6 * 60
+        self.afk("queue", "tick")
+
+        self.assertEqual(len(self.interrupts()), 1)
+        self.assertEqual(len(self.prompts_sent()), 1)
+        self.assertNotEqual(self.status()["state"], "stuck")
+
+    def test_a_worker_that_hasnt_wrapped_up_by_the_end_of_the_grace_period_is_abandoned_and_the_next_ticket_starts(self):
+        self.limits(phase_minutes=5, wrap_up_minutes=10)
+        worktree = str(self.state_home / "afk" / ".queue" / "worktrees" / "12")
+        self.run_fake.responses[("git", "-C", worktree, "log")] = "3f2a9c1 Half an export\n"  # never pushed
+        self.enqueue(13)
+        self.now += 6 * 60
+        self.afk("queue", "tick")
+        self.now += 9 * 60
+        self.afk("queue", "tick")
+        self.assertTrue((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+
+        self.now += 2 * 60
+        output = self.afk("queue", "tick")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%5"]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"),
+                         [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
+                         [["git", "-C", str(self.repo), "branch", "-D", "afk/queue-12"]])
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        self.assertEqual(comment[3:6], ["12", "--repo", "acme/widgets"])
+        self.assertIn("over 5m in implement", comment[comment.index("--body") + 1])
+        self.assertEqual(self.run_fake.find("gh", "issue", "close"), [])
+        self.assertEqual([c for c in self.run_fake.find("gh", "issue", "edit") if "--remove-assignee" in c], [])
+        [notification] = self.desktop_notifications()
+        self.assertIn("acme/widgets#12 abandoned", notification)
+        self.assertIn("\a", output)
+        self.assertRegex(self.afk("queue"), r"abandoned  acme/widgets#12  Widget export  .*over 5m in implement")
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+
+    def test_a_worker_that_reports_done_within_the_grace_period_ends_as_drafted_though_its_draft_is_found_after(self):
+        self.limits(phase_minutes=5, wrap_up_minutes=10)
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"  # its shell pane is idle
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("OPEN", url="https://github.com/acme/widgets/pull/7")
+        self.now += 6 * 60
+        self.afk("queue", "tick")
+        self.now += 9 * 60 + 40
+        self.afk("queue", "tick")  # polls its PR while it's still wrapping up
+        self.now += 10
+        self.finish_phase("Wrapped up: export half done")
+        self.now += 30
+        self.afk("queue", "tick")  # past the grace period, but its PR isn't polled again until a minute has passed
+        self.assertTrue((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+
+        self.now += 30
+        output = self.afk("queue", "tick")
+
+        self.assertIn("drafted  acme/widgets#12  Widget export  https://github.com/acme/widgets/pull/7", self.afk("queue"))
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        self.assertIn("draft PR", comment[comment.index("--body") + 1])
+        self.assertNotIn("\a", output)
+
+
+class QueueAbandonTest(QueueWorkerTestCase):
+    """`afk dequeue <ticket> --abandon`: the engineer gives up on the running ticket."""
+
+    def test_dequeue_refuses_the_running_ticket_and_names_abandon(self):
+        output = self.queue_fails("dequeue", "acme/widgets#12")
+
+        self.assertIn("acme/widgets#12 is running", output)
+        self.assertIn("afk dequeue acme/widgets#12 --abandon", output)
+        self.assertTrue((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+
+    def test_abandon_stops_and_cleans_up_the_running_worker_keeping_what_it_pushed_and_the_next_ticket_starts(self):
+        worktree = str(self.state_home / "afk" / ".queue" / "worktrees" / "12")
+        self.run_fake.responses[("git", "-C", worktree, "log")] = "3f2a9c1 Half an export\n"  # never pushed
+        self.enqueue(13)
+
+        output = self.afk("dequeue", self.URL, "--abandon")
+
+        self.assertIn("abandoned acme/widgets#12", output)
+        self.assertNotIn("\a", output)  # the engineer abandoned it, so there's no one to call
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%5"]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"),
+                         [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
+                         [["git", "-C", str(self.repo), "branch", "-D", "afk/queue-12"]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "push"), [])
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        self.assertIn("afk dequeue --abandon", comment[comment.index("--body") + 1])
+        self.assertRegex(self.afk("queue"), r"abandoned  acme/widgets#12  Widget export  .*afk dequeue --abandon")
+        self.afk("queue", "tick")
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+
+    def test_an_abandon_whose_cleanup_fails_partway_is_finished_by_the_next_tick(self):
+        removes = []
+
+        def remove_fails_once(cmd):
+            removes.append(cmd)
+            if len(removes) == 1:
+                raise subprocess.CalledProcessError(1, cmd, stderr="fatal: busy")
+            return git(cmd)
+
+        self.run_fake.responses[("git", "-C", str(self.repo), "worktree", "remove")] = remove_fails_once
+        self.enqueue(13)
+        self.queue_fails("dequeue", self.URL, "--abandon")
+
+        self.afk("queue", "tick")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertEqual(len(self.run_fake.find("gh", "issue", "comment")), 1)
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+
+    def test_abandon_on_a_waiting_ticket_just_takes_it_off_the_queue(self):
+        self.enqueue(13)
+
+        self.assertIn("removed acme/widgets#13", self.afk("dequeue", "acme/widgets#13", "--abandon"))
+        self.assertNotIn("acme/widgets#13", self.afk("queue"))
+
+    def test_an_unknown_option_fails_with_usage(self):
+        self.assertIn("usage: afk dequeue", self.queue_fails("dequeue", "acme/widgets#12", "--force"))
 
 
 class QueueAndProjectsTest(QueueWorkerTestCase):
@@ -3337,7 +3581,7 @@ class WorkerTestCase(AfkTestCase):
             elif cmd[:2] == ["tmux", "paste-buffer"] and cmd[cmd.index("-t") + 1] == pane:
                 self.assertIn("-p", cmd)  # bracketed paste, so newlines don't submit early
                 prompts.append(buffers[cmd[cmd.index("-b") + 1]])
-            elif cmd[:2] == ["tmux", "send-keys"] and cmd[cmd.index("-t") + 1] == pane:
+            elif cmd[:2] == ["tmux", "send-keys"] and cmd[cmd.index("-t") + 1] == pane and cmd[-1] != "Escape":  # an interrupt
                 self.assertEqual(cmd[-1], "Enter")
         return prompts
 
