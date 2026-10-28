@@ -5759,6 +5759,375 @@ class TokenCapTest(WorkerTestCase):
         self.assertEqual(self.status("05")["state"], "stuck")
 
 
+class ResumeTestCase(WorkerTestCase):
+    """Worker 03 runs until the tmux server crashes: its session, windows and panes are gone, and the human has
+    recreated the session, unbound, before running `afk resume`."""
+
+    def setUp(self):
+        super().setUp()
+        self.active()  # its session has an id to resume
+
+    def crash(self):
+        self.run_fake.responses[("tmux", "display-message")] = "rebuilt\n"  # the recreated session
+        # The crash took @afk_project with it, until it's set again.
+        self.run_fake.responses[("tmux", "show-options")] = lambda cmd: "widgets\n" if self.resumed("tmux", "set-option") else ""
+        panes = iter(range(1, 100))  # a new server numbers its panes afresh
+        self.run_fake.responses[("tmux", "new-window")] = self.run_fake.responses[("tmux", "split-window")] = (
+            lambda cmd: f"%{next(panes)}\n")
+        self.calls_before = len(self.run_fake.calls)
+
+    def second_worker(self):
+        """Worker 04, started after 03, so resumed after it."""
+        self.ticket("04-api", "Widget API")
+        self.afk("start", "04")
+
+    def resumed(self, *prefix):
+        """The commands since the crash that start with prefix."""
+        return [c for c in self.run_fake.calls[self.calls_before :] if tuple(c[: len(prefix)]) == prefix]
+
+    def launch_command(self, pane="%1"):
+        [send] = self.resumed("tmux", "send-keys", "-t", pane)
+        self.assertEqual(send[-1], "Enter")
+        return shlex.split(send[4])
+
+
+
+class ResumeTest(ResumeTestCase):
+    def test_resume_binds_the_session_it_runs_in_to_the_project(self):
+        self.crash()
+
+        self.afk("resume", "widgets")
+
+        self.assertEqual(self.resumed("tmux", "set-option", "-t", "rebuilt"),
+                         [["tmux", "set-option", "-t", "rebuilt", "@afk_project", "widgets"]])
+        self.assertEqual(tomllib.loads((self.project_dir / "config.toml").read_text())["session"], "rebuilt")
+
+    def test_resume_without_a_project_resumes_the_one_whose_session_was_recreated_by_its_name(self):
+        self.crash()
+        self.run_fake.responses[("tmux", "display-message")] = "work\n"
+
+        self.afk("resume")
+
+        self.assertEqual(self.resumed("tmux", "set-option", "-t", "work"),
+                         [["tmux", "set-option", "-t", "work", "@afk_project", "widgets"]])
+
+    def test_resume_without_a_project_never_reads_the_queues_hand_written_config(self):
+        self.crash()
+        self.run_fake.responses[("tmux", "display-message")] = "work\n"
+        (self.state_home / "afk" / ".queue").mkdir()
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text("[queue\n")  # a typo
+
+        self.afk("resume")
+
+        self.assertEqual(self.status()["pane"], "%1")
+
+    def test_resume_without_a_project_passes_over_another_projects_broken_config(self):
+        self.crash()
+        self.run_fake.responses[("tmux", "display-message")] = "work\n"
+        (self.state_home / "afk" / "gadgets").mkdir()
+        (self.state_home / "afk" / "gadgets" / "config.toml").write_text("[limits\n")  # a typo
+
+        self.afk("resume")
+
+        self.assertEqual(self.status()["pane"], "%1")
+
+    def test_resume_without_a_project_names_the_configs_it_could_not_read_when_none_was_bound(self):
+        self.crash()
+        self.run_fake.responses[("tmux", "display-message")] = "work\n"
+        path = self.project_dir / "config.toml"
+        path.write_text("[limits\n" + path.read_text())  # a typo in the bound project's own
+        out = io.StringIO()
+
+        code = afk.main(["resume"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn(f"no project was bound to tmux session 'work' (couldn't read {path}: ", out.getvalue())
+
+    def test_resume_in_a_session_of_the_same_name_leaves_the_hand_edited_config_as_it_is(self):
+        path = self.project_dir / "config.toml"
+        path.write_text(path.read_text() + "\n# raised for the big tickets\n[limits]\nphase_minutes = 120\n")
+        before = path.read_text()
+        self.crash()
+        self.run_fake.responses[("tmux", "display-message")] = "work\n"
+
+        self.afk("resume")
+
+        self.assertEqual(path.read_text(), before)
+
+    def test_resume_without_a_project_in_a_session_no_project_had_names_none_to_resume(self):
+        self.crash()
+        out = io.StringIO()
+
+        code = afk.main(["resume"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("no project was bound to tmux session 'rebuilt'; run `afk resume <project>`", out.getvalue())
+        self.assertEqual(self.resumed("tmux", "set-option"), [])
+
+    def test_resume_without_a_project_where_two_had_the_session_asks_which(self):
+        self.crash()
+        self.run_fake.responses[("tmux", "display-message")] = "work\n"
+        other = self.state_home / "afk" / "gadgets"
+        other.mkdir()
+        (other / "config.toml").write_text('session = "work"\n')
+        out = io.StringIO()
+
+        code = afk.main(["resume"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("projects gadgets and widgets were bound to tmux session 'work'; run `afk resume <project>`",
+                      out.getvalue())
+
+    def test_resume_of_a_project_there_is_none_of_says_so(self):
+        self.crash()
+        out = io.StringIO()
+
+        code = afk.main(["resume", "gizmos"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("afk: no project 'gizmos'", out.getvalue())
+
+    def test_resume_reopens_each_workers_named_window_split_agent_left_shell_right_and_records_its_panes(self):
+        self.crash()
+
+        self.afk("resume", "widgets")
+
+        worktree = str(self.project_dir / "worktrees" / "03")
+        [window] = self.resumed("tmux", "new-window")
+        self.assertIn("-d", window)
+        self.assertEqual(window[window.index("-t") + 1], "rebuilt:")
+        self.assertEqual(window[window.index("-n") + 1], "03-widget-ui")
+        self.assertEqual(window[window.index("-c") + 1], worktree)
+        self.assertEqual(self.resumed("tmux", "split-window"),
+                         [["tmux", "split-window", "-h", "-d", "-t", "%1", "-c", worktree, "-P", "-F", "#{pane_id}"]])
+        self.assertEqual((self.status()["pane"], self.status()["shell_pane"]), ("%1", "%2"))
+
+
+    def test_a_worker_that_fails_to_relaunch_leaves_no_window_and_the_rest_still_resume(self):
+        self.second_worker()
+        self.crash()
+        splits = iter([subprocess.CalledProcessError(1, ["tmux", "split-window"], stderr="no space for new pane")])
+
+        def split(cmd):
+            failure = next(splits, None)
+            if failure:
+                raise failure
+            return "%3\n"
+
+        self.run_fake.responses[("tmux", "split-window")] = split
+        out = io.StringIO()
+
+        code = afk.main(["resume", "widgets"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+
+        self.assertEqual(code, 1)
+        self.assertIn("afk: 03 not resumed: `tmux split-window` failed: no space for new pane", out.getvalue())
+        self.assertEqual(self.resumed("tmux", "kill-window"), [["tmux", "kill-window", "-t", "%1"]])
+        self.assertEqual(self.status()["pane"], "%5")  # as before, so a rerun resumes it
+        self.assertEqual(self.resumed("tmux", "send-keys", "-t", "%1"), [])
+        self.assertEqual(self.status("04")["pane"], "%2")
+        self.assertIn("resumed 04", out.getvalue())
+
+    def test_resume_relaunches_a_worker_by_resuming_its_recorded_session_as_start_launched_it(self):
+        self.report("question", "Which colour?")
+        self.stop()
+        self.crash()
+
+        self.afk("resume", "widgets")
+
+        launch = self.launch_command()
+        self.assertEqual(launch[:5], ["env", "AFK_PROJECT=widgets", "AFK_TICKET=03", "AFK_SLOT=1", "AFK_PORT_BASE=4100"])
+        self.assertEqual(launch[5:], ["claude", "--resume", "s", "--permission-mode", "auto", "--settings",
+                                      str(self.project_dir / "workers" / "03" / "settings.json")])
+
+    def test_a_worker_whose_ticket_is_gone_from_the_tracker_fails_alone(self):
+        self.second_worker()
+        (self.scratch / "issues" / "03-ui.md").unlink()
+        self.crash()
+        out = io.StringIO()
+
+        code = afk.main(["resume", "widgets"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+
+        self.assertEqual(code, 1)
+        self.assertIn("afk: 03 not resumed: no ticket '03'", out.getvalue())
+        self.assertEqual(self.status()["pane"], "%5")
+        self.assertIn("resumed 04", out.getvalue())
+        self.assertIn("run `afk watch`", out.getvalue())
+
+    def test_a_worker_crashed_before_its_session_started_is_launched_afresh_as_start_launched_it(self):
+        self.repo_config('default_type = "skill"\n[task_types.skill]\nskill = "/tdd"')
+        self.second_worker()  # crashed before its session recorded an id
+        self.crash()
+
+        self.afk("resume", "widgets")
+
+        launch = self.launch_command("%3")
+        self.assertNotIn("--resume", launch)
+        self.assertTrue(launch[-1].startswith("/tdd AFK phase: implement — ticket 04"), launch[-1])
+        self.assertNotIn("afk resumed", launch[-1])  # there is no session to have resumed
+
+    def test_a_hitl_worker_crashed_before_its_session_started_is_launched_afresh_in_guide_mode(self):
+        self.ticket("04-api", "Widget API", type="hitl")
+        self.afk("start", "04")
+        self.crash()
+
+        self.afk("resume", "widgets")
+
+        self.assertTrue(self.launch_command("%3")[-1].startswith("AFK guide mode"), self.launch_command("%3")[-1])
+
+    def test_resume_says_what_it_brought_back_and_that_the_watcher_is_next(self):
+        self.crash()
+
+        out = self.afk("resume", "widgets")
+
+        self.assertIn("resumed 03 in its window, 03-widget-ui", out)
+        self.assertIn("run `afk watch` in the orchestrator window's right pane", out)
+
+    def test_a_resumed_workers_window_is_marked_with_its_state_again(self):
+        self.report("question", "Which colour?")
+        self.stop()
+        self.afk("tick")
+        self.crash()
+
+        self.afk("resume", "widgets")
+
+        self.assertEqual(self.resumed("tmux", "rename-window"), [["tmux", "rename-window", "-t", "%1", "03-widget-ui?"]])
+        self.assertEqual(self.resumed("tmux", "set-option", "-w"),
+                         [["tmux", "set-option", "-w", "-t", "%1", "@afk_state", "question"]])
+
+    def test_a_worker_cut_off_mid_phase_is_resumed_with_its_current_phase_prompt_which_is_no_approval(self):
+        self.finish_phase("Implemented")  # now verifying, when the crash cuts it off
+        self.crash()
+
+        self.afk("resume", "widgets")
+
+        prompt = self.launch_command()[-1]
+        self.assertTrue(prompt.startswith("AFK phase: verify"), prompt)
+        self.assertIn("afk resumed this session", prompt)
+        self.prompt(prompt)
+        self.assertNotIn("last_human_prompt_at", self.status())
+
+    def test_a_worker_done_with_its_phase_is_sent_the_next_once_its_resumed_session_stops_never_the_done_one_again(self):
+        self.report("done", "Implemented")
+        self.stop()  # the watcher would have sent verify next, but the crash came first
+        self.crash()
+
+        self.afk("resume", "widgets")
+        self.afk("tick")  # its session is still starting, so nothing may be pasted into it
+
+        nudge = self.launch_command()[-1]
+        self.assertTrue(nudge.startswith("AFK phase: implement"), nudge)
+        self.assertIn("already reported this phase done", nudge)
+        self.assertEqual(self.prompts_sent("%1"), [])
+        self.stop()
+        self.afk("tick")
+        self.assertEqual([p.split(" — ")[0] for p in self.prompts_sent("%1")], ["AFK phase: verify"])
+
+    def test_a_worker_fixing_review_feedback_is_told_to_carry_on_not_to_stand_by(self):
+        for _ in range(4):
+            self.finish_phase()  # now in review
+        self.report("question", "Rename it?")
+        self.prompt("Yes, rename it")  # the human answered, so it's working on the feedback
+        self.crash()
+
+        self.afk("resume", "widgets")
+
+        prompt = self.launch_command()[-1]
+        self.assertTrue(prompt.startswith("AFK phase: review — ticket 03"), prompt)
+        self.assertIn("carry on", prompt)
+        self.assertNotIn("Standing by", prompt)
+
+    def test_a_worker_whose_agent_exited_after_its_phase_was_done_carries_on_once_resumed(self):
+        self.report("done", "Implemented")
+        self.stop()
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = "bash\n"  # its window lost claude
+        self.afk("tick")
+        self.assertEqual(self.status()["message"], "claude is no longer running in its pane")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = "claude\n"
+        self.crash()
+
+        self.afk("resume", "widgets")
+        nudge = self.launch_command()[-1]
+        self.stop()
+        self.afk("tick")
+
+        self.assertIn("already reported this phase done", nudge)
+        self.assertEqual([p.split(" — ")[0] for p in self.prompts_sent("%1")], ["AFK phase: verify"])
+
+    def test_downtime_does_not_count_against_the_resumed_workers_phase_limit(self):
+        self.crash()
+        self.now += 2 * 60 * 60  # down for longer than phase_minutes
+
+        self.afk("resume", "widgets")
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "working")
+
+    def test_a_worker_whose_window_survived_is_left_running(self):
+        self.crash()
+        window = lambda cmd: "03-widget-ui\n" if cmd[-1] == "#{window_name}" else "claude\n"
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%5")] = window
+
+        out = self.afk("resume", "widgets")
+
+        self.assertEqual((self.resumed("tmux", "new-window"), self.resumed("tmux", "send-keys")), ([], []))
+        self.assertEqual(self.status()["pane"], "%5")
+        self.assertIn("left 03 alone: its window, 03-widget-ui, survived", out)
+
+    def test_a_pane_a_new_server_numbered_as_the_workers_was_is_not_taken_for_it(self):
+        self.crash()  # its pane, %5, is the recreated session's own: "claude" names no worker window
+
+        self.afk("resume", "widgets")
+
+        self.assertEqual(self.status()["pane"], "%1")
+
+    def test_a_pane_older_tmux_cannot_find_is_gone(self):
+        self.crash()
+
+        def gone(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %5")
+
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%5")] = gone
+
+        self.afk("resume", "widgets")
+
+        self.assertEqual(self.status()["pane"], "%1")
+
+
+class LocalLandingResumeTest(ResumeTestCase):
+    INIT = ("--land", "local")
+
+    def test_a_worker_done_with_a_critique_round_gets_its_next_round_once_resumed(self):
+        for _ in range(3):
+            self.finish_phase()  # now in critique
+        self.report("done", "round: fixed two findings")
+        self.stop()
+        self.crash()
+
+        self.afk("resume", "widgets")
+        self.stop()
+        self.afk("tick")
+
+        self.assertEqual([p.split(" — ")[0] for p in self.prompts_sent("%1")], ["AFK phase: critique"])
+
+    def test_a_worker_whose_agent_exited_after_a_critique_round_gets_its_next_round_once_resumed(self):
+        for _ in range(3):
+            self.finish_phase()  # now in critique
+        self.report("done", "round: fixed two findings")
+        self.stop()
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = "bash\n"  # its window lost claude
+        self.afk("tick")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t")] = "claude\n"
+        self.crash()
+
+        self.afk("resume", "widgets")
+        self.stop()
+        self.afk("tick")
+
+        self.assertEqual([p.split(" — ")[0] for p in self.prompts_sent("%1")], ["AFK phase: critique"])
+
+
 class LocalLandingWatchTest(WorkerTestCase):
     INIT = ("--land", "local", "--target", "widgets-v2")
 

@@ -2,14 +2,14 @@
 name: afk
 description: Orchestrate AFK agent workers for one project in this tmux session — find unblocked tickets, start workers in their own worktree and tmux window, and track their status — or hand a standalone ticket to the machine-wide queue.
 disable-model-invocation: true
-argument-hint: <init [<spec>] [--land <pr|local>] [--target <branch>] | frontier | start <ticket> [--type <type>] | drop <ticket> [--discard] | watch | status | view | close [--force] | next | enqueue <issue URL> [--type <type>] | queue [pause|resume|watch|tick] | dequeue <ticket> [--abandon] | worktree <owner/name>>
+argument-hint: <init [<spec>] [--land <pr|local>] [--target <branch>] | frontier | start <ticket> [--type <type>] | drop <ticket> [--discard] | watch | status | view | resume [<project>] | close [--force] | next | enqueue <issue URL> [--type <type>] | queue [pause|resume|watch|tick] | dequeue <ticket> [--abandon] | worktree <owner/name>>
 ---
 
 # AFK
 
 You drive the `afk` CLI; it does all the mechanical work. Run it with Bash and relay its output. Add judgment only where a step below asks for it.
 
-One project = one tmux session. `afk` resolves the project from the tmux session it runs in, so run every command from inside that session. The exceptions are the [queue](#queue)'s commands, `enqueue`, `queue` and `dequeue`, which belong to no project and run from any session, and `worktree`, which only a queue worker runs.
+One project = one tmux session. `afk` resolves the project from the tmux session it runs in, so run every command from inside that session. The exceptions are `resume`, which binds the session it runs in, and the [queue](#queue)'s commands, `enqueue`, `queue` and `dequeue`, which belong to no project and run from any session, and `worktree`, which only a queue worker runs.
 
 ## Commands
 
@@ -23,6 +23,7 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 - **`afk drop <ticket> --discard`** — abandon a local-mode worker's unlanded work, releasing its ticket back onto the frontier: see [Dropping](#dropping).
 - **`afk status`** — every worker's ticket, phase, state and last message, then the same "all tickets landed" line the watcher shows, while it holds.
 - **`afk view`** — the current project's config (`config.toml`): its spec, tracker, repo, session, `[landing]`, `[repos]`, `[limits]` and `[overrides]`.
+- **`afk resume [<project>]`** — after a crash or reboot took the project's tmux session with it, run it from the recreated session: by default it resumes the project last bound to a session of that name. It binds the session to the project again, then reopens each worker's window `<ticket>-<abbrev>` in its worktree, split agent-left / shell-right and marked with its state, and relaunches its `claude` worker as `afk start` launched it, resuming its recorded session. A worker cut off mid-phase is given its current phase's prompt again, saying it was resumed; one that had reported its phase done is told to stop, and the watcher then sends it the next phase, never the done one again. Each worker's phase clock restarts, so the downtime doesn't count against `phase_minutes`. A worker that crashed before its session started is launched afresh, exactly as `afk start` launched it. A worker whose window survived is left alone, so running it twice relaunches nothing twice; one that fails to relaunch is left as it was, without a window, for a rerun to retry, and the rest still resume. Then run `afk watch` in the orchestrator window's right pane, if it isn't running. Queue workers aren't resumed.
 - **`afk enqueue <issue URL> [--type <type>] [--agent <agent>] [--model <model>] [--effort <effort>] [--repo <owner/name>]`**, **`afk queue [pause|resume|watch|tick]`**, **`afk dequeue <ticket> [--abandon]`** — add a standalone GitHub or Linear ticket to the machine-wide queue, list, pause or watch it, take a waiting ticket off it, or abandon the running one: see [Queue](#queue).
 - **`afk worktree <owner/name>`** — run by a queue worker, from its worktree, when its ticket spans repos: see [Tickets that span repos](#tickets-that-span-repos).
 - **`afk close [--force]`** — close the project: prune its clones' worktrees, unbind the tmux session, append a line to `${XDG_STATE_HOME:-~/.local/state}/afk/closed.log`, notify, and remove the project's state. It refuses while any worker or worktree is left, and while a ticket isn't done unless `--force` abandons the open ones. The watcher runs it on its own once every ticket is done, except in a project landing on an integration branch, which stays open until you run it.
@@ -31,6 +32,7 @@ One project = one tmux session. `afk` resolves the project from the tmux session
 
 - `next`: follow [`/afk next`](#afk-next) below.
 - `init [<spec>] …`, `frontier`, `start <ticket> …`, `status`, `view`, `close [--force]`: run `afk $ARGUMENTS` and show the output.
+- `resume [<project>]`: run `afk $ARGUMENTS` and show the output; if it names no project bound to the session, ask the user which project to resume (one of the directories in `${XDG_STATE_HOME:-~/.local/state}/afk/`). Then tell the user to run `afk watch` in the orchestrator window's right pane, if it isn't running.
 - `enqueue <issue URL> …`, `queue`, `queue pause`, `queue resume`, `queue tick`, `dequeue <ticket> [--abandon]`: run `afk $ARGUMENTS` from wherever this session is, with no project needed, and show the output. If enqueue refuses, relay why: for a repo with no known clone, offer to add it under `[repos]` in the queue's `config.toml`; for one with no afk repo config, point the user at `/afk-setup` in that clone; for a Linear ticket naming no repo, ask which repo it's for and enqueue it again with `--repo`. Never add `--abandon` yourself: it stops the running worker and deletes whatever it hasn't pushed, so only the user types it.
 - `drop <ticket> [--discard]`: run `afk $ARGUMENTS` and show the output. Never add `--discard` yourself: it deletes the worker's work, so only the user types it.
 - `watch`: it runs forever, so don't run it yourself. Tell the user to run `afk watch` in the orchestrator window's right pane.

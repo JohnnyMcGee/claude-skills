@@ -233,6 +233,15 @@ Re-open 02's ticket as `Status: ready-for-agent` again and start it.
 - [ ] Once it has a PR, close the PR on GitHub without merging. Within about a minute 02 is cleaned up, you're notified "02 closed and cleaned up", its ticket still reads `Status: ready-for-agent`, and `afk frontier` lists it.
 - [ ] Start 02 once more as a guide-mode worker (`afk start 02 --type hitl`), since only a worker in `pr`, `review` or `hitl` is polled. It isn't cleaned up for the PR the last attempt closed. With no PR, set its ticket to `Status: closed`. Within about a minute it's cleaned up, you're notified "02 ticket closed and cleaned up", and its ticket still reads `Status: closed`.
 
+## 10a. Crash and `afk resume` (optional)
+
+Start a worker, e.g. re-open 02's ticket as `Status: ready-for-agent` again and start it, and let it get partway through a phase.
+
+- [ ] Kill the tmux server (`tmux kill-server`), then recreate the session by its old name and its orchestrator window. `afk status` fails with "no project for this tmux session".
+- [ ] Run `afk resume`. It binds the session again, and says it resumed 02 in its window. 02's window is back, named and split agent-left / shell-right, and its agent resumes its old conversation, given its phase's prompt again with a line saying the session was resumed. `afk status` works again.
+- [ ] Start `afk watch` in the orchestrator window's right pane. The dashboard's time in phase for 02 starts from the resume, not from before the crash, and 02 carries on through its phases: no phase it had finished is sent again.
+- [ ] Run `afk resume` once more. It relaunches nothing: 02's window survived.
+
 ## 11. Local landing mode
 
 Re-uses the throwaway repo, with the PR-mode run above finished and torn down from the afk side (stop its `afk watch`; keep the repo and its remote). This section checks that workers land without a PR, that the integration branch is pushed and base never is, and that approval gates the land. It needs the reviewer CLIs from section 2, step 5 (or accept the code-review subagent fallback). Tickets in a second spec:

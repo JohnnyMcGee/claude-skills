@@ -244,7 +244,7 @@ class Afk:
         base = repo_config.get("base", "main")
         task_type = repo_config.get("task_types", {}).get(choices["type"], {})
         slot = self.claim_worker(owner, worker_dir, counted=phase != "hitl")
-        slot_env = [f"AFK_SLOT={slot}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * slot}"]
+        slot_env = worker_slot_env(repo_config, slot)
         undo = [lambda: shutil.rmtree(worker_dir, ignore_errors=True)]
         try:
             owner.tracker.claim(ticket)
@@ -263,13 +263,8 @@ class Afk:
 
             settings = worker_dir / "settings.json"
             settings.write_text(json.dumps(worker_settings(base, target if mode == "local" else None, owner.denies), indent=2) + "\n")
-            launch = [
-                "env", *owner.env, f"AFK_TICKET={ticket.id}", *slot_env,
-                "claude", "--permission-mode", "auto", "--settings", str(settings),
-                *[arg for key in ("model", "effort") if choices[key] for arg in (f"--{key}", choices[key])],
-                self.first_prompt(owner, ticket, phase if drafts is None else "resume", task_type, clone, mode, target,
-                                  drafts, branch),
-            ]
+            launch = agent_command(owner, ticket.id, slot_env, choices, prompt=self.first_prompt(
+                owner, ticket, phase if drafts is None else "resume", task_type, clone, mode, target, drafts, branch))
             write_json(
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "title": ticket.title, "phase": phase, "state": state, "message": "",
@@ -339,7 +334,7 @@ class Afk:
             return 1
         repo_config = reduce(deep_merge, repo_config_layers(repo), {})
         base = repo_config.get("base", "main")
-        slot_env = [f"AFK_SLOT={TRIAL_SLOT}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * TRIAL_SLOT}"]
+        slot_env = worker_slot_env(repo_config, TRIAL_SLOT)
         label = f"worktree {worktree} on {TRIAL_BRANCH} from {base}"
         try:
             worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -876,11 +871,7 @@ class Afk:
         if kind == "prompt":
             ticket_id, pane, phase, *reason = args  # the wrap-up prompt names the limit the worker went over
             status = read_json(owner.workers / ticket_id / "status.json")
-            prompt = self.phase_prompt(owner, ticket_id, phase, owner.worker_clone(status), status.get("landing", "pr"),
-                                       status.get("target"), reason=reason[0] if reason else None,
-                                       worktrees=owner.worker_worktrees(status), slot=status.get("slot"),
-                                       branch=owner.worker_branch(status))
-            self.send_prompt(ticket_id, pane, prompt)
+            self.send_prompt(ticket_id, pane, self.worker_prompt(owner, status, phase, reason[0] if reason else None))
         elif kind == "window":
             # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
             pane, name, state = args
@@ -1027,6 +1018,12 @@ class Afk:
                              reviewers=others)
         return prompt + owner.guidance
 
+    def worker_prompt(self, owner, status, phase, reason=None):
+        """The phase's prompt for a running worker, from its status."""
+        return self.phase_prompt(owner, status["ticket"], phase, owner.worker_clone(status), status.get("landing", "pr"),
+                                 status.get("target"), reason=reason, worktrees=owner.worker_worktrees(status),
+                                 slot=status.get("slot"), branch=owner.worker_branch(status))
+
     def first_prompt(self, owner, ticket, phase, task_type, clone, landing="pr", target=None, drafts=(), branch=None):
         """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
         prompt = self.phase_prompt(owner, ticket.id, phase, clone, landing, target, drafts=drafts or (), branch=branch)
@@ -1093,6 +1090,110 @@ class Afk:
         landed = self.landed(owner, rows)
         if landed:
             self.out(landed)
+
+    def cmd_resume(self, project=None):
+        """After a crash or reboot, bind the session this runs in to the project again, by default the one last bound
+        to a session of its name, and bring back each of its workers."""
+        session = self.run(["tmux", "display-message", "-p", "#{session_name}"]).strip()
+        if project is None:
+            root = self.state_root()
+            bound, unread = [], []
+            # No project dir is dot-named, so the queue's hand-written config is never read.
+            for config_path in sorted(root.glob("[!.]*/config.toml")) if root.is_dir() else []:
+                try:
+                    if tomllib.loads(config_path.read_text()).get("session") == session:
+                        bound.append(config_path.parent.name)
+                except tomllib.TOMLDecodeError as error:
+                    # A typo in another project's hand-edited config can't stop this one's resume, but it may be this one's.
+                    unread.append(f"couldn't read {config_path}: {error}")
+            if len(bound) != 1:
+                which = f"projects {' and '.join(bound)} were" if bound else "no project was"
+                why = f" ({'; '.join(unread)})" if unread and not bound else ""
+                raise SystemExit(f"afk: {which} bound to tmux session '{session}'{why}; run `afk resume <project>`")
+            project = bound[0]
+        path = self.project_dir(project) / "config.toml"
+        if not path.exists():
+            raise SystemExit(f"afk: no project '{project}'; see {self.state_root()}")
+        config = tomllib.loads(path.read_text())
+        if config["session"] != session:  # rewritten only then, keeping the hand-edited file as it is
+            config["session"] = session
+            path.write_text(to_toml(config))
+        self.run(["tmux", "set-option", "-t", session, "@afk_project", project])
+        owner = self.project(config, project)
+        failed = False
+        owner.workers.mkdir(parents=True, exist_ok=True)
+        # Under the tick lock, then each worker's, as a tick takes them, so a watcher can't act on a pane id the new
+        # server has given another worker meanwhile.
+        with locked(owner.workers):
+            for status_path in sorted(owner.workers.glob("*/status.json")):
+                with locked(status_path.parent):
+                    try:
+                        self.relaunch(owner, status_path)
+                    except (subprocess.CalledProcessError, OSError, SystemExit) as error:
+                        # One worker failing fails alone, as in a tick, its ticket gone from the tracker included; it's
+                        # left as it was, so a rerun retries it.
+                        if isinstance(error, subprocess.CalledProcessError):
+                            why = f"`{shlex.join(error.cmd)}` failed: {(error.stderr or '').strip()}"
+                        else:
+                            why = str(error.code if isinstance(error, SystemExit) else error).removeprefix("afk: ")
+                        self.out(f"afk: {status_path.parent.name} not resumed: {why}")
+                        failed = True
+        self.out("run `afk watch` in the orchestrator window's right pane, if it isn't running, to drive them on")
+        return 1 if failed else None
+
+    def relaunch(self, owner, path):
+        """Reopen a worker's window in its worktree, as launch_worker opened it, unless it survived, and resume its
+        agent's session there."""
+        status = read_json(path)
+        # A new server numbers its panes afresh, so a pane by the worker's id is its only if it's in its window.
+        try:
+            window = self.run(["tmux", "display-message", "-p", "-t", status["pane"], "#{window_name}"]).strip()
+        except subprocess.CalledProcessError:
+            window = ""  # gone, to older tmux; tmux 3.6 prints nothing
+        if window.startswith(status["window"]):  # perhaps marked with its state
+            self.out(f"left {status['ticket']} alone: its window, {status['window']}, survived")
+            return
+        prompt, changes = None, {}
+        clone = owner.worker_clone(status)
+        if "session_id" not in status:
+            # It crashed before its session started, so it starts afresh, as `afk start` launched it.
+            task_type = owner.repo_config(clone).get("task_types", {}).get(status.get("type"), {})
+            prompt = self.first_prompt(owner, owner.tracker.get(status["ticket"]), status["phase"], task_type, clone,
+                                       status.get("landing", "pr"), status.get("target"),
+                                       branch=owner.worker_branch(status))
+        elif status["state"] == "working":
+            # Cut off mid-phase, so it never reported done: it gets its phase's prompt again, as afk's own. Bar
+            # review's, which says to stand by, while it was working on the human's feedback.
+            review = status["phase"] == "review"
+            prompt = (f"AFK phase: review — ticket {status['ticket']}" if review
+                      else self.worker_prompt(owner, status, status["phase"])) + RESUMED
+            changes["idle"] = False
+        elif status["state"] in ("done", "queued") or (status["state"], status.get("message")) == ("attention", AGENT_GONE):
+            # Its phase is done, so the watcher sends the next, but only once it stops: pasted into a session still
+            # starting, a prompt's newlines could submit it piecemeal. Told so, it stops at once. One whose agent had
+            # exited once done, as when only its window was lost, is done again now it runs.
+            prompt = f"AFK phase: {status['phase']} — ticket {status['ticket']}\n\n{RESUMED_DONE}"
+            # A done report's message stays: a critique round's marks the round, which the next tick reads.
+            gone = status["state"] == "attention"
+            changes.update(idle=False, **({"state": "done", "message": status.pop("done_message", "")} if gone else {}))
+        slot_env = worker_slot_env(owner.repo_config(clone), status["slot"])
+        worktree = str(owner.worktree(status["ticket"]))
+        pane = self.run(["tmux", "new-window", "-d", "-t", owner.session + ":", "-n", status["window"], "-c", worktree,
+                         "-P", "-F", "#{pane_id}"]).strip()
+        try:
+            shell = self.run(["tmux", "split-window", "-h", "-d", "-t", pane, "-c", worktree, "-P", "-F", "#{pane_id}"]).strip()
+            state = changes.get("state", status["state"])
+            self.perform(owner, "window", pane, status["window"], state)
+            launch = agent_command(owner, status["ticket"], slot_env, status, resume=status.get("session_id"),
+                                   prompt=prompt)
+            self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
+            # Downtime isn't the worker's, so its phase clock restarts.
+            write_json(path, {**status, "pane": pane, "shell_pane": shell, "phase_started_at": self.clock(), "shown": state,
+                              **changes})
+        except BaseException:
+            self.best_effort(["tmux", "kill-window", "-t", pane])  # so a rerun opens it once
+            raise
+        self.out(f"resumed {status['ticket']} in its window, {status['window']}")
 
     def cmd_view(self):
         """The current project's config.toml, headed by its path."""
@@ -1251,7 +1352,7 @@ class Afk:
         clone = self.queue_clone(repo)
         repo_config = queue_repo_config(clone)
         worktree = owner.worktree(ticket_id, repo)
-        slot_env = [f"AFK_SLOT={status['slot']}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * status['slot']}"]
+        slot_env = worker_slot_env(repo_config, status["slot"])
         base = repo_config.get("base", "main")
         # Its branch there is its ticket's too: linked to it on GitHub, so a later pass finds it again.
         owner.tracker.branch(owner.tracker.get(ticket_id), repo, base, clone, branch)
@@ -1589,9 +1690,10 @@ class Afk:
     def config(self):
         return tomllib.loads((self.project_dir(self.current_project()) / "config.toml").read_text())
 
-    def project(self, config=None):
-        """The current project, as the owner of its workers."""
-        project, config = self.current_project(), config or self.config()
+    def project(self, config=None, project=None):
+        """The current project, or the one named, as the owner of its workers."""
+        project = project or self.current_project()
+        config = config or tomllib.loads((self.project_dir(project) / "config.toml").read_text())
         remote = {"github": GithubTracker, "linear": LinearTracker}.get(config["tracker"])
         tracker = remote(self.run, config["spec"]) if remote else LocalTracker(Path(config["spec"]))
         return Owner(name=project, state_dir=self.project_dir(project), session=config["session"], tracker=tracker,
@@ -1600,6 +1702,12 @@ class Afk:
 
 
 REPORT_STATES = ("done", "blocked", "question")
+
+# Ends the phase prompt `afk resume` gives a worker the crash cut off mid-phase.
+RESUMED = "\n\nafk resumed this session after a crash cut it short: carry on with this phase from where you left off.\n"
+# The whole prompt, after its AFK phase line, that `afk resume` gives a worker whose phase was done before the crash.
+RESUMED_DONE = ("afk resumed this session after a crash cut it short. You had already reported this phase done, so "
+                "there is nothing to do: end your turn now, and afk takes it from there.\n")
 
 # A prompt no human typed: afk's own phase or guide-mode prompt, perhaps after its task type's skill, or pasted, as the
 # watcher sends them (Claude Code hands the hook a paste wrapped in a <pasted_content> tag, after whatever was typed
@@ -1661,6 +1769,7 @@ PR_POLL_SECONDS = 60
 DAY = 24 * 3600  # the daily token cap's window
 NO_PR = "no PR found for its branch"
 NO_REPORT = "stopped without reporting"
+AGENT_GONE = "claude is no longer running in its pane"
 # /open-pr adds this label only once the PR's automated gates are clear.
 READY_LABEL = "Ready for Review"
 
@@ -1800,8 +1909,10 @@ def advance(ticket, status, now, agent_running, may_verify, limits, pr_state=Non
     if state == "queued" and may_verify:
         state = "done"  # its turn to verify: advance as if it had just finished
     if state == "done" and status.get("idle") and not agent_running:
-        state, message = "attention", "claude is no longer running in its pane"
-        status = {**status, "state": state, "message": message, "reports": status.get("reports", 0) + 1}
+        state, message = "attention", AGENT_GONE
+        # Its done report's message is kept for when its agent runs again: a critique round's marks the round.
+        status = {**status, "state": state, "message": message, "reports": status.get("reports", 0) + 1,
+                  "done_message": status.get("message", "")}
     # Only act on done once the worker has also stopped: never type into a busy session.
     if state == "done" and status.get("idle"):
         if phase == "draft":
@@ -2617,6 +2728,23 @@ def worker_settings(base, target=None, denies=()):
     }
 
 
+def worker_slot_env(repo_config, slot):
+    """The environment that keeps a worker on its slot's ports."""
+    return [f"AFK_SLOT={slot}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * slot}"]
+
+
+def agent_command(owner, ticket_id, slot_env, choices, resume=None, prompt=None):
+    """The command a worker's pane runs its agent with: claude in auto mode with the worker's settings and its launch
+    choices, resuming its session if given, then submitting the prompt if given."""
+    settings = owner.workers / ticket_id / "settings.json"
+    return [
+        "env", *owner.env, f"AFK_TICKET={ticket_id}", *slot_env,
+        "claude", *(["--resume", resume] if resume else []), "--permission-mode", "auto", "--settings", str(settings),
+        *[arg for key in ("model", "effort") if choices.get(key) for arg in (f"--{key}", choices[key])],
+        *([prompt] if prompt else []),
+    ]
+
+
 def dashboard(statuses, now):
     width = ticket_width(statuses)
     yield f"{'TICKET':<{width}}{'PHASE':<11}{'STATE':<17}{'ELAPSED':<9}PR"  # wide enough for cleanup-pending
@@ -2888,7 +3016,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|close|land|drop|status|view|hook|check|trial|enqueue|queue|dequeue|worktree> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|close|land|drop|status|view|resume|hook|check|trial|enqueue|queue|dequeue|worktree> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)
