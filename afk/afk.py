@@ -39,6 +39,7 @@ class Afk:
         self.stdout = stdout
         self.clock = clock
         self.closed = False  # set once the project is closed, which ends `afk watch`
+        self.transcripts = Transcripts()  # kept across `afk watch`'s ticks, so each reads only what was added since
 
     def out(self, line):
         print(line, file=self.stdout)
@@ -214,6 +215,11 @@ class Afk:
         choices = launch_choices(ticket, repo_config.get("default_type"), task_types, corrections)
         check_choices(ticket.id, choices, task_types)
         type_name = choices["type"]
+        # A worker started now would only trip the cap at once; a hitl worker is the human's, held to no limit.
+        capped = type_name != HITL and self.over_daily_cap(owner, self.clock())
+        if capped:
+            raise SystemExit(f"afk: the project's workers are {capped}; raise [limits] daily_tokens in its config.toml "
+                             f"to start {ticket.id} now")
         base = repo_config.get("base", "main")
         landing = config.get("landing", {})
         # Recorded in its status, so a change to the project's landing never strands a running worker.
@@ -550,6 +556,10 @@ class Afk:
                 transcript_path=payload.get("transcript_path"),
                 last_event=payload.get("hook_event_name", event),
             )
+            # Every session the worker runs in, as relaunching its agent starts a new transcript: token caps count all.
+            transcripts = worker_transcripts(status)
+            if payload.get("transcript_path") and payload["transcript_path"] not in transcripts:
+                changes["transcripts"] = [*transcripts, payload["transcript_path"]]
             if event == "stop":
                 # Not a stall by itself: a worker ends its turn to wait on a background task (a review subagent,
                 # CI checks) and resumes when it lands. The idle limit catches a worker that never resumes.
@@ -649,7 +659,12 @@ class Afk:
         shown, failures = [], []
         paths = sorted(owner.workers.glob("*/status.json"))
         # Only ticks change phases and ticks don't overlap, so a snapshot of them stays true for the whole tick.
-        verify = VerifyQueue(verify_concurrency, [read_json(p) for p in paths])
+        snapshot = [read_json(p) for p in paths]
+        verify = VerifyQueue(verify_concurrency, snapshot)
+        transcripts = self.owner_transcripts(owner, snapshot, now)
+        # Any other than these and its workers' is done with, so a long-running watcher lets it go.
+        self.transcripts.keep([*transcripts, *(t for status in snapshot for t in worker_transcripts(status))])
+        day_tokens = self.transcripts.tokens(transcripts, since=now - DAY)
         # Each worker is read, acted on and persisted under its lock, so a report or hook can't land in between,
         # a failure can't make a later tick repeat another worker's effects, and one failing worker fails alone.
         for path in paths:
@@ -658,7 +673,9 @@ class Afk:
                 given = dict(may_verify=verify.may_start(before), limits=owner.limits, owner_tells=bool(owner.on_end),
                              wraps_up=owner.wraps_up,
                              phases=owner.phases[before.get("landing", "pr")],  # workers started before landing modes landed by PR
-                             last_activity=last_write(before.get("transcript_path")))
+                             last_activity=last_write(before.get("transcript_path")),
+                             tokens=self.transcripts.tokens(worker_transcripts(before), since=before["phase_started_at"]),
+                             day_tokens=day_tokens)
                 try:
                     pr_state = pr_url = None
                     pr_ready = ticket_closed = False
@@ -689,6 +706,33 @@ class Afk:
                 verify.update(before, status)
                 shown.append(status)
         return shown, failures
+
+    def owner_transcripts(self, owner, statuses, now):
+        """The transcripts of every session the owner's workers ran in over the last day, theirs since cleaned up
+        included, as its daily token cap counts them all. Kept in its state, under the caller's lock on its workers."""
+        path = owner.state_dir / "transcripts.json"
+        known = read_json(path) if path.exists() else []
+        current = [*known, *(t for status in statuses for t in worker_transcripts(status))]
+        # One not written in the last day holds nothing the cap counts, so it's let go.
+        recent = [t for t in dict.fromkeys(current) if (last_write(t) or 0) >= now - DAY]
+        if recent != known:
+            write_json(path, recent)
+        return recent
+
+    def over_daily_cap(self, owner, now):
+        """Why the owner's workers may not take on new work: over its daily token cap, counting the transcripts its last
+        tick recorded and those its workers' hooks have since. None if they may. Read only, so it needs no lock."""
+        cap = {**LIMITS, **owner.limits}["daily_tokens"]
+        path = owner.state_dir / "transcripts.json"
+        transcripts = read_json(path) if path.exists() else []
+        for status in owner.workers.glob("*/status.json"):
+            try:
+                transcripts += worker_transcripts(read_json(status))
+            except FileNotFoundError:
+                pass  # cleaned up meanwhile: the ledger has what the last tick saw of it
+        if self.transcripts.tokens(list(dict.fromkeys(transcripts)), since=now - DAY) > cap:
+            return f"over {cap:,} tokens in the last 24h"
+        return None
 
     def surface_unblocked(self, owner, statuses, now):
         """The Gate 1 judgment point: unblocked tickets and a free worker slot. The user decides with /afk next. And
@@ -1140,6 +1184,8 @@ class Afk:
         waiting = [t for t in state["tickets"] if t["state"] == "waiting"]
         if state["paused"]:
             self.out("paused: nothing new starts until `afk queue resume`")
+        if state.get("capped"):
+            self.out(f"{state['capped']}: nothing new starts until it falls back under daily_tokens")
         if not running and not waiting:
             self.out("the queue is empty")
         for t in running:
@@ -1277,7 +1323,8 @@ class Afk:
                 shutil.rmtree(slot.parent)
 
     def pick_up(self, owner):
-        """Start the oldest waiting tickets, as many as the queue's free worker slots, unless it's paused.
+        """Start the oldest waiting tickets, as many as the queue's free worker slots, unless it's paused or over its
+        daily token cap, which would only have each new worker told to wrap up at once.
 
         Each is read again from its tracker first. One closed, assigned to someone else or gone meanwhile is removed,
         with a notification. One with open blockers, or whose worker failed to start, is skipped, keeping its place,
@@ -1286,8 +1333,17 @@ class Afk:
         state = self.read_queue()
         if state["paused"]:
             return
-        free = owner.max_workers() - sum(counts_toward_max(slot.parent) for slot in owner.workers.glob("*/slot"))
         now = self.clock()
+        capped = self.over_daily_cap(owner, now)
+        if capped != state.get("capped"):
+            # The human hears once that it's holding back, not every tick; it carries on by itself as usage ages out.
+            with self.queue_state() as queue:
+                queue["capped"] = capped
+            if capped:
+                self.notify(owner, f"{capped}: nothing new starts until it falls back under daily_tokens", bell=False)
+        if capped:
+            return
+        free = owner.max_workers() - sum(counts_toward_max(slot.parent) for slot in owner.workers.glob("*/slot"))
         for entry in [t for t in state["tickets"] if t["state"] == "waiting"]:
             if free <= 0:
                 break
@@ -1568,7 +1624,12 @@ INIT_OPTIONS = ("--land", "--target")
 LANDING_MODES = ("pr", "local")
 
 # Runaway limits; a project's config.toml [limits] table overrides any of them.
-LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3, "critique_rounds": 3}
+LIMITS = {"max_workers": 3, "phase_minutes": 90, "idle_minutes": 20, "fix_loops": 3, "critique_rounds": 3,
+          "phase_tokens": 30_000_000, "daily_tokens": 250_000_000}
+
+# What a transcript's usage counts as tokens: every one the model read or wrote, cache reads included, as a session's
+# cache reads dominate its spend the longer it runs.
+TOKEN_KINDS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
 
 # Marks a critique round's done report: it fixed findings, so the fixes need a round of their own.
 CRITIQUE_ROUND = "round:"
@@ -1597,6 +1658,7 @@ QUEUE_LIMITS = {"ci_rounds": 2, "ticket_minutes": 240, "wrap_up_minutes": 15}
 RECENT_OUTCOMES = 10  # how many finished tickets `afk queue` shows
 
 PR_POLL_SECONDS = 60
+DAY = 24 * 3600  # the daily token cap's window
 NO_PR = "no PR found for its branch"
 NO_REPORT = "stopped without reporting"
 # /open-pr adds this label only once the PR's automated gates are clear.
@@ -1662,7 +1724,7 @@ def ending(status, polled, pr_state, ticket_closed=False):
 
 def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, last_activity=None,
          polled=False, pr_state=None, pr_url=None, pr_ready=False, ticket_closed=False, cleanup_blocker=None, phases=None,
-         owner_tells=False, wraps_up=False):
+         owner_tells=False, wraps_up=False, tokens=0, day_tokens=0):
     """One watcher step for one worker, pure: its status and the time in; its updated status and effects out.
 
     agent_running=False says the worker's pane no longer runs its agent, so it can't be sent a prompt.
@@ -1676,6 +1738,8 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
     phases are the worker's phases in order, by default its landing mode's.
     owner_tells says the worker's owner tells the human how its work ended, once it's cleaned up.
     wraps_up says the worker's owner, the queue, has a worker over a limit wrap up rather than wait on the human.
+    tokens are those the worker's sessions used since its phase started; day_tokens, those all its owner's workers used
+    in the last 24 hours.
     A status of None out means the worker is cleaned up and gone.
     """
     ended = ending(status, polled, pr_state, ticket_closed)
@@ -1706,7 +1770,8 @@ def tick(ticket, status, now, agent_running=True, may_verify=True, limits=None, 
             return None, [("cleanup", ticket, status["pane"], "abandoned")]
         status, effects = advance(ticket, status, now, agent_running, may_verify, limits, pr_state, pr_ready, phases, wraps_up)
         if not effects:
-            status, effects = enforce(ticket, status, now, limits, last_activity, wraps_up, agent_running)
+            status, effects = enforce(ticket, status, now, limits, last_activity, wraps_up, agent_running, tokens,
+                                      day_tokens)
     if status["state"] != status.get("shown"):
         status = {**status, "shown": status["state"]}
         effects.append(("window", status["pane"], status["window"], status["state"]))
@@ -1789,11 +1854,13 @@ def enter_review(ticket, status, now, effects):
     return status, effects + [("notify", f"{ticket} {ready} ready for review" + (f": {pr}" if pr else ""))]
 
 
-def enforce(ticket, status, now, limits, last_activity, wraps_up=False, agent_running=True):
+def enforce(ticket, status, now, limits, last_activity, wraps_up=False, agent_running=True, tokens=0, day_tokens=0):
     """Trip a runaway limit: interrupt the worker, mark it stuck and notify. Never kill it. A worker that stopped
     without reporting and stayed quiet is instead marked attention, with nothing to interrupt.
 
     last_activity is when the worker's session last wrote anything; a phase prompt counts as activity.
+    tokens are those its sessions used since its phase started; day_tokens, those all its owner's workers used in the
+    last 24 hours, so each running worker trips the daily cap.
     wraps_up says the worker is told to wrap up instead, as a queue worker is, if its agent is running to be told.
     """
     # A worker that reported done but hasn't stopped is still running. Review has no phase clock: it waits on the human.
@@ -1823,6 +1890,10 @@ def enforce(ticket, status, now, limits, last_activity, wraps_up=False, agent_ru
         return status, [("notify", f"{ticket} needs attention: {NO_REPORT}")]
     if now - status["phase_started_at"] > limits["phase_minutes"] * 60:
         reason = f"over {limits['phase_minutes']}m in {status['phase']}"
+    elif tokens > limits["phase_tokens"]:
+        reason = f"over {limits['phase_tokens']:,} tokens in {status['phase']}"
+    elif day_tokens > limits["daily_tokens"]:
+        reason = f"workers over {limits['daily_tokens']:,} tokens in the last 24h"
     elif quiet:
         reason = f"idle for over {limits['idle_minutes']}m"
     else:
@@ -2708,6 +2779,58 @@ def counts_toward_max(worker_dir):
         return read_json(worker_dir / "status.json")["phase"] not in ("review", "hitl")
     except FileNotFoundError:
         return True
+
+
+class Transcripts:
+    """Token usage read from agent sessions' transcripts: each is read once, then only as far as it has grown."""
+
+    def __init__(self):
+        self.read = {}  # path -> (bytes read, {response id: (when, tokens)})
+
+    def tokens(self, paths, since):
+        """Tokens the sessions with transcripts at paths, and their subagents, used at or after since."""
+        responses = {}
+        for path in paths:
+            # Claude Code writes a session's subagents' transcripts beside its own, in <session>/subagents/.
+            for transcript in [path, *sorted(Path(path).with_suffix("").glob("subagents/*.jsonl"))]:
+                responses.update(self.responses(str(transcript)))
+        return sum(tokens for when, tokens in responses.values() if when >= since)
+
+    def keep(self, paths):
+        """Let go of what was read of every transcript but those at paths and their subagents'."""
+        sessions = {str(Path(path).with_suffix("")) for path in paths}
+        # A session's transcript is <session>.jsonl, and its subagents' <session>/subagents/<agent>.jsonl.
+        self.read = {path: read for path, read in self.read.items()
+                     if str(Path(path).with_suffix("")) in sessions or str(Path(path).parent.parent) in sessions}
+
+    def responses(self, path):
+        offset, responses = self.read.get(path, (0, {}))
+        try:
+            with open(path, "rb") as file:
+                file.seek(offset)
+                data = file.read()
+        except OSError:
+            return responses
+        end = data.rfind(b"\n") + 1  # a line still being written is read once it's whole
+        for line in data[:end].splitlines():
+            try:
+                entry = json.loads(line)
+                message = entry["message"]
+                usage = message["usage"]
+                # A response is written a line per content block, each repeating its usage, so it counts once.
+                responses[message["id"]] = (datetime.fromisoformat(entry["timestamp"]).timestamp(),
+                                            sum(usage.get(kind) or 0 for kind in TOKEN_KINDS))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue  # not a model response
+        self.read[path] = (offset + end, responses)
+        return responses
+
+
+def worker_transcripts(status):
+    """The transcripts of every session the worker's hooks recorded, workers started before they kept them all
+    having only their latest."""
+    latest = status.get("transcript_path")
+    return status.get("transcripts") or ([latest] if latest else [])
 
 
 def last_write(path):

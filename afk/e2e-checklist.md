@@ -219,6 +219,13 @@ Set `[limits] idle_minutes = 1` in the project's `config.toml`, then start a fre
 
 Restore the limit after.
 
+Then set `[limits] phase_tokens = 200_000` and start a fresh worker the same way.
+
+- [ ] Within a few model responses it's `stuck` with "over 200,000 tokens in implement", interrupted and notified. A worker's real transcript, as Claude Code writes it, is what's summed.
+- [ ] Set `daily_tokens` below what the project has used today and nudge it. On the next tick it's `stuck` again with "workers over … tokens in the last 24h".
+
+Restore both after.
+
 ## 10. Closed without merging (optional)
 
 Re-open 02's ticket as `Status: ready-for-agent` again and start it.

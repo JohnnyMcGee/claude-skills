@@ -67,6 +67,24 @@ def no_pr(cmd):
     raise subprocess.CalledProcessError(1, cmd, stderr=f'no pull requests found for branch "{cmd[3]}"')
 
 
+def model_response(transcript, tokens, at):
+    """Append a model response using `tokens` at clock time `at` to a transcript, as Claude Code writes one: a line per
+    content block, each repeating the response's usage, then the user line with the result of the tool it called."""
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    n = transcript.read_text().count("\n") if transcript.exists() else 0
+    usage = {"input_tokens": 1, "cache_creation_input_tokens": tokens // 4, "cache_read_input_tokens": tokens // 2,
+             "output_tokens": tokens - 1 - tokens // 4 - tokens // 2}
+    timestamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    entry = {"type": "assistant", "timestamp": timestamp, "requestId": f"req_{n}",
+             "message": {"id": f"msg_{transcript.stem}_{n}", "role": "assistant", "usage": usage}}
+    result = {"type": "user", "timestamp": timestamp,
+              "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"toolu_{n}", "content": "ok"}]}}
+    with open(transcript, "a") as file:
+        for block in ({"type": "thinking"}, {"type": "tool_use", "id": f"toolu_{n}", "name": "Bash"}):
+            file.write(json.dumps({**entry, "message": {**entry["message"], "content": [block]}}) + "\n")
+        file.write(json.dumps(result) + "\n")
+
+
 class AfkTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -2150,6 +2168,46 @@ class QueueWrapUpTest(QueueWorkerTestCase):
         self.assertIn("over 5m in implement", wrap_up)
         self.assertIn(self.URL, wrap_up)
         self.assertNotIn("{{", wrap_up)
+
+    def test_a_worker_over_a_token_cap_is_interrupted_and_told_to_wrap_up_instead_of_going_stuck(self):
+        self.limits(phase_tokens=25_000)
+        model_response(self.tmp / "12.jsonl", 30_000, self.now)
+        payload = {"session_id": "s", "transcript_path": str(self.tmp / "12.jsonl"), "hook_event_name": "PreToolUse"}
+        self.afk("hook", "activity", stdin=json.dumps(payload), env=self.worker_env())
+
+        self.afk("queue", "tick")
+
+        self.assertNotEqual(self.status()["state"], "stuck")
+        self.assertEqual(len(self.interrupts()), 1)
+        [wrap_up] = self.prompts_sent()
+        self.assertIn("over 25,000 tokens in implement", wrap_up)
+
+    def test_a_queue_over_its_daily_token_cap_starts_nothing_new_until_its_usage_falls_back_under(self):
+        (self.state_home / "afk" / ".queue" / "config.toml").write_text(
+            "[queue]\nmax_workers = 2\n\n[queue.limits]\ndaily_tokens = 25_000\n")
+        model_response(self.tmp / "12.jsonl", 30_000, self.now)
+        payload = {"session_id": "s", "transcript_path": str(self.tmp / "12.jsonl"), "hook_event_name": "PreToolUse"}
+        self.afk("hook", "activity", stdin=json.dumps(payload), env=self.worker_env())
+        self.enqueue(13)
+
+        self.afk("queue", "tick")
+        self.afk("queue", "tick")
+
+        self.assertIn("workers over 25,000 tokens in the last 24h", self.prompts_sent()[0])  # 12 wraps up
+        started = lambda: [add[6] for add in self.worktree_adds()[1:]]  # after 12's
+        self.assertEqual(started(), [])
+        listing = self.afk("queue")
+        self.assertIn("over 25,000 tokens in the last 24h: nothing new starts until it falls back under daily_tokens",
+                      listing.splitlines()[0])
+        self.assertIn("1. acme/widgets#13", listing)  # still waiting
+        held = [n for n in self.desktop_notifications() if "nothing new starts" in n]
+        self.assertEqual(held, ["afk: queue over 25,000 tokens in the last 24h: nothing new starts until it falls back "
+                                "under daily_tokens"])
+
+        self.now += 25 * 3600
+        self.afk("queue", "tick")
+
+        self.assertEqual(started(), ["13-widget-13"])
 
     def test_a_worker_working_but_quiet_past_its_idle_limit_is_interrupted_and_told_to_wrap_up(self):
         self.limits(idle_minutes=10)
@@ -4260,6 +4318,13 @@ class WorkerTestCase(AfkTestCase):
         self.stop()
         self.afk("tick")
 
+    def limit(self, **limits):
+        with open(self.project_dir / "config.toml", "a") as config:
+            config.write("\n[limits]\n" + "".join(f"{k} = {v}\n" for k, v in limits.items()))
+
+    def interrupts(self, pane="%5"):
+        return [c for c in self.run_fake.find("tmux", "send-keys")[1:] if c[c.index("-t") + 1] == pane and c[-1] == "Escape"]
+
 
 class WatchTest(WorkerTestCase):
     def test_done_report_then_stop_advances_to_verify_and_sends_its_prompt(self):
@@ -4604,12 +4669,6 @@ class WatchTest(WorkerTestCase):
         self.assertEqual(self.phase(), "verify")
         self.assertEqual(len(self.prompts_sent()), 1)
 
-    def limit(self, **limits):
-        with open(self.project_dir / "config.toml", "a") as config:
-            config.write("\n[limits]\n" + "".join(f"{k} = {v}\n" for k, v in limits.items()))
-
-    def interrupts(self, pane="%5"):
-        return [c for c in self.run_fake.find("tmux", "send-keys")[1:] if c[c.index("-t") + 1] == pane and c[-1] == "Escape"]
 
     def test_a_worker_over_the_configured_phase_limit_is_interrupted_and_stuck(self):
         self.limit(phase_minutes=5)
@@ -5514,6 +5573,190 @@ class WatchTest(WorkerTestCase):
         self.assertFalse((self.project_dir / "workers" / "04").exists())
         self.assertIn("04 ticket closed and cleaned up", self.desktop_notifications()[-1])
         self.assertIn("**Status:** closed", path.read_text())  # the tracker already has it as closed
+
+
+class TokenCapTest(WorkerTestCase):
+    """Token caps, with usage summed from fixture transcripts at the paths the worker's hooks record."""
+
+    def spend(self, tokens, ago=0, ticket="03", session=None, subagent=None):
+        """The worker's session, or its `subagent`, gets one model response using `tokens`, `ago` seconds before now,
+        written to its transcript as Claude Code writes it: a line per content block, each repeating the response's
+        usage. Then a hook of the session records the session's transcript."""
+        session = session or self.transcript(ticket)
+        path = session.with_suffix("") / "subagents" / f"agent-{subagent}.jsonl" if subagent else session
+        model_response(path, tokens, self.now - ago)
+        payload = {"session_id": "s", "transcript_path": str(session), "hook_event_name": "PreToolUse"}
+        self.afk("hook", "activity", stdin=json.dumps(payload), env=self.worker_env(ticket))
+
+    def test_a_worker_over_the_phase_token_cap_is_interrupted_stuck_and_notified(self):
+        self.limit(phase_tokens=25_000)
+        self.spend(10_000)
+        self.spend(10_000)
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "working")
+
+        self.spend(10_000)
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "stuck")
+        self.assertIn("over 25,000 tokens in implement", self.status()["message"])
+        self.assertEqual(len(self.interrupts()), 1)
+        [notification] = self.desktop_notifications()
+        self.assertIn("03 stuck: over 25,000 tokens in implement", notification)
+
+    def test_tokens_used_in_an_earlier_phase_do_not_count_against_the_next(self):
+        self.limit(phase_tokens=25_000)
+        self.spend(20_000)
+        self.now += 60
+        self.report("done", "Implemented")
+        self.stop()
+        self.afk("tick")
+        self.assertEqual(self.phase(), "verify")
+
+        self.now += 60
+        self.spend(10_000)
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "working")
+
+    def test_tokens_used_by_the_workers_subagents_count(self):
+        self.limit(phase_tokens=25_000)
+        self.spend(10_000)
+        self.spend(10_000, subagent="a1")
+        self.spend(10_000, subagent="b2")
+
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "stuck")
+
+    def test_tokens_used_in_every_session_the_hooks_recorded_count(self):
+        # The worker's agent is relaunched mid-phase, in a session with a transcript of its own.
+        self.limit(phase_tokens=25_000)
+        self.spend(20_000)
+        self.spend(10_000, session=self.tmp / "relaunched.jsonl")
+
+        self.afk("tick")
+
+        self.assertEqual(self.status()["state"], "stuck")
+
+    def test_the_default_token_caps_apply_without_config(self):
+        self.spend(29_000_000)
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "working")
+        self.spend(2_000_000)
+        self.afk("tick")
+        self.assertEqual(self.status()["message"], "over 30,000,000 tokens in implement")
+
+        self.start_another()
+        self.spend(200_000_000, ago=3600, ticket="05")  # before its phase, but within the day
+        self.afk("tick")
+        self.assertEqual(self.status("05")["state"], "working")
+        self.spend(20_000_000, ticket="05")
+        self.afk("tick")
+        self.assertEqual(self.status("05")["message"], "workers over 250,000,000 tokens in the last 24h")
+
+    def test_the_watcher_counts_a_response_once_its_half_written_line_is_finished_skipping_what_isnt_one(self):
+        self.limit(phase_tokens=25_000)
+        model_response(self.transcript(), 20_000, self.now)
+        response = self.transcript().read_text().splitlines()[-2]  # its last block, before its tool's result
+        response = response.replace('"msg_', '"msg_late_')  # a second response of the same size
+        with open(self.transcript(), "a") as transcript:
+            transcript.write('{"type": "summary", "summary": "Widget UI"}\n'
+                             '{"type": "assistant", "timestamp": "1970-01-12T13:46:40.000Z", '
+                             '"message": {"id": "msg_x", "usage": null}}\n'
+                             'not json\n' + response[:40])
+        self.resume()  # a hook records the transcript
+        ticks = []
+
+        def sleep(seconds):
+            ticks.append(self.status()["state"])
+            if len(ticks) == 2:
+                raise KeyboardInterrupt
+            with open(self.transcript(), "a") as transcript:
+                transcript.write(response[40:] + "\n")
+
+        with mock.patch.object(afk.time, "sleep", side_effect=sleep):
+            out = io.StringIO()
+            afk.main(["watch"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+
+        self.assertNotIn("failed", out.getvalue())
+        self.assertEqual(ticks, ["working", "stuck"])
+
+    def start_another(self, ticket="05"):
+        self.ticket(f"{ticket}-export", "Widget export")
+        self.run_fake.responses[("tmux", "new-window")] = "%7\n"
+        self.afk("start", ticket)
+
+    def test_workers_together_over_the_daily_token_cap_are_each_interrupted_stuck_and_notified(self):
+        self.limit(daily_tokens=25_000)
+        self.start_another()
+        self.spend(15_000)
+        self.afk("tick")
+        self.assertEqual(self.status()["state"], "working")
+
+        self.spend(15_000, ticket="05")
+        self.afk("tick")
+
+        for ticket, pane in (("03", "%5"), ("05", "%7")):
+            self.assertEqual(self.status(ticket)["state"], "stuck")
+            self.assertEqual(len(self.interrupts(pane)), 1)
+        self.assertEqual(self.desktop_notifications()[-2:], [
+            f"afk: widgets {ticket} stuck: workers over 25,000 tokens in the last 24h" for ticket in ("03", "05")])
+
+    def test_only_tokens_used_in_the_last_24_hours_count_against_the_daily_cap(self):
+        self.limit(daily_tokens=25_000)
+        self.start_another()
+        self.spend(20_000, ago=25 * 3600)
+        self.spend(10_000, ticket="05")
+
+        self.afk("tick")
+
+        self.assertEqual([self.status(ticket)["state"] for ticket in ("03", "05")], ["working", "working"])
+
+    def test_starting_a_ticket_is_refused_while_the_project_is_over_its_daily_token_cap(self):
+        self.limit(daily_tokens=25_000)
+        self.spend(30_000)
+        self.afk("tick")
+        self.ticket("05-export", "Widget export")
+        out = io.StringIO()
+
+        code = afk.main(["start", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+
+        self.assertEqual(code, 1)
+        self.assertIn("over 25,000 tokens in the last 24h", out.getvalue())
+        self.assertIn("daily_tokens", out.getvalue())
+        self.assertFalse((self.project_dir / "workers" / "05").exists())
+        self.assertIn("**Status:** ready-for-agent", (self.scratch / "issues" / "05-export.md").read_text())
+
+    def test_starting_a_ticket_counts_the_running_workers_tokens_since_the_last_tick(self):
+        self.limit(daily_tokens=25_000)
+        self.spend(30_000)  # no tick since
+        self.ticket("05-export", "Widget export")
+        out = io.StringIO()
+
+        code = afk.main(["start", "05"], run=self.run_fake, env=self.env, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+
+        self.assertEqual(code, 1)
+        self.assertIn("over 25,000 tokens in the last 24h", out.getvalue())
+
+    def test_tokens_used_by_a_worker_since_cleaned_up_count_against_the_daily_cap(self):
+        self.limit(daily_tokens=25_000)
+        self.spend(20_000)
+        for message in ["Implemented", "Verified", "Checks pass", "https://github.com/acme/widgets/pull/42"]:
+            self.finish_phase(message)
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("MERGED")
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"
+        self.now += 60
+        self.afk("tick")
+        self.assertFalse((self.project_dir / "workers" / "03").exists())
+
+        self.start_another()
+        self.spend(10_000, ticket="05")
+        self.afk("tick")
+
+        self.assertEqual(self.status("05")["state"], "stuck")
 
 
 class LocalLandingWatchTest(WorkerTestCase):
