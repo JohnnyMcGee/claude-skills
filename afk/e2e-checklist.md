@@ -324,7 +324,7 @@ echo "$time_url $date_url $now_url"
 
 **Pick-up (/time)**
 
-- [ ] From any session, in `~/code/afk-e2e`, `/afk enqueue $time_url`, then `/afk enqueue $date_url`. Within a few seconds /time is assigned to you on GitHub and a window `<n>-add-a-time` opens in `afk-queue`. In its shell pane `git branch --show-current` is `afk/queue-<n>`, branched from `main`, and `echo $AFK_SLOT` prints `8`.
+- [ ] From any session, in `~/code/afk-e2e`, `/afk enqueue $time_url`, then `/afk enqueue $date_url`. Within a few seconds /time is assigned to you on GitHub and a window `<n>-add-a-time` opens in `afk-queue`. In its shell pane `git branch --show-current` is the branch GitHub named, `<n>-add-a-time-endpoint`, branched from `main`, and `echo $AFK_SLOT` prints `8`. The issue's Development section links that branch, which is already on the remote.
 - [ ] `afk queue` shows `running  …#<n>  Add a /time endpoint  (implement, working)`, then /date waiting at `1.`: one queue worker at a time.
 - [ ] In the worker's agent pane, ask it to run `gh pr ready`, `afk report question "test"` and `afk queue pause`: each is denied. Ask it to edit `~/code/afk-e2e/app.py`, the main checkout: the edit is denied as outside its worktree.
 
@@ -332,8 +332,15 @@ echo "$time_url $date_url $now_url"
 
 - [ ] It runs implement → verify → prepr → critique → draft without ever reporting `question` or `blocked`, and the dashboard follows. Critique runs the reviewers over `git diff origin/main...HEAD`.
 - [ ] draft: a draft PR against `main` opens on its branch. Its description links the ticket and ends with `## Questions for the engineer`, which names the time format it chose. With no CI in this repo, it says so rather than waiting.
-- [ ] Once it reports `done`: /time's issue has a comment linking the draft, and is still open and assigned to you. The worker's window, worktree and local branch are gone (`git branch` in the repo has no `afk/queue-<n>`; the branch is still on the remote). You get a tmux message and a desktop notification with the draft's URL, and the bell doesn't ring. The draft is still a draft.
+- [ ] Once it reports `done`: /time's issue has a comment linking the draft, and is still open and assigned to you. The worker's window, worktree and local branch are gone (`git branch` in the repo has no `<n>-add-a-time-endpoint`; the branch is still on the remote, linked to the issue). You get a tmux message and a desktop notification with the draft's URL, and the bell doesn't ring. The draft is still a draft.
 - [ ] `afk queue` lists `drafted  …#<n>  Add a /time endpoint  <draft URL>`, and /date is now running, on slot 8 again.
+
+**Answering questions and re-enqueueing (/time)**
+
+- [ ] On /time's draft, answer its `## Questions for the engineer` in a PR comment (say, ask for ISO 8601 time), leave a review comment on a line of its diff, and push a small commit of your own to its branch, then delete your local copy of that branch. Then `/afk enqueue $time_url`: it's accepted, at the end of the queue, though its draft exists.
+- [ ] When it's picked up, its worktree is on the same linked branch as you pushed it, your commit included (`git log -1` in its shell pane), not fresh from `main`. Its first prompt is `AFK phase: resume`, naming the draft's URL, and the worker reads your PR comment, review comment and commit and addresses them.
+- [ ] draft: no second PR opens. The same draft gets the new commits, and its description's `## Questions for the engineer` no longer lists the time-format question, keeping only what's still open (or `None.`). Once it's done, `afk queue` lists a second `drafted` line for /time with the same draft's URL, and the issue has a second comment, saying afk updated its draft, linking it.
+- [ ] Delete the branch on the remote (`git push origin --delete <n>-add-a-time-endpoint`, after closing the draft), then `/afk enqueue $time_url` once more and, when it's picked up, check it starts fresh from `main` with an `AFK phase: implement` prompt, on a branch linked to the issue anew. `afk dequeue <its id> --abandon` to stop it.
 
 **Skips, removals, pause and restart**
 
@@ -355,9 +362,11 @@ ping_url=$(gh issue create --title "Add a /ping endpoint and a client command fo
 ```
 
 - [ ] In the shell that set it, `afk enqueue "$ping_url"` (a slash command's shell doesn't have `$ping_url`). In the worker's shell pane, which isn't the worker's session, `AFK_QUEUE=1 AFK_TICKET=<n> afk worktree <you>/nowhere` refuses, saying there's no clone of it, and from any shell outside a queue worker `afk worktree <you>/afk-e2e-client` refuses, naming a queue worker.
-- [ ] During implement the worker runs `afk worktree <you>/afk-e2e-client`. A worktree `<n>@<you>.afk-e2e-client` appears beside its own under `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/worktrees/`, on branch `afk/queue-<n>` from the client's `main`, and the worker's status lists it under `siblings`. It printed the client's `export AFK_SLOT=8 AFK_PORT_BASE=…`.
+- [ ] During implement the worker runs `afk worktree <you>/afk-e2e-client`. A worktree `<n>@<you>.afk-e2e-client` appears beside its own under `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/worktrees/`, on the worker's branch name from the client's `main`, which the issue's Development section now links in the client repo too, and the worker's status lists it under `siblings`. It printed the client's `export AFK_SLOT=8 AFK_PORT_BASE=…`.
 - [ ] Every phase prompt after that lists both worktrees, each with its repo and base, and the worker verifies, pre-PRs and critiques both. It may edit files in either worktree, and still nowhere else.
-- [ ] draft: one draft PR opens in each repo, each description linking the ticket and the other PR. Once it reports `done`, the ticket's comment, the notification and `afk queue`'s `drafted` line link both drafts, and both worktrees and both repos' local `afk/queue-<n>` branches are gone.
+- [ ] draft: one draft PR opens in each repo, each description linking the ticket and the other PR. Once it reports `done`, the ticket's comment, the notification and `afk queue`'s `drafted` line link both drafts, and both worktrees and both repos' local copies of its branch are gone.
+- [ ] Comment on the client's draft, then `afk enqueue "$ping_url"` again. The resumed worker reads both drafts, runs `afk worktree <you>/afk-e2e-client`, which prints that it's on the branch as last pushed with the client's draft, and addresses your comment there. Once it reports `done`, `afk queue`'s new `drafted` line links both of the same drafts.
+- [ ] Optional, a same-numbered ticket elsewhere: open an issue in `<you>/afk-e2e-client` until one has the same number as /ping and enqueue it. Its worker starts on a new branch linked to it, not on /ping's branch in the client repo.
 
 **Wrap-up and abandonment (optional)**
 
@@ -422,7 +431,8 @@ linear issue create --team TEAM --title "/clock endpoint" --yes --description "R
 ```
 
 - [ ] From any session, in `~/code/afk-e2e`, `/afk enqueue <Q1's URL>` refuses, saying Q1 names no repo. `/afk enqueue <Q1's URL> --repo <you>/afk-e2e` enqueues it as `Q1`, then `/afk enqueue <Q2's URL>` enqueues Q2 behind it.
-- [ ] Within a few seconds Q1 is assigned to you in Linear, and a window `<q1>-echo-endpo` opens in `afk-queue`. In its shell pane `git branch --show-current` is `afk/queue-<q1>`, Q1's identifier lower-cased (e.g. `afk/queue-eng-45`). `afk queue` shows `running  Q1  /echo endpoint  (implement, working)`, then Q2 waiting at `1.`.
+- [ ] Within a few seconds Q1 is assigned to you in Linear, and a window `<q1>-echo-endpo` opens in `afk-queue`. In its shell pane `git branch --show-current` is Q1's branch name as Linear's "Copy git branch name" gives it, holding its identifier (e.g. `me/eng-45-echo-endpoint`). `afk queue` shows `running  Q1  /echo endpoint  (implement, working)`, then Q2 waiting at `1.`.
+- [ ] Once Q1's draft is open, rename Q1 in Linear and enqueue it again. Whether or not its "Copy git branch name" changed, the worker resumes on the branch Q1's first pass pushed, with an `AFK phase: resume` prompt naming its draft.
 - [ ] `afk dequeue <Q2, lower-cased>` takes Q2 off the queue: any case names it.
 - [ ] Once Q1's worker reports `done` with its draft open: Q1 has a comment in Linear linking the draft, and is still assigned to you. In Linear the draft is linked to Q1 by the GitHub integration, which has moved Q1 through the team's workflow as its settings say; none of Q1's state changes comes from afk, which would show in its history as yours, made through the API rather than attributed to the GitHub integration. `afk queue` lists `drafted  Q1  /echo endpoint  <draft URL>`.
 

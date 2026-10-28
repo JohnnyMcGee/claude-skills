@@ -841,6 +841,7 @@ class FakeLinear:
         return {
             "identifier": identifier, "title": issue["title"], "description": issue["description"] or None,
             "url": f"https://linear.app/acme/issue/{identifier}/{afk.slug(issue['title'])}",
+            "branchName": f"me/{identifier.lower()}-{afk.slug(issue['title'])}",
             "state": {"type": issue["state"]},
             "assignee": issue["assignee"] and {"displayName": issue["assignee"]},
             "inverseRelations": {"nodes": blockers + related},
@@ -1215,6 +1216,56 @@ class QueueTestCase(GithubTestCase):
         self.clone(self.repo, "git@github.com:acme/widgets.git")
         self.repo_config('default_type = "feature"\n\n[task_types.feature]\nmodel = "sonnet"\neffort = "medium"\n')
         self.issue(12, "Widget export")
+        self.linked = {}  # (issue's repo, number) -> [(branch's repo, name)], the branches GitHub links to an issue
+        self.run_fake.responses[("gh", "api", "graphql")] = self.linked_branches
+        self.run_fake.responses[("gh", "issue", "develop")] = self.develop
+        self.remotes = {}  # (clone, branch) -> its commits beyond base on the clone's origin
+        self.clones = {"acme/widgets": self.repo}  # where `gh issue develop`'s new branches show up on origin
+        self.on_origin(self.repo)
+
+    def on_origin(self, clone):
+        """Answer `git ls-remote` and `git rev-list --count` in clone from the branches pushed to its origin."""
+        def ls_remote(cmd):
+            branch = cmd[-1].removeprefix("refs/heads/")
+            return f"3f2a9c1\trefs/heads/{branch}\n" if (str(clone), branch) in self.remotes else ""
+        def ahead(cmd):
+            return f"{self.remotes[(str(clone), cmd[-1].partition('..origin/')[2])]}\n"
+        self.run_fake.responses[("git", "-C", str(clone), "ls-remote")] = ls_remote
+        self.run_fake.responses[("git", "-C", str(clone), "rev-list")] = ahead
+
+    def push(self, branch, ahead=2, clone=None):
+        """An earlier pass's branch on the clone's origin, ahead commits beyond base."""
+        self.remotes[(str(clone or self.repo), branch)] = ahead
+
+    def link(self, number, name, repo="acme/widgets", branch_repo=None):
+        """A branch linked to the issue, as `gh issue develop` links one, in its own repo or branch_repo, and so on its
+        origin, at base unless pushed already."""
+        branch_repo = branch_repo or repo
+        self.linked.setdefault((repo, number), []).append((branch_repo, name))
+        if branch_repo in self.clones:
+            self.remotes.setdefault((str(self.clones[branch_repo]), name), 0)
+
+    def linked_branches(self, cmd):
+        """GitHub's GraphQL answer for an issue's linked branches."""
+        fields = dict(cmd[i + 1].split("=", 1) for i, arg in enumerate(cmd) if arg in ("-f", "-F"))
+        links = self.linked.get((f"{fields['owner']}/{fields['name']}", int(fields["number"])), [])
+        gone = lambda repo, name: repo in self.clones and (str(self.clones[repo]), name) not in self.remotes
+        # A linked branch since deleted has no ref.
+        nodes = [{"ref": None if gone(repo, name) else {"name": name, "repository": {"nameWithOwner": repo}}}
+                 for repo, name in links]
+        return json.dumps({"data": {"repository": {"issue": {"linkedBranches": {"nodes": nodes}}}}})
+
+    def develop(self, cmd):
+        """`gh issue develop`: a branch made and linked to the issue, named as GitHub names it unless --name is given."""
+        option = lambda name: cmd[cmd.index(name) + 1] if name in cmd else None
+        repo, number = option("--repo"), int(cmd[3])
+        title = self.issues[self.key(repo, number)]["title"]
+        name, branch_repo = option("--name") or f"{number}-{re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')}", option("--branch-repo") or repo
+        if any((branch_repo, name) in links for links in self.linked.values()) and not (
+                branch_repo in self.clones and (str(self.clones[branch_repo]), name) not in self.remotes):
+            raise subprocess.CalledProcessError(1, cmd, stderr="Reference already exists")
+        self.link(number, name, repo, branch_repo)  # on the remote, at base
+        return f"github.com/{branch_repo}/tree/{name}\n"
 
     def queue_fails(self, *argv):
         out = io.StringIO()
@@ -1528,8 +1579,8 @@ class QueueTickTest(QueueTickTestCase):
                          [["gh", "issue", "edit", "12", "--repo", "acme/widgets", "--add-assignee", "@me"]])
         [add] = self.worktree_adds()
         self.assertEqual(add[2], str(self.repo))
-        self.assertEqual(add[5:7], ["-b", "afk/queue-12"])
-        self.assertEqual(add[-1], "main")
+        self.assertEqual(add[5:7], ["-b", "12-widget-export"])
+        self.assertEqual(add[-1], "origin/main")
         [window] = self.run_fake.find("tmux", "new-window")
         self.assertEqual(window[window.index("-t") + 1], "afk-queue:")
         [send] = self.run_fake.find("tmux", "send-keys")
@@ -1566,7 +1617,7 @@ class QueueTickTest(QueueTickTestCase):
 
         self.afk("queue", "tick")
 
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["12-widget-export", "13-widget-13"])
         slots = [next(arg for arg in shlex.split(send[4]) if arg.startswith("AFK_SLOT="))
                  for send in self.run_fake.find("tmux", "send-keys")]
         self.assertEqual(slots, ["AFK_SLOT=8", "AFK_SLOT=7"])
@@ -1591,7 +1642,7 @@ class QueuePickUpTest(QueueTickTestCase):
 
         output = self.afk("queue", "tick")
 
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["13-widget-13"])
         self.assertEqual(self.run_fake.find("gh", "issue", "edit", "12"), [])
         [notification] = self.desktop_notifications()
         self.assertIn("acme/widgets#12 removed from the queue: it was closed", notification)
@@ -1617,7 +1668,7 @@ class QueuePickUpTest(QueueTickTestCase):
 
         output = self.afk("queue", "tick")
 
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["13-widget-13"])
         self.assertEqual(self.desktop_notifications(), [])
         self.assertNotIn("\a", output)
         self.assertIn("1. acme/widgets#12  Widget export  (acme/widgets: type feature, agent claude, model sonnet, "
@@ -1630,7 +1681,7 @@ class QueuePickUpTest(QueueTickTestCase):
         self.issue(3, "Widget schema", state="closed")
         self.now += 60
         self.afk("queue", "tick")
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13", "afk/queue-12"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["13-widget-13", "12-widget-export"])
 
     def test_a_ticket_numbered_as_a_running_one_in_another_repo_waits_for_it_to_end(self):
         gadgets = self.clone(self.tmp / "gadgets", "git@github.com:acme/gadgets.git")
@@ -1645,7 +1696,7 @@ class QueuePickUpTest(QueueTickTestCase):
         self.afk("queue", "tick")
 
         self.assertEqual([(add[2], add[6]) for add in self.worktree_adds()],
-                         [(str(self.repo), "afk/queue-12"), (str(self.repo), "afk/queue-13")])
+                         [(str(self.repo), "12-widget-export"), (str(self.repo), "13-widget-13")])
         self.assertIn("1. acme/gadgets#12", self.afk("queue"))
 
     def test_a_ticket_gone_from_github_is_removed_with_a_notification_and_the_next_one_started(self):
@@ -1662,7 +1713,7 @@ class QueuePickUpTest(QueueTickTestCase):
 
         self.afk("queue", "tick")
 
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["13-widget-13"])
         self.assertIn("acme/widgets#12 removed from the queue: it was not found", self.desktop_notifications()[0])
         self.assertIn("removed  acme/widgets#12  Widget export  it was not found", self.afk("queue"))
 
@@ -1680,7 +1731,7 @@ class QueuePickUpTest(QueueTickTestCase):
 
         self.afk("queue", "tick")
 
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["13-widget-13"])
         self.assertIn("1. acme/widgets#12", self.afk("queue"))
         self.assertIn("couldn't check it: `gh api repos/acme/widgets/issues/99` failed", self.afk("queue"))
 
@@ -1689,18 +1740,32 @@ class QueuePickUpTest(QueueTickTestCase):
         # What a watcher killed mid-bootstrap leaves, as no rollback runs: the ticket running, a slot without a worker.
         queue = self.state_home / "afk" / ".queue"
         state = json.loads((queue / "queue.json").read_text())
-        state["tickets"][0].update(state="running", worker="12")
+        state["tickets"][0].update(state="running", worker="12", branch="12-widget-export")
         (queue / "queue.json").write_text(json.dumps(state))
         (queue / "workers" / "12").mkdir(parents=True)
         (queue / "workers" / "12" / "slot").write_text("8\n")
+        (queue / "worktrees" / "12").mkdir(parents=True)  # added, with its branch, before the bootstrap
 
         self.afk("queue", "tick")
 
         worktree = str(queue / "worktrees" / "12")
         self.assertIn(["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree], self.run_fake.calls)
-        self.assertIn(["git", "-C", str(self.repo), "branch", "-D", "afk/queue-12"], self.run_fake.calls)
+        self.assertIn(["git", "-C", str(self.repo), "branch", "-D", "12-widget-export"], self.run_fake.calls)
         self.assertIn("running  acme/widgets#12  Widget export  (implement, working)", self.afk("queue"))
         self.assertIn("AFK_SLOT=8", self.run_fake.find("tmux", "send-keys")[-1][4])
+
+    def test_a_start_killed_before_its_worktree_was_added_leaves_a_branch_of_that_name_alone(self):
+        self.enqueue(12)
+        queue = self.state_home / "afk" / ".queue"
+        state = json.loads((queue / "queue.json").read_text())
+        state["tickets"][0].update(state="running", worker="12", branch="12-widget-export")
+        (queue / "queue.json").write_text(json.dumps(state))
+
+        self.afk("queue", "tick")
+
+        # Not afk's to delete: the worktree that would have made it was never added, so it may be the engineer's.
+        self.assertNotIn(["git", "-C", str(self.repo), "branch", "-D", "12-widget-export"], self.run_fake.calls)
+        self.assertIn("running  acme/widgets#12", self.afk("queue"))
 
     def test_a_ticket_whose_worker_fails_to_start_keeps_its_place_says_why_and_is_retried_a_poll_later(self):
         def split_fails(cmd):
@@ -1711,7 +1776,7 @@ class QueuePickUpTest(QueueTickTestCase):
 
         output = self.afk("queue", "tick")
 
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])  # both tried
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["12-widget-export", "13-widget-13"])  # both tried
         self.assertIn("1. acme/widgets#12  Widget export", self.afk("queue"))
         self.assertIn("failed to start: `tmux split-window", self.afk("queue"))
         self.assertIn("no space for new pane", self.afk("queue"))
@@ -1733,9 +1798,13 @@ class QueueWorkerTestCase(QueueTickTestCase):
 
     def setUp(self):
         super().setUp()
+        self.before_pick_up()
         self.enqueue(12)
         self.afk("queue", "tick")
         self.calls_before = len(self.run_fake.calls)
+
+    def before_pick_up(self):
+        """Script what the tick that starts the worker finds."""
 
     def worker_env(self):
         return {"AFK_QUEUE": "1", "AFK_TICKET": "12"}
@@ -1846,11 +1915,22 @@ class QueueDraftTest(QueueWorkerTestCase):
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"),
                          [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
-                         [["git", "-C", str(self.repo), "branch", "-D", "afk/queue-12"]])
+                         [["git", "-C", str(self.repo), "branch", "-D", "12-widget-export"]])
         self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
         [notification] = self.desktop_notifications()
         self.assertIn(f"acme/widgets#12 draft PR opened: {self.DRAFT}", notification)
         self.assertNotIn("\a", output)
+
+    def test_a_worker_started_before_its_ticket_named_its_branch_is_ended_on_the_branch_afk_named(self):
+        path = self.state_home / "afk" / ".queue" / "workers" / "12" / "status.json"
+        status = json.loads(path.read_text())
+        del status["branch"]
+        path.write_text(json.dumps(status))
+
+        self.finish_phase("Draft open, CI green")
+
+        self.assertEqual(self.run_fake.find("gh", "pr", "view")[-1][3], "afk/queue-12")
+        self.assertIn(["git", "-C", str(self.repo), "branch", "-D", "afk/queue-12"], self.run_fake.calls)
 
     def test_afk_queue_shows_the_draft_among_recent_outcomes(self):
         self.finish_phase("Draft open, CI green")
@@ -1859,13 +1939,40 @@ class QueueDraftTest(QueueWorkerTestCase):
         self.assertIn(f"drafted  acme/widgets#12  Widget export  {self.DRAFT}", listing)
         self.assertNotIn("running", listing)
 
+    def test_enqueued_again_once_drafted_it_is_accepted_and_resumes_on_its_pushed_branch(self):
+        self.finish_phase("Draft open, CI green")
+        self.run_fake.responses[("git", "-C", str(self.repo), "ls-remote")] = "3f2a9c1\trefs/heads/12-widget-export\n"
+        self.run_fake.responses[("gh", "pr", "list")] = json.dumps([{"url": self.DRAFT}])
+        self.run_fake.responses[("git", "-C", str(self.repo), "rev-list")] = "4\n"
+
+        self.assertIn("enqueued acme/widgets#12 at position 1", self.afk("enqueue", self.URL))
+        self.afk("queue", "tick")
+
+        self.assertEqual([add[-1] for add in self.worktree_adds()], ["origin/main", "origin/12-widget-export"])
+        resume = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])[-1]
+        self.assertTrue(resume.startswith("AFK phase: resume"), resume)
+        self.assertIn(self.DRAFT, resume)
+
+    def test_enqueued_again_once_its_branch_is_deleted_it_starts_afresh_from_base(self):
+        self.finish_phase("Draft open, CI green")
+        del self.remotes[(str(self.repo), "12-widget-export")]
+
+        self.afk("enqueue", self.URL)
+        self.afk("queue", "tick")
+
+        # GitHub drops the deleted branch's link, so the ticket gets a new one, from base.
+        self.assertEqual(len(self.run_fake.find("gh", "issue", "develop")), 2)
+        self.assertEqual([add[-1] for add in self.worktree_adds()], ["origin/main", "origin/main"])
+        implement = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])[-1]
+        self.assertTrue(implement.startswith("AFK phase: implement"), implement)
+
     def test_the_next_waiting_ticket_starts_in_the_same_tick_on_the_freed_slot(self):
         self.enqueue(13)
         self.assertEqual(len(self.worktree_adds()), 1)
 
         self.finish_phase("Draft open, CI green")
 
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["12-widget-export", "13-widget-13"])
         launch = shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])
         self.assertIn("AFK_SLOT=8", launch)
 
@@ -1917,7 +2024,7 @@ class QueueDraftTest(QueueWorkerTestCase):
         self.afk("queue", "tick")
 
         self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["12-widget-export", "13-widget-13"])
         return self.afk("queue")
 
     def test_a_pr_the_engineer_merges_mid_draft_ends_the_ticket_and_the_next_one_starts(self):
@@ -1966,7 +2073,7 @@ class QueueDraftTest(QueueWorkerTestCase):
 
         self.assertEqual(self.run_fake.find("gh", "issue", "comment"), [])
         self.assertIn(f"drafted  acme/widgets#12  Widget export  {self.DRAFT}", self.afk("queue"))
-        self.assertEqual(self.worktree_adds()[-1][6], "afk/queue-13")
+        self.assertEqual(self.worktree_adds()[-1][6], "13-widget-13")
 
     def test_a_cleanup_cut_short_once_the_ticket_ended_finishes_on_the_next_tick(self):
         self.enqueue(13)
@@ -1988,7 +2095,7 @@ class QueueDraftTest(QueueWorkerTestCase):
         self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
         self.assertEqual(len(self.run_fake.find("gh", "issue", "comment")), 1)
         self.assertEqual(len(self.desktop_notifications()), 1)
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["12-widget-export", "13-widget-13"])
 
     def test_a_comment_that_fails_is_posted_on_the_next_tick_before_anything_is_cleaned_up(self):
         def comment_fails(cmd):
@@ -2167,7 +2274,7 @@ class QueueWrapUpTest(QueueWorkerTestCase):
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"),
                          [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
-                         [["git", "-C", str(self.repo), "branch", "-D", "afk/queue-12"]])
+                         [["git", "-C", str(self.repo), "branch", "-D", "12-widget-export"]])
         [comment] = self.run_fake.find("gh", "issue", "comment")
         self.assertEqual(comment[3:6], ["12", "--repo", "acme/widgets"])
         self.assertIn("over 5m in implement", comment[comment.index("--body") + 1])
@@ -2177,7 +2284,7 @@ class QueueWrapUpTest(QueueWorkerTestCase):
         self.assertIn("acme/widgets#12 abandoned", notification)
         self.assertIn("\a", output)
         self.assertRegex(self.afk("queue"), r"abandoned  acme/widgets#12  Widget export  .*over 5m in implement")
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["12-widget-export", "13-widget-13"])
 
     def test_a_worker_that_reports_done_within_the_grace_period_ends_as_drafted_though_its_draft_is_found_after(self):
         self.limits(phase_minutes=5, wrap_up_minutes=10)
@@ -2227,13 +2334,13 @@ class QueueAbandonTest(QueueWorkerTestCase):
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "worktree", "remove"),
                          [["git", "-C", str(self.repo), "worktree", "remove", "--force", worktree]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
-                         [["git", "-C", str(self.repo), "branch", "-D", "afk/queue-12"]])
+                         [["git", "-C", str(self.repo), "branch", "-D", "12-widget-export"]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "push"), [])
         [comment] = self.run_fake.find("gh", "issue", "comment")
         self.assertIn("afk dequeue --abandon", comment[comment.index("--body") + 1])
         self.assertRegex(self.afk("queue"), r"abandoned  acme/widgets#12  Widget export  .*afk dequeue --abandon")
         self.afk("queue", "tick")
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["12-widget-export", "13-widget-13"])
 
     def test_an_abandon_whose_cleanup_fails_partway_is_finished_by_the_next_tick(self):
         removes = []
@@ -2252,7 +2359,12 @@ class QueueAbandonTest(QueueWorkerTestCase):
 
         self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
         self.assertEqual(len(self.run_fake.find("gh", "issue", "comment")), 1)
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["12-widget-export", "13-widget-13"])
+
+    def test_an_abandoned_ticket_can_be_enqueued_again(self):
+        self.afk("dequeue", self.URL, "--abandon")
+
+        self.assertIn("enqueued acme/widgets#12 at position 1", self.afk("enqueue", self.URL))
 
     def test_abandon_on_a_waiting_ticket_just_takes_it_off_the_queue(self):
         self.enqueue(13)
@@ -2262,6 +2374,188 @@ class QueueAbandonTest(QueueWorkerTestCase):
 
     def test_an_unknown_option_fails_with_usage(self):
         self.assertIn("usage: afk dequeue", self.queue_fails("dequeue", "acme/widgets#12", "--force"))
+
+
+class QueueBranchTest(QueueTickTestCase):
+    """A queue ticket's branch is the one its tracker links to it, so a later pass finds it whatever it's named."""
+
+    def gadgets(self):
+        gadgets = self.clone(self.tmp / "gadgets", "git@github.com:acme/gadgets.git")
+        (gadgets / "docs" / "agents").mkdir(parents=True)
+        (gadgets / "docs" / "agents" / "afk.md").write_text('+++\nbase = "develop"\n+++\n\n# AFK\n')
+        self.clones["acme/gadgets"] = gadgets
+        self.on_origin(gadgets)
+        return gadgets
+
+    def test_a_ticket_picked_up_for_the_first_time_gets_a_branch_github_names_and_links_to_it(self):
+        self.enqueue(12)
+
+        self.afk("queue", "tick")
+
+        [develop] = self.run_fake.find("gh", "issue", "develop")
+        self.assertEqual(develop, ["gh", "issue", "develop", "12", "--repo", "acme/widgets", "--base", "main"])
+        # In the clone, where gh records the branch's base for `gh pr create`, which fails outside a checkout.
+        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(develop)], str(self.repo))
+        [add] = self.worktree_adds()
+        self.assertEqual(add[5:7], ["-b", "12-widget-export"])
+        # From base as GitHub made the branch, so the worker's first push is a fast-forward of it.
+        self.assertEqual(add[-1], "origin/main")
+        self.assertTrue(shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])[-1].startswith("AFK phase: implement"))
+
+    def test_a_branch_the_engineer_linked_to_the_ticket_is_the_one_its_worker_takes(self):
+        self.link(12, "export-spike")
+        self.enqueue(12)
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.run_fake.find("gh", "issue", "develop"), [])
+        self.assertEqual(self.worktree_adds()[0][5:7], ["-b", "export-spike"])
+
+    def test_a_branch_linked_to_a_ticket_in_another_repo_is_never_taken_though_their_numbers_match(self):
+        gadgets = self.gadgets()
+        self.issue(12, "Gadget export", repo="acme/gadgets")
+        # acme/widgets#12's branch in acme/gadgets, from a pass on it that spanned both repos.
+        self.link(12, "12-widget-export", branch_repo="acme/gadgets")
+        self.push("12-widget-export", clone=gadgets)
+        self.run_fake.responses[("gh", "pr", "list")] = json.dumps([{"url": "https://github.com/acme/gadgets/pull/3"}])
+        self.afk("enqueue", "https://github.com/acme/gadgets/issues/12")
+
+        self.afk("queue", "tick")
+
+        [add] = self.worktree_adds()
+        self.assertEqual((add[2], add[6], add[-1]), (str(gadgets), "12-gadget-export", "origin/develop"))
+        self.assertTrue(shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])[-1].startswith("AFK phase: implement"))
+
+    def test_a_linked_branch_with_nothing_pushed_beyond_base_starts_afresh_from_base(self):
+        self.link(12, "12-widget-export")
+        self.push("12-widget-export", ahead=0)
+        self.enqueue(12)
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.worktree_adds()[0][-1], "origin/main")
+        self.assertTrue(shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])[-1].startswith("AFK phase: implement"))
+
+    def test_a_branch_github_fails_to_make_keeps_the_ticket_in_its_place_saying_why(self):
+        self.link(99, "12-widget-export")  # the name GitHub suggests is another issue's branch
+        self.enqueue(12)
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.worktree_adds(), [])
+        listing = self.afk("queue")
+        self.assertIn("1. acme/widgets#12", listing)
+        self.assertIn("Reference already exists", listing)
+
+
+class QueueResumeTest(QueueWorkerTestCase):
+    """acme/widgets#12 enqueued again and picked up once an earlier pass pushed its branch, 12-widget-export, and opened
+    its draft a day before."""
+
+    DRAFT = "https://github.com/acme/widgets/pull/7"
+
+    def before_pick_up(self):
+        self.link(12, "12-widget-export")
+        self.run_fake.responses[("git", "-C", str(self.repo), "ls-remote")] = "3f2a9c1\trefs/heads/12-widget-export\n"
+        self.run_fake.responses[("git", "-C", str(self.repo), "rev-list")] = "2\n"  # commits beyond main
+        self.run_fake.responses[("gh", "pr", "list")] = json.dumps([{"url": self.DRAFT}])
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("OPEN", url=self.DRAFT, created=self.now - 86400)
+
+    def launch_prompt(self):
+        [send] = self.run_fake.find("tmux", "send-keys")
+        return shlex.split(send[4])[-1]
+
+    def test_the_worker_starts_on_the_pushed_branch_told_to_address_the_feedback_on_its_draft(self):
+        fetches = self.run_fake.find("git", "-C", str(self.repo), "fetch")
+        self.assertEqual(fetches, [["git", "-C", str(self.repo), "fetch", "origin",
+                                    "+refs/heads/12-widget-export:refs/remotes/origin/12-widget-export",
+                                    "+refs/heads/main:refs/remotes/origin/main"]])
+        self.assertEqual(self.run_fake.find("gh", "issue", "develop"), [])  # its branch is linked already
+        [add] = self.worktree_adds()
+        self.assertEqual(add[5:7], ["-b", "12-widget-export"])
+        self.assertEqual(add[-1], "origin/12-widget-export")
+        prompt = self.launch_prompt()
+        self.assertTrue(prompt.startswith("AFK phase: resume"), prompt)
+        self.assertIn(self.DRAFT, prompt)
+        self.assertIn(self.URL, prompt)
+        self.assertNotIn("{{", prompt)
+
+    def test_its_earlier_draft_still_open_once_it_is_done_ends_the_ticket_as_drafted_again(self):
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"  # its shell pane is idle
+        for _ in range(4):
+            self.finish_phase()
+        self.now += 60
+
+        self.finish_phase("Feedback addressed, questions refreshed")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        self.assertIn(self.DRAFT, comment[comment.index("--body") + 1])
+        self.assertIn(f"drafted  acme/widgets#12  Widget export  {self.DRAFT}", self.afk("queue"))
+        self.assertIn(f"acme/widgets#12 draft PR updated: {self.DRAFT}", self.desktop_notifications()[-1])
+
+    def test_the_comment_on_the_ticket_says_its_draft_was_updated_not_opened(self):
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"  # its shell pane is idle
+        for _ in range(5):
+            self.finish_phase()
+
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        self.assertEqual(comment[comment.index("--body") + 1], f"afk updated its draft PR for this ticket: {self.DRAFT}")
+
+
+class QueueResumeWithoutDraftTest(QueueResumeTest):
+    """acme/widgets#12 picked up again once an earlier pass pushed its branch, its draft since closed by the engineer."""
+
+    def before_pick_up(self):
+        super().before_pick_up()
+        self.run_fake.responses[("gh", "pr", "list")] = "[]"
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("CLOSED", url=self.DRAFT, created=self.now - 86400)
+
+    def test_the_worker_starts_on_the_pushed_branch_with_no_draft_to_name(self):
+        [add] = self.worktree_adds()
+        self.assertEqual(add[-1], "origin/12-widget-export")
+        prompt = self.launch_prompt()
+        self.assertTrue(prompt.startswith("AFK phase: resume"), prompt)
+        self.assertNotIn(self.DRAFT, prompt)
+        self.assertNotIn("{{", prompt)
+
+    def test_the_closed_draft_is_none_of_its_own_so_it_ends_once_it_opens_a_new_one(self):
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"  # its shell pane is idle
+        for _ in range(5):
+            self.finish_phase()
+        self.assertEqual(self.status()["message"], afk.NO_PR)  # neither ended as closed nor taken as its draft
+        new = "https://github.com/acme/widgets/pull/8"
+        self.run_fake.responses[("gh", "pr", "view")] = pr_view("OPEN", url=new)
+        self.now += 60
+
+        self.afk("queue", "tick")
+
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        self.assertEqual(comment[comment.index("--body") + 1], f"afk opened a draft PR for this ticket: {new}")
+
+    test_its_earlier_draft_still_open_once_it_is_done_ends_the_ticket_as_drafted_again = None
+    test_the_comment_on_the_ticket_says_its_draft_was_updated_not_opened = None
+    test_the_worker_starts_on_the_pushed_branch_told_to_address_the_feedback_on_its_draft = None
+
+
+class QueueResumeFailureTest(QueueTickTestCase):
+    def test_a_ticket_whose_branch_cannot_be_looked_up_keeps_its_place_and_is_tried_again_a_poll_later(self):
+        def unreachable(cmd):
+            raise subprocess.CalledProcessError(128, cmd, stderr="fatal: Could not read from remote repository.")
+
+        self.link(12, "12-widget-export")
+        self.run_fake.responses[("git", "-C", str(self.repo), "ls-remote")] = unreachable
+        self.enqueue(12)
+
+        self.afk("queue", "tick")
+
+        self.assertEqual(self.worktree_adds(), [])
+        self.assertIn("1. acme/widgets#12", self.afk("queue"))
+        self.assertIn("Could not read from remote repository", self.afk("queue"))
+        self.run_fake.responses[("git", "-C", str(self.repo), "ls-remote")] = ""
+        self.now += 60
+        self.afk("queue", "tick")
+        self.assertEqual([add[-1] for add in self.worktree_adds()], ["main"])
 
 
 class QueueAndProjectsTest(QueueWorkerTestCase):
@@ -2277,7 +2571,7 @@ class QueueAndProjectsTest(QueueWorkerTestCase):
         (self.state_home / "afk" / ".queue" / "config.toml").write_text("[queue]\nmax_workers = 2\n")
         self.afk("queue", "tick")
 
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-12", "afk/widgets-03", "afk/queue-13"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["12-widget-export", "afk/widgets-03", "13-widget-13"])
 
     def test_enqueueing_the_running_ticket_is_refused(self):
         output = self.queue_fails("enqueue", self.URL)
@@ -2322,7 +2616,7 @@ class QueueWatchTest(QueueTickTestCase):
 class QueueWorkerRestrictionTest(QueueWorkerTestCase):
 
     def test_a_queue_worker_keeps_a_pr_mode_workers_deny_list(self):
-        for command in ["git push --force origin afk/queue-12", "git push origin main", "gh pr merge 7 --squash",
+        for command in ["git push --force origin 12-widget-export", "git push origin main", "gh pr merge 7 --squash",
                         "git worktree remove ../other", "afk drop 12 --discard"]:
             self.assertTrue(self.denied(command), command)
 
@@ -2364,6 +2658,8 @@ class QueueWorktreeTestCase(QueueWorkerTestCase):
     def setUp(self):
         super().setUp()
         self.gadgets = self.clone(self.tmp / "gadgets", "git@github.com:acme/gadgets.git")
+        self.clones["acme/gadgets"] = self.gadgets
+        self.on_origin(self.gadgets)
         (self.gadgets / ".env").write_text("SECRET=1\n")
         config = self.gadgets / "docs" / "agents" / "afk.md"
         config.parent.mkdir(parents=True)
@@ -2379,13 +2675,33 @@ class QueueWorktreeTest(QueueWorktreeTestCase):
     def test_afk_worktree_adds_a_worktree_on_the_workers_branch_in_the_other_repos_clone_prepared_for_its_slot(self):
         output = self.afk("worktree", "acme/gadgets", env=self.worker_env())
 
-        self.assertIn(["git", "-C", str(self.gadgets), "worktree", "add", "-b", "afk/queue-12", str(self.sibling), "develop"],
+        self.assertIn(["git", "-C", str(self.gadgets), "worktree", "add", "-b", "12-widget-export", str(self.sibling), "origin/develop"],
                       self.run_fake.calls)
         self.assertEqual((self.sibling / ".env").read_text(), "SECRET=1\n")
         [bootstrap] = self.run_fake.find("env", "AFK_SLOT=8")
         self.assertEqual(bootstrap, ["env", "AFK_SLOT=8", "AFK_PORT_BASE=5800", "sh", "-c", "npm ci"])
         self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(bootstrap)], str(self.sibling))
         self.assertIn(str(self.sibling), output)
+
+    def test_the_branch_in_the_other_repo_is_made_and_linked_to_the_ticket_under_the_workers_branch_name(self):
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+
+        develop = self.run_fake.find("gh", "issue", "develop")[-1]
+        self.assertEqual(develop, ["gh", "issue", "develop", "12", "--repo", "acme/widgets", "--base", "develop",
+                                   "--branch-repo", "acme/gadgets", "--name", "12-widget-export"])
+        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(develop)], str(self.gadgets))
+
+    def test_a_branch_of_that_name_in_the_other_repo_that_is_another_tickets_is_refused_adding_no_worktree(self):
+        self.link(7, "12-widget-export", branch_repo="acme/gadgets")
+
+        out = io.StringIO()
+        code = afk.main(["worktree", "acme/gadgets"], run=self.run_fake, env={**self.env, **self.worker_env()},
+                        stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Reference already exists", out.getvalue())
+        self.assertFalse(self.sibling.exists())
+        self.assertEqual([c for c in self.worktree_adds() if c[2] == str(self.gadgets)], [])
 
     def test_it_prints_the_slot_env_the_other_repos_dev_server_runs_with(self):
         output = self.afk("worktree", "acme/gadgets", env=self.worker_env())
@@ -2398,7 +2714,7 @@ class QueueWorktreeTest(QueueWorktreeTestCase):
         self.afk("worktree", "acme/gadgets", env=self.worker_env())
 
         for command in ["git push origin develop", "git push origin HEAD:develop", "git push origin main",
-                        "git push --force origin afk/queue-12", "gh pr ready 3"]:
+                        "git push --force origin 12-widget-export", "gh pr ready 3"]:
             self.assertTrue(self.denied(command), command)
         self.assertFalse(self.denied("git push -u origin HEAD"))
 
@@ -2415,7 +2731,7 @@ class QueueWorktreeTest(QueueWorktreeTestCase):
         self.assertEqual(code, 1)
         self.assertIn("cleaned up", out.getvalue())
         self.assertFalse(self.sibling.exists())
-        self.assertIn(["git", "-C", str(self.gadgets), "branch", "-D", "afk/queue-12"], self.run_fake.calls)
+        self.assertIn(["git", "-C", str(self.gadgets), "branch", "-D", "12-widget-export"], self.run_fake.calls)
 
     def gadgets_adds(self):
         return [add for add in self.worktree_adds() if add[2] == str(self.gadgets)]
@@ -2441,7 +2757,7 @@ class QueueWorktreeTest(QueueWorktreeTestCase):
         self.assertEqual(code, 1)
         self.assertIn("npm ERR! network", out.getvalue())
         self.assertFalse(self.sibling.exists())
-        self.assertIn(["git", "-C", str(self.gadgets), "branch", "-D", "afk/queue-12"], self.run_fake.calls)
+        self.assertIn(["git", "-C", str(self.gadgets), "branch", "-D", "12-widget-export"], self.run_fake.calls)
         del self.run_fake.responses[("env", "AFK_SLOT=8")]
         self.afk("worktree", "acme/gadgets", env=self.worker_env())
         self.assertEqual(len(self.gadgets_adds()), 2)
@@ -2459,7 +2775,7 @@ class QueueWorktreeTest(QueueWorktreeTestCase):
         for prompt in prompts:
             self.assertIn(f"`acme/widgets` (base `main`, `AFK_PORT_BASE=4800`): {own}", prompt)
             self.assertIn(f"`acme/gadgets` (base `develop`, `AFK_PORT_BASE=5800`): {self.sibling}", prompt)
-            self.assertIn("afk/queue-12", prompt)
+            self.assertIn("12-widget-export", prompt)
             self.assertNotIn("{{", prompt)
 
     def test_the_worker_may_edit_inside_its_worktree_in_the_other_repo_but_still_nowhere_else(self):
@@ -2480,7 +2796,7 @@ class QueueWorktreeTest(QueueWorktreeTestCase):
         self.assertEqual(self.run_fake.find("git", "-C", str(self.gadgets), "worktree", "remove"),
                          [["git", "-C", str(self.gadgets), "worktree", "remove", "--force", str(self.sibling)]])
         self.assertEqual(self.run_fake.find("git", "-C", str(self.gadgets), "branch", "-D"),
-                         [["git", "-C", str(self.gadgets), "branch", "-D", "afk/queue-12"]])
+                         [["git", "-C", str(self.gadgets), "branch", "-D", "12-widget-export"]])
         self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
 
     def test_the_critique_prompt_gives_each_other_repos_reviewers_over_the_diff_against_its_own_base(self):
@@ -2526,7 +2842,7 @@ class QueueSiblingDraftTest(QueueWorktreeTestCase):
             self.assertEqual(self.run_fake.find("git", "-C", str(clone), "worktree", "remove"),
                              [["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)]])
             self.assertEqual(self.run_fake.find("git", "-C", str(clone), "branch", "-D"),
-                             [["git", "-C", str(clone), "branch", "-D", "afk/queue-12"]])
+                             [["git", "-C", str(clone), "branch", "-D", "12-widget-export"]])
         self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
 
     def test_the_ticket_comment_the_outcome_and_the_notification_link_the_draft_in_every_repo(self):
@@ -2561,7 +2877,7 @@ class QueueSiblingDraftTest(QueueWorktreeTestCase):
         def branch_gone_once_deleted(cmd):
             deletes.append(cmd)
             if len(deletes) > 1:
-                raise subprocess.CalledProcessError(1, cmd, stderr="error: branch 'afk/queue-12' not found.")
+                raise subprocess.CalledProcessError(1, cmd, stderr="error: branch '12-widget-export' not found.")
             return ""
 
         self.run_fake.responses[("git", "-C", str(self.gadgets), "worktree", "remove")] = sibling_remove_fails_once
@@ -2606,6 +2922,47 @@ class QueueSiblingDraftTest(QueueWorktreeTestCase):
     def test_uncommitted_changes_in_the_other_repos_worktree_leave_it_cleanup_pending(self):
         self.assertEqual(self.held_back_by_the_other_repo("status", " M gadget.py\n"),
                          "its acme/gadgets worktree has uncommitted changes")
+
+
+class QueueSiblingResumeTest(QueueWorktreeTestCase):
+    """acme/widgets#12's queue worker running `afk worktree acme/gadgets` on a second pass, once an earlier pass pushed
+    12-widget-export to acme/gadgets and opened its draft there a day before."""
+
+    DRAFT = "https://github.com/acme/gadgets/pull/3"
+
+    def setUp(self):
+        super().setUp()
+        self.link(12, "12-widget-export", branch_repo="acme/gadgets")
+        self.run_fake.responses[("git", "-C", str(self.gadgets), "ls-remote")] = "9b1e4d2\trefs/heads/12-widget-export\n"
+        self.run_fake.responses[("git", "-C", str(self.gadgets), "rev-list")] = "1\n"  # commits beyond develop
+        self.run_fake.responses[("gh", "pr", "list")] = json.dumps([{"url": self.DRAFT}])
+
+    def test_the_worktree_starts_on_the_branch_as_last_pushed_to_that_repo(self):
+        output = self.afk("worktree", "acme/gadgets", env=self.worker_env())
+
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.gadgets), "fetch"),
+                         [["git", "-C", str(self.gadgets), "fetch", "origin",
+                           "+refs/heads/12-widget-export:refs/remotes/origin/12-widget-export",
+                           "+refs/heads/develop:refs/remotes/origin/develop"]])
+        self.assertIn(["git", "-C", str(self.gadgets), "worktree", "add", "-b", "12-widget-export", str(self.sibling),
+                       "origin/12-widget-export"], self.run_fake.calls)
+        self.assertIn(self.DRAFT, output)
+
+    def test_its_earlier_draft_there_is_linked_when_the_ticket_ends_drafted(self):
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"  # its shell pane is idle
+        for _ in range(4):
+            self.finish_phase()
+        widgets = "https://github.com/acme/widgets/pull/7"
+        self.run_fake.responses[("gh", "pr", "view")] = lambda cmd: (
+            pr_view("OPEN", url=self.DRAFT, created=self.now - 86400) if self.run_fake.cwds[-1] == str(self.gadgets)
+            else pr_view("OPEN", url=widgets))
+        self.now += 60
+
+        self.finish_phase("Drafts open, CI green")
+
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        self.assertIn(f"{widgets}, {self.DRAFT}", comment[comment.index("--body") + 1])
 
 
 class QueueWorktreeRefusalTest(QueueWorktreeTestCase):
@@ -2658,20 +3015,33 @@ class LinearEnqueueTest(LinearQueueTestCase):
 class LinearQueueTickTest(LinearQueueTestCase):
     CLAIM = ["linear", "issue", "update", "ENG-123", "--assignee", "@me", "--no-input"]
 
-    def test_a_tick_claims_a_linear_ticket_on_a_branch_named_by_its_lower_cased_identifier(self):
+    def test_a_tick_claims_a_linear_ticket_on_the_branch_linear_names_for_it(self):
         self.afk("enqueue", self.URL)
 
         self.afk("queue", "tick")
 
         self.assertEqual(self.run_fake.find("linear", "issue", "update"), [self.CLAIM])
         [add] = self.worktree_adds()
-        self.assertEqual(add[5:7], ["-b", "afk/queue-eng-123"])
+        self.assertEqual(add[5:7], ["-b", "me/eng-123-widget-export"])
         self.assertEqual(add[2], str(self.repo))
         [send] = self.run_fake.find("tmux", "send-keys")
         launch = shlex.split(send[4])
         self.assertIn("AFK_TICKET=eng-123", launch)
         self.assertIn(self.URL, launch[-1])
         self.assertTrue(self.afk("queue").startswith("running  ENG-123  Widget export  (implement, working)"))
+
+    def test_a_linear_ticket_enqueued_again_resumes_on_its_branch_as_pushed(self):
+        self.run_fake.responses[("git", "-C", str(self.repo), "ls-remote")] = "3f2a9c1\trefs/heads/me/eng-123-widget-export\n"
+        self.run_fake.responses[("git", "-C", str(self.repo), "rev-list")] = "2\n"
+        self.run_fake.responses[("gh", "pr", "list")] = json.dumps([{"url": "https://github.com/acme/widgets/pull/7"}])
+        self.afk("enqueue", self.URL)
+
+        self.afk("queue", "tick")
+
+        [add] = self.worktree_adds()
+        self.assertEqual(add[5:7], ["-b", "me/eng-123-widget-export"])
+        self.assertEqual(add[-1], "origin/me/eng-123-widget-export")
+        self.assertTrue(shlex.split(self.run_fake.find("tmux", "send-keys")[-1][4])[-1].startswith("AFK phase: resume"))
 
     def test_a_ticket_ended_while_it_waited_is_removed_with_a_notification(self):
         self.afk("enqueue", self.URL)
@@ -2707,7 +3077,7 @@ class LinearQueueTickTest(LinearQueueTestCase):
         self.linear.issues["ENG-100"]["state"] = "completed"
         self.now += 60
         self.afk("queue", "tick")
-        self.assertEqual([add[6] for add in self.worktree_adds()], ["afk/queue-eng-123"])
+        self.assertEqual([add[6] for add in self.worktree_adds()], ["me/eng-123-widget-export"])
 
 
 class LinearQueueDraftTest(LinearQueueTestCase):
@@ -2743,10 +3113,23 @@ class LinearQueueDraftTest(LinearQueueTestCase):
         self.assertEqual(comment[:5], ["linear", "issue", "comment", "add", "ENG-123"])
         self.assertIn(self.DRAFT, comment[comment.index("--body") + 1])
         self.assertEqual(self.updates(), [])
-        self.assertEqual(self.run_fake.find("gh", "pr", "view")[-1][3], "afk/queue-eng-123")
+        self.assertEqual(self.run_fake.find("gh", "pr", "view")[-1][3], "me/eng-123-widget-export")
         self.assertEqual(self.run_fake.find("git", "-C", str(self.repo), "branch", "-D"),
-                         [["git", "-C", str(self.repo), "branch", "-D", "afk/queue-eng-123"]])
+                         [["git", "-C", str(self.repo), "branch", "-D", "me/eng-123-widget-export"]])
         self.assertIn(f"drafted  ENG-123  Widget export  {self.DRAFT}", self.afk("queue"))
+
+    def test_renamed_before_it_is_enqueued_again_it_resumes_on_the_branch_its_last_pass_pushed(self):
+        self.finish_phase("Draft open, CI green")
+        self.linear.issues["ENG-123"]["title"] = "Widget export as CSV"  # its branchName now says so
+        self.push("me/eng-123-widget-export")
+        self.run_fake.responses[("gh", "pr", "list")] = json.dumps([{"url": self.DRAFT}])
+
+        self.afk("enqueue", self.URL)
+        self.afk("queue", "tick")
+
+        add = self.worktree_adds()[-1]
+        self.assertEqual(add[5:7], ["-b", "me/eng-123-widget-export"])
+        self.assertEqual(add[-1], "origin/me/eng-123-widget-export")
 
     def test_a_pr_the_engineer_merges_mid_draft_leaves_the_issues_workflow_state_to_linear(self):
         self.run_fake.responses[("gh", "pr", "view")] = pr_view("MERGED", url=self.DRAFT)

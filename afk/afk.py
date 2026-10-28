@@ -226,11 +226,15 @@ class Afk:
         worktree, branch = self.launch_worker(owner, ticket, repo, clone, repo_config, choices, phase, state, mode, target)
         self.out(f"started {ticket.id} in {worktree} on {branch}")
 
-    def launch_worker(self, owner, ticket, repo, clone, repo_config, choices, phase, state, mode, target):
+    def launch_worker(self, owner, ticket, repo, clone, repo_config, choices, phase, state, mode, target, start=None,
+                      drafts=None, branch=None):
         """Start the owner's worker on a ticket in the given phase and state: claim a slot and the ticket, branch a
-        worktree off the target and prepare it, open the worker's window and launch its agent there. Returns the
-        worktree and branch."""
-        worktree, worker_dir, branch = owner.worktree(ticket.id), owner.workers / ticket.id, owner.branch(ticket.id)
+        worktree off the target, or off start if given, and prepare it, open the worker's window and launch its agent
+        there. Returns the worktree and branch, the owner's for the ticket unless given.
+
+        drafts, for a queue worker resuming on a branch an earlier pass pushed, are its open PRs' URLs: its first prompt
+        is then to address the feedback on them, and they count as its own though opened before it started."""
+        worktree, worker_dir, branch = owner.worktree(ticket.id), owner.workers / ticket.id, branch or owner.branch(ticket.id)
         base = repo_config.get("base", "main")
         task_type = repo_config.get("task_types", {}).get(choices["type"], {})
         slot = self.claim_worker(owner, worker_dir, counted=phase != "hitl")
@@ -239,7 +243,7 @@ class Afk:
         try:
             owner.tracker.claim(ticket)
             undo.append(lambda: owner.tracker.release(ticket))
-            self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), target])
+            self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), start or target])
             undo.append(lambda: self.run(["git", "-C", str(clone), "branch", "-D", branch]))
             undo.append(lambda: self.run(["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)]))
             self.prepare_worktree(clone, worktree, repo_config, slot_env)
@@ -257,14 +261,16 @@ class Afk:
                 "env", *owner.env, f"AFK_TICKET={ticket.id}", *slot_env,
                 "claude", "--permission-mode", "auto", "--settings", str(settings),
                 *[arg for key in ("model", "effort") if choices[key] for arg in (f"--{key}", choices[key])],
-                self.first_prompt(owner, ticket, phase, task_type, clone, mode, target),
+                self.first_prompt(owner, ticket, phase if drafts is None else "resume", task_type, clone, mode, target,
+                                  drafts, branch),
             ]
             write_json(
                 worker_dir / "status.json",
                 {"ticket": ticket.id, "title": ticket.title, "phase": phase, "state": state, "message": "",
-                 "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "repo": repo,
+                 "pane": pane, "shell_pane": shell, "window": window_name(ticket), "slot": slot, "repo": repo, "branch": branch,
                  "clone": str(clone), **choices,
-                 "landing": mode, "target": target, "started_at": self.clock(), "phase_started_at": self.clock()},
+                 "landing": mode, "target": target, "started_at": self.clock(), "phase_started_at": self.clock(),
+                 **({} if drafts is None else {"resumed_prs": drafts})},
             )
             self.run(["tmux", "send-keys", "-t", pane, shlex.join(launch), "Enter"])
         except BaseException:
@@ -828,7 +834,8 @@ class Afk:
             status = read_json(owner.workers / ticket_id / "status.json")
             prompt = self.phase_prompt(owner, ticket_id, phase, owner.worker_clone(status), status.get("landing", "pr"),
                                        status.get("target"), reason=reason[0] if reason else None,
-                                       worktrees=owner.worker_worktrees(status), slot=status.get("slot"))
+                                       worktrees=owner.worker_worktrees(status), slot=status.get("slot"),
+                                       branch=owner.worker_branch(status))
             self.send_prompt(ticket_id, pane, prompt)
         elif kind == "window":
             # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
@@ -901,7 +908,7 @@ class Afk:
         if owner.on_end:
             owner.on_end(owner, status, ended)  # after the tracker's steps, as the queue's tracker finds only running tickets
         self.best_effort(["tmux", "kill-window", "-t", pane])
-        branch = owner.branch(ticket_id)
+        branch = owner.worker_branch(status)
         for _, repo, worktree in owner.worker_worktrees(status):
             repo = str(repo)
             if worktree.exists():
@@ -931,15 +938,19 @@ class Afk:
         except (OSError, subprocess.CalledProcessError):
             pass
 
-    def phase_prompt(self, owner, ticket_id, phase, clone, landing="pr", target=None, reason=None, worktrees=(), slot=None):
+    def phase_prompt(self, owner, ticket_id, phase, clone, landing="pr", target=None, reason=None, worktrees=(), slot=None,
+                     drafts=(), branch=None):
         """The phase's prompt for the worker's landing mode: phase-<phase>-<landing>.md where the mode has its own.
 
-        reason is the limit a wrapping-up queue worker went over. worktrees are the worker's, as worker_worktrees gives
-        them, each named in the prompt with its base and its port base on the worker's slot when its ticket spans repos.
+        reason is the limit a wrapping-up queue worker went over. drafts are a resuming queue worker's open PRs, on
+        branch, by default the owner's for the ticket.
+        worktrees are the worker's, as worker_worktrees gives them, each named in the prompt with its base and its port
+        base on the worker's slot when its ticket spans repos.
         """
         ticket = owner.tracker.get(ticket_id)
         repo_config = owner.repo_config(clone)
         base = repo_config.get("base", "main")
+        branch = branch or owner.branch(ticket_id)
         target = target or base
         if phase == "critique" and landing == "pr":
             # A PR's critique, the queue's, is of what the PR will show: prepr merged its base from origin.
@@ -954,6 +965,9 @@ class Afk:
             reviewers=reviewer_list(repo_config.get("reviewers", []), target),
             ci_rounds=owner.limits.get("ci_rounds"),
             reason=reason,
+            branch=branch,
+            drafts=(f"draft PR{'s' * (len(drafts) > 1)} {', '.join(drafts)}" if drafts
+                    else "no open draft PR: the last pass ended before opening one, or the engineer closed it"),
             grace=owner.limits.get("wrap_up_minutes"),
         )
         if len(worktrees) > 1:
@@ -965,13 +979,13 @@ class Afk:
             others = "".join(f"\n\n`{repo}`'s reviewers:\n\n" + reviewer_list(config.get("reviewers", []),
                                                                              f"origin/{config.get('base', 'main')}")
                              for repo, config, _ in configs[1:]) if phase == "critique" else ""
-            prompt += render(SKILL_DIR / "queue-worktrees.md", branch=owner.branch(ticket_id), base=base, worktrees=listing,
+            prompt += render(SKILL_DIR / "queue-worktrees.md", branch=branch, base=base, worktrees=listing,
                              reviewers=others)
         return prompt + owner.guidance
 
-    def first_prompt(self, owner, ticket, phase, task_type, clone, landing="pr", target=None):
+    def first_prompt(self, owner, ticket, phase, task_type, clone, landing="pr", target=None, drafts=(), branch=None):
         """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
-        prompt = self.phase_prompt(owner, ticket.id, phase, clone, landing, target)
+        prompt = self.phase_prompt(owner, ticket.id, phase, clone, landing, target, drafts=drafts or (), branch=branch)
         if "prompt" in task_type:
             template = clone / task_type["prompt"]
             prompt += "\n" + render(template, ticket=ticket.id, ticket_path=ticket.path)
@@ -986,9 +1000,10 @@ class Afk:
 
         afk only ever reads PRs; merging is the human's call. Whoever opened the PR, the worker or the human, it is
         found by the worker's branch, so afk never depends on a URL being reported. A PR opened before the worker
-        started, from an earlier attempt at the ticket on the same branch, is none of this worker's.
+        started, from an earlier attempt at the ticket on the same branch, is none of this worker's, unless it's a draft
+        a resuming queue worker picked up.
         """
-        branch = owner.branch(status["ticket"])
+        branch = owner.worker_branch(status)
         try:
             # From the clone, not the worktree, which a cleanup that failed partway may already have removed.
             pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url,labels,createdAt"],
@@ -997,7 +1012,8 @@ class Afk:
             if "no pull requests found" not in (error.stderr or ""):
                 raise
             return "NONE", None, False
-        if datetime.fromisoformat(pr["createdAt"]).timestamp() < status.get("started_at", float("-inf")):
+        if (pr["url"] not in status.get("resumed_prs", [])
+                and datetime.fromisoformat(pr["createdAt"]).timestamp() < status.get("started_at", float("-inf"))):
             return "NONE", None, False
         return pr["state"], pr["url"], any(label["name"] == READY_LABEL for label in pr.get("labels", []))
 
@@ -1173,14 +1189,15 @@ class Afk:
 
     def cmd_worktree(self, repo=None):
         """Give a queue worker whose ticket spans repos a worktree in another, on its branch and prepared for its slot,
-        found as enqueue finds a clone."""
+        found as enqueue finds a clone. On a second pass, the branch starts as the first pushed it to that repo."""
         if not repo or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
             raise SystemExit("afk: usage: afk worktree <owner/name>")
         owner, ticket_id = self.queue_owner(), self.env.get("AFK_TICKET")
         path = ticket_id and self.env.get("AFK_QUEUE") and owner.workers / ticket_id / "status.json"
         if not path or not path.exists():
             raise SystemExit("afk: afk worktree runs only in a queue worker, from its worktree")
-        status, branch = read_json(path), owner.branch(ticket_id)
+        status = read_json(path)
+        branch = owner.worker_branch(status)
         has = next((worktree for name, _, worktree in owner.worker_worktrees(status) if name and same(name, repo)), None)
         if has:
             self.out(f"worktree ready: {has} on {branch}")
@@ -1189,26 +1206,34 @@ class Afk:
         repo_config = queue_repo_config(clone)
         worktree = owner.worktree(ticket_id, repo)
         slot_env = [f"AFK_SLOT={status['slot']}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * status['slot']}"]
-        self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), repo_config.get("base", "main")])
+        base = repo_config.get("base", "main")
+        # Its branch there is its ticket's too: linked to it on GitHub, so a later pass finds it again.
+        owner.tracker.branch(owner.tracker.get(ticket_id), repo, base, clone, branch)
+        start, drafts = self.pushed(clone, branch, base)
+        self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), start or base])
         try:
             self.prepare_worktree(clone, worktree, repo_config, slot_env)
-            self.add_sibling(owner, path, {"repo": repo, "clone": str(clone), "worktree": str(worktree)})
+            self.add_sibling(owner, path, {"repo": repo, "clone": str(clone), "worktree": str(worktree)}, drafts or [])
         except BaseException:
             # Rolled back, even on Ctrl-C, so a plain retry works, and cleanup never misses a worktree it wasn't told of.
             self.best_effort(["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)])
             self.best_effort(["git", "-C", str(clone), "branch", "-D", branch])
             raise
+        resumed = start and (f" as last pushed, with draft PR{'s' * (len(drafts) > 1)} {', '.join(drafts)}" if drafts
+                             else " as last pushed")
         # The worker's session has its own repo's slot env, which another repo's dev server may need in place of it.
-        self.out(f"worktree ready: {worktree} on {branch}; its dev server runs with: export {' '.join(slot_env)}")
+        self.out(f"worktree ready: {worktree} on {branch}{resumed or ''}; its dev server runs with: export {' '.join(slot_env)}")
 
-    def add_sibling(self, owner, path, sibling):
-        """Record a queue worker's worktree in another repo in its status, and deny it pushing to that repo's base, as it
-        is denied pushing to its own: best-effort, as every deny is, and only once its session reloads its settings."""
+    def add_sibling(self, owner, path, sibling, drafts):
+        """Record a queue worker's worktree in another repo in its status, with the open PRs it resumes there, and deny
+        it pushing to that repo's base, as it is denied pushing to its own: best-effort, as every deny is, and only once
+        its session reloads its settings."""
         try:
             with locked(path.parent):  # gone, lock and all, once it's cleaned up
                 status = read_json(path)
                 siblings = [*status.get("siblings", []), sibling]
-                write_json(path, {**status, "siblings": siblings})
+                resumed = {"resumed_prs": [*status.get("resumed_prs", []), *drafts]} if drafts else {}
+                write_json(path, {**status, "siblings": siblings, **resumed})
         except FileNotFoundError:
             raise SystemExit("afk: this worker was cleaned up meanwhile, so its new worktree is removed")
         base = owner.repo_config(owner.worker_clone(status)).get("base", "main")
@@ -1235,15 +1260,18 @@ class Afk:
 
     def clear_dead_starts(self, owner):
         """Undo a start the watcher was stopped in the middle of, past its own rollback. Under the tick lock nothing
-        else starts a queue worker, so a running ticket with no worker status, or a worker dir with none, is one. Its
-        branch is new, as no agent ever ran on it."""
+        else starts a queue worker, so a running ticket with no worker status, or a worker dir with none, is one. A local
+        branch made with its worktree is new, as no agent ever ran on it."""
         with self.queue_state() as state:
             for t in state["tickets"]:
                 if t["state"] == "running" and not (owner.workers / t["worker"] / "status.json").exists():
-                    worker = t.pop("worker")
+                    worker, branch = t.pop("worker"), t.pop("branch", None)
                     t["state"] = "waiting"
+                    # afk made the branch only with the worktree: one of that name without it may be the engineer's.
+                    added = owner.worktree(worker).exists()
                     self.best_effort(["git", "-C", t["clone"], "worktree", "remove", "--force", str(owner.worktree(worker))])
-                    self.best_effort(["git", "-C", t["clone"], "branch", "-D", owner.branch(worker)])
+                    if branch and added:
+                        self.best_effort(["git", "-C", t["clone"], "branch", "-D", branch])
         for slot in owner.workers.glob("*/slot"):
             if not (slot.parent / "status.json").exists():
                 shutil.rmtree(slot.parent)
@@ -1324,16 +1352,19 @@ class Afk:
                 if state == "OPEN":
                     urls.append(sibling_url)
             drafts = f"draft PR{'s' * (len(urls) > 1)}"
+            # A resumed pass that opened none updated the drafts the ticket already links.
+            updated = all(url in status.get("resumed_prs", []) for url in urls)
             if ticket:
-                owner.tracker.comment(ticket, f"afk opened a {drafts} for this ticket: {', '.join(urls)}")
+                owner.tracker.comment(ticket, f"afk {'updated its' if updated else 'opened a'} {drafts} for this ticket: "
+                                              f"{', '.join(urls)}")
             self.settle(entry["id"], state="drafted", prs=urls)
-            message = f"{entry['id']} {drafts} opened: {' '.join(urls)}"
+            message = f"{entry['id']} {drafts} {'updated' if updated else 'opened'}: {' '.join(urls)}"
         elif ended == "abandoned":
             reason = status.get("abandoned") or (
                 f"it didn't wrap up within {owner.limits['wrap_up_minutes']}m of going {status['wrap_up']}")
             if ticket:
                 owner.tracker.comment(ticket, f"afk abandoned this ticket: {reason}. Whatever its worker pushed stays on "
-                                              f"branch `{owner.branch(status['ticket'])}`.")
+                                              f"branch `{owner.worker_branch(status)}`.")
             self.settle(entry["id"], state="abandoned", reason=reason)
             # The queue moved on without it, so the human hears now, unless they abandoned it themselves.
             self.notify(owner, f"{entry['id']} abandoned: {reason}", bell="abandoned" not in status)
@@ -1366,15 +1397,24 @@ class Afk:
         try:
             clone = Path(entry["clone"])
             repo_config = owner.repo_config(clone)
+            base = repo_config.get("base", "main")
             choices = {key: entry[key] for key in ("type", "agent", "model", "effort")}
+            # The ticket's own branch, as its tracker names it, and links it on GitHub, so a later pass finds it again.
+            previous = next((t.get("branch") for t in reversed(self.read_queue().get("outcomes", []))
+                             if t["id"] == entry["id"]), None)
+            branch = owner.tracker.branch(ticket, entry["repo"], base, clone, previous=previous)
+            with self.queue_state() as state:
+                next(t for t in state["tickets"] if t["id"] == entry["id"])["branch"] = branch  # for clear_dead_starts
+            start, drafts = self.pushed(clone, branch, base)
             worktree, branch = self.launch_worker(owner, ticket, entry["repo"], clone, repo_config, choices, "implement",
-                                                  "working", "pr", repo_config.get("base", "main"))
+                                                  "working", "pr", base, start, drafts, branch)
         except BaseException as error:
             # launch_worker has rolled itself back, so it goes back in its place.
             with self.queue_state() as state:
                 current = next(t for t in state["tickets"] if t["id"] == entry["id"])
                 current["state"] = "waiting"
                 current.pop("worker")
+                current.pop("branch", None)
             if not isinstance(error, (subprocess.CalledProcessError, OSError, SystemExit)):
                 raise
             # A poll later, as a failure that lasts would otherwise claim and release the ticket every tick; meanwhile
@@ -1388,6 +1428,19 @@ class Afk:
             return False
         self.out(f"started {entry['id']} in {worktree} on {branch}")
         return True
+
+    def pushed(self, clone, branch, base):
+        """Where a queue worker on branch starts in clone, and its open PRs' URLs, None unless it resumes: on the branch
+        as an earlier pass pushed it, fetched, if it has commits beyond base; from base as fetched if it has none, so the
+        worker's first push fast-forwards it, as GitHub made it at base; else, a branch that's gone, from base."""
+        if not self.run(["git", "-C", str(clone), "ls-remote", "--heads", "origin", f"refs/heads/{branch}"]).strip():
+            return None, None
+        self.run(["git", "-C", str(clone), "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                  f"+refs/heads/{base}:refs/remotes/origin/{base}"])
+        if self.run(["git", "-C", str(clone), "rev-list", "--count", f"origin/{base}..origin/{branch}"]).strip() == "0":
+            return f"origin/{base}", None
+        prs = json.loads(self.run(["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url"], cwd=clone))
+        return f"origin/{branch}", [pr["url"] for pr in prs]
 
     def queue_owner(self):
         """The queue, as the owner of its workers (ADR 0002)."""
@@ -1833,6 +1886,11 @@ def same(a, b):
 
 GITHUB_ISSUE = re.compile(r"https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)/?$")
 
+# The branches GitHub links to an issue, in its own repo or another, as `gh issue develop` links them.
+GITHUB_LINKED_BRANCHES = ("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) "
+                          "{ issue(number: $number) { linkedBranches(first: 100) { nodes { ref { name repository "
+                          "{ nameWithOwner } } } } } } }")
+
 # A Linear issue's URL, by its identifier (ENG-123), perhaps followed by its title's slug, a query and a fragment.
 LINEAR_ISSUE = re.compile(r"https://linear\.app/[^/]+/issue/(?P<id>[A-Za-z][A-Za-z0-9]*-\d+)(?:/[^/?#]*)?/?(?:[?#].*)?$")
 # A Linear project's URL: its name's slug ending in its slug id, perhaps followed by the tab it shows, a query and a
@@ -1844,7 +1902,7 @@ LINEAR_PROJECT = re.compile(
 LINEAR_ENDED = {"completed", "canceled", "duplicate"}
 
 # What afk reads of a Linear issue: an issue that blocks it is the source of a `blocks` relation pointing at it.
-LINEAR_FIELDS = ("identifier title description url state { type } assignee { displayName } "
+LINEAR_FIELDS = ("identifier title description url branchName state { type } assignee { displayName } "
                  "inverseRelations(first: 50) { nodes { type issue { identifier state { type } } } }")
 # Issues per request: Linear refuses a query whose complexity passes 10,000, and each issue as afk reads it costs about
 # 3.3 per relation it may hold, so 50 issues of 50 relations come to about 8,500.
@@ -1864,6 +1922,7 @@ class Ticket:
     type: str
     repo: str | None = None  # owner/name; None leaves it for Gate 1 to resolve
     assignees: tuple = ()
+    branch: str | None = None  # the branch its tracker suggests, as Linear does
 
     @property
     def done(self):
@@ -1906,6 +1965,10 @@ class Owner:
 
     def branch(self, ticket_id):
         return f"afk/{self.name}-{ticket_id}"
+
+    def worker_branch(self, status):
+        """The worker's branch: a queue worker's is its ticket's, as its tracker names it, in each of its repos."""
+        return status.get("branch") or self.branch(status["ticket"])  # workers started before a ticket named it
 
     def max_workers(self):
         return {**LIMITS, **self.limits}["max_workers"]
@@ -2099,6 +2162,33 @@ class GithubTracker:
         repo, number = self.locate(ticket.id)
         self.run(["gh", "issue", "comment", number, "--repo", repo, "--body", body])
 
+    def branch(self, ticket, repo, base, clone, name=None, previous=None):
+        """The ticket's branch in repo, cloned at clone, as GitHub links it to the issue: one linked already, named name
+        if given, else one `gh issue develop` makes on the remote from base and links, named name or as GitHub suggests,
+        which fails if the repo has a branch of that name not linked to the ticket. previous, the branch the ticket's
+        last pass used, isn't needed: the link outlives a rename."""
+        issue = GITHUB_ISSUE.match(str(ticket.path))
+        own = f"{issue['owner']}/{issue['repo']}"
+
+        def linked():
+            data = json.loads(self.run(["gh", "api", "graphql", "-f", f"query={GITHUB_LINKED_BRANCHES}",
+                                        "-f", f"owner={issue['owner']}", "-f", f"name={issue['repo']}",
+                                        "-F", f"number={issue['number']}"]))
+            refs = [n["ref"] for n in data["data"]["repository"]["issue"]["linkedBranches"]["nodes"]]
+            # A linked branch since deleted has no ref.
+            return [r["name"] for r in refs if r and same(r["repository"]["nameWithOwner"], repo) and name in (None, r["name"])]
+
+        found = linked()
+        if found:
+            return found[0]
+        # In the clone: with --base, gh records the branch's base in its git config, failing outside a checkout.
+        self.run(["gh", "issue", "develop", issue["number"], "--repo", own, "--base", base,
+                  *(["--branch-repo", repo] if not same(repo, own) else []), *(["--name", name] if name else [])], cwd=clone)
+        found = linked()
+        if not found:
+            raise SystemExit(f"afk: `gh issue develop` linked no branch in {repo} to {ticket.path}")
+        return found[0]
+
     def complete(self, ticket, landed=None):
         """Merged: its assignment keeps it off the frontier until its PR, or the user, closes it. Landed, as the
         (sha, target) it landed as: no PR will close it, so it is closed here."""
@@ -2213,7 +2303,7 @@ class LinearTracker:
             id=issue["identifier"], title=issue["title"], status=status,
             blocked_by=[r["issue"]["identifier"] for r in issue["inverseRelations"]["nodes"] if r["type"] == "blocks"],
             path=issue["url"], type=field(description, "Type"), repo=repo and repo.group(0),
-            assignees=(issue["assignee"]["displayName"],) if issue["assignee"] else (),
+            assignees=(issue["assignee"]["displayName"],) if issue["assignee"] else (), branch=issue["branchName"],
         )
 
     def get(self, ticket_id):
@@ -2260,6 +2350,12 @@ class LinearTracker:
 
     def comment(self, ticket, body):
         self.run(["linear", "issue", "comment", "add", ticket.id.upper(), "--body", body, "--yes", "--no-input"])
+
+    def branch(self, ticket, repo, base, clone, name=None, previous=None):
+        """The ticket's branch, which Linear's GitHub integration links by the issue's identifier in it: named name, else
+        previous, the one the ticket's last pass used, as Linear's suggestion follows its title, else as Linear suggests.
+        Linear makes no branch, so git says whether an earlier pass pushed it."""
+        return name or previous or ticket.branch
 
     def split(self, ticket, parts):
         """Create the parts beside the ticket, in its team, under its parent and in its project, then close it."""
@@ -2317,6 +2413,9 @@ class QueueTracker:
 
     def comment(self, ticket, body):
         self.tracker(ticket.id).comment(ticket, body)
+
+    def branch(self, ticket, repo, base, clone, name=None, previous=None):
+        return self.tracker(ticket.id).branch(ticket, repo, base, clone, name, previous)
 
 
 def queue_tracker(run, entry):
