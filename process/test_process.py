@@ -1662,9 +1662,10 @@ class NextWorkRankingTest(NextWorkTestCase):
             ticket("WID-3", priority=2, target_date="2026-11-01", created="2026-10-10T12:00:00Z"),
             ticket("WID-4", priority=2, target_date="2026-11-01", created="2026-09-10T12:00:00Z"),
             ticket("WID-5", state="in_progress", assignee="me", priority=4),
+            ticket("WID-6", priority=4, created="2026-10-15T12:00:00Z"),
         )
 
-        self.assertEqual(self.picks(result), ["WID-5", "WID-4", "WID-3"])
+        self.assertEqual(self.picks(result), ["WID-5", "WID-4", "WID-3", "WID-2", "WID-1"])
         self.assertTrue(all(r["reason"].strip() for r in result["recommendations"]))
         self.assertEqual(self.process("validate", "next_work", str(self.profile_dir() / "next.json")), "")
 
@@ -1695,21 +1696,28 @@ class NextWorkRankingTest(NextWorkTestCase):
         self.assertIn("Unblocked 2026-10-19", result["recommendations"][0]["reason"])
 
     def test_backlog_fills_the_slots_todo_leaves_as_promotions_queued_for_my_approval(self):
-        _, result = self.next_work(ticket("WID-1"), ticket("WID-7", state="backlog", priority=4), ticket("WID-8", state="backlog", priority=2), ticket("WID-9", state="backlog", priority=3))
+        _, result = self.next_work(
+            ticket("WID-1"),
+            ticket("WID-2"),
+            ticket("WID-6", state="backlog", priority=4, created="2026-10-15T12:00:00Z"),
+            ticket("WID-7", state="backlog", priority=4),
+            ticket("WID-8", state="backlog", priority=2),
+            ticket("WID-9", state="backlog", priority=3),
+        )
 
-        self.assertEqual(self.picks(result), ["WID-1", "WID-8", "WID-9"])
+        self.assertEqual(self.picks(result), ["WID-1", "WID-2", "WID-8", "WID-9", "WID-7"])
         promotions = [e for e in self.queue() if e["action"]["type"] == "linear_promote"]
-        self.assertEqual([e["action"]["params"]["ticket"] for e in promotions], ["WID-8", "WID-9"])
+        self.assertEqual([e["action"]["params"]["ticket"] for e in promotions], ["WID-8", "WID-9", "WID-7"])
         self.assertEqual({(e["status"], e["autonomy"]) for e in promotions}, {("pending", "draft")})
-        self.assertEqual([r.get("entry_id") for r in result["recommendations"]], [None] + [e["id"] for e in promotions])
-        self.assertIn("Todo is thin", result["recommendations"][1]["reason"])
+        self.assertEqual([r.get("entry_id") for r in result["recommendations"]], [None, None] + [e["id"] for e in promotions])
+        self.assertIn("Todo is thin", result["recommendations"][2]["reason"])
         self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
         self.assertEqual(self.run_fake.calls, [])  # proposed, never done
 
     def test_backlog_is_left_alone_while_todo_fills_every_slot(self):
-        _, result = self.next_work(ticket("WID-1"), ticket("WID-2"), ticket("WID-3"), ticket("WID-8", state="backlog", priority=1))
+        _, result = self.next_work(*(ticket(f"WID-{n}") for n in range(1, 6)), ticket("WID-8", state="backlog", priority=1))
 
-        self.assertEqual(self.picks(result), ["WID-1", "WID-2", "WID-3"])
+        self.assertEqual(self.picks(result), ["WID-1", "WID-2", "WID-3", "WID-4", "WID-5"])
         self.assertEqual(self.queue(), [])
 
     def test_the_full_brief_shows_my_next_work_with_reasons_and_the_afk_list(self):
@@ -1749,7 +1757,7 @@ class AfkListTest(NextWorkTestCase):
             ticket("WID-5", estimate="M"),
         )
 
-        self.assertEqual(self.picks(result), ["WID-3", "WID-5"])  # the AFK list doesn't count against my 3
+        self.assertEqual(self.picks(result), ["WID-3", "WID-5"])  # the AFK list doesn't count against my 5
         self.assertEqual([a["ref"] for a in result["afk"]], ["WID-1", "WID-2"])
         self.assertEqual([a["reason"] for a in result["afk"]], ["Trivial: estimate S", "Trivial: labeled Cleanup"])
         launches = [e for e in self.queue() if e["action"]["type"] == "afk_launch"]
@@ -1779,7 +1787,7 @@ class NextWorkProposalsTest(NextWorkTestCase):
         self.next_work(ticket("WID-1", estimate="S"), ticket("WID-8", state="backlog"))
         before = self.queue()
 
-        _, result = self.next_work(ticket("WID-1", estimate="S"), ticket("WID-2"), ticket("WID-3"), ticket("WID-4"), ticket("WID-8", state="backlog"))
+        _, result = self.next_work(ticket("WID-1", estimate="S"), *(ticket(f"WID-{n}") for n in range(2, 7)), ticket("WID-8", state="backlog"))
 
         [promote] = [e for e in before if e["action"]["type"] == "linear_promote"]
         [afk] = [e for e in before if e["action"]["type"] == "afk_launch"]

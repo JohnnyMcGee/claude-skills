@@ -286,7 +286,7 @@
       }
     },
     "next_work": {
-      "description": "`process next` output, <profile>/next.json: up to 3 recommendations for me, and a separate AFK list that does not count against them.",
+      "description": "`process next` output, <profile>/next.json: up to 5 recommendations for me, and a separate AFK list that does not count against them.",
       "type": "object",
       "required": ["profile", "at", "recommendations", "afk"],
       "additionalProperties": false,

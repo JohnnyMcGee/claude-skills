@@ -681,7 +681,7 @@ class Process:
     # -- next work --
 
     def cmd_next(self, name, *args):
-        """Rank the next-work skill's candidate tickets (JSONL on stdin, or --file) into up to 3 recommendations, each
+        """Rank the next-work skill's candidate tickets (JSONL on stdin, or --file) into up to 5 recommendations, each
         with its reason, and an AFK list, in next.json. Promotions and AFK launches are queued for my approval, once
         each: a rerun keeps a proposal still waiting, supersedes one it no longer makes, and never re-proposes one I
         decided. All or nothing."""
@@ -700,7 +700,7 @@ class Process:
         # An AFK launch I approved has the ticket; one I skipped (or that failed) hands it back to me.
         free = [t for t in tickets if not t["blocked"] and status("afk_launch", t) not in ("approved", "done")]
         todo = [t for t in free if t["state"] == "todo" and t["assignee"] != "other"]
-        afk = [t for t in todo if trivial(profile, t) and not status("afk_launch", t)]  # a separate list, not one of my 3
+        afk = [t for t in todo if trivial(profile, t) and not status("afk_launch", t)]  # a separate list, not one of my 5
         todo = [t for t in todo if t not in afk]
         unblocked = [t for t in todo if t.get("unblocked_at", "") >= iso(now - UNBLOCKED_AGE)]
         tiers = [
@@ -1343,7 +1343,7 @@ def render_project(entries, acted=()):
 
 
 def render_next(result, queue):
-    """The Next work section: my up to 3 recommendations, each with its reason, then the AFK list and where each stands."""
+    """The Next work section: my up to 5 recommendations, each with its reason, then the AFK list and where each stands."""
     if not result or not (result["recommendations"] or result["afk"]):
         return []
     status = {e["id"]: "approved, waits for a free AFK slot" if e["status"] == "approved" else e["status"] for e in queue}
@@ -1445,7 +1445,7 @@ def entry(name, profile, group):
     }
 
 
-NEXT_SLOTS = 3
+NEXT_SLOTS = 5
 PRIORITY = {1: "urgent", 2: "high", 3: "medium", 4: "low"}
 # A Todo ticket stays newly unblocked this long after its last blocker cleared, then it is just another Todo ticket.
 UNBLOCKED_AGE = 3 * 24 * 3600

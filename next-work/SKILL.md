@@ -1,6 +1,6 @@
 ---
 name: next-work
-description: Process next-work for one profile — gather the Linear tickets I could start next and hand them to `process next`, which proposes up to 3 with a reason each, plus the trivial ones for AFK workers. Run headless by `process run` with the full brief, or by hand.
+description: Process next-work for one profile — gather the Linear tickets I could start next and hand them to `process next`, which proposes up to 5 with a reason each, plus the trivial ones for AFK workers. Run headless by `process run` with the full brief, or by hand.
 disable-model-invocation: true
 argument-hint: <profile> [--fixtures <dir>]
 ---
@@ -58,4 +58,4 @@ It consumes the file and prints the ranked list. If it lists invalid tickets ins
 
 ## 5. Report
 
-Show what `process next` printed, as it is: up to 3 recommendations with their reasons, then the AFK list. Done when it is on screen.
+Show what `process next` printed, as it is: up to 5 recommendations with their reasons, then the AFK list. Done when it is on screen.
