@@ -572,13 +572,16 @@ class Afk:
         path = tool_input.get("file_path") or tool_input.get("notebook_path")
         if payload.get("tool_name") not in EDIT_TOOLS or not path:
             return
-        worktree = os.path.realpath(self.queue_dir() / "worktrees" / self.env["AFK_TICKET"])
-        path = os.path.realpath(os.path.join(payload.get("cwd") or worktree, path))
-        if os.path.commonpath([path, worktree]) != worktree:
+        # Its own, then any in the other repos its ticket spans.
+        siblings = read_json(self.worker_status_path()).get("siblings", [])
+        worktrees = [os.path.realpath(w) for w in [self.queue_dir() / "worktrees" / self.env["AFK_TICKET"],
+                                                   *(s["worktree"] for s in siblings)]]
+        path = os.path.realpath(os.path.join(payload.get("cwd") or worktrees[0], path))
+        if all(os.path.commonpath([path, worktree]) != worktree for worktree in worktrees):
             self.out(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                "permissionDecisionReason": f"afk: {path} is outside your worktree, {worktree}; a queue worker edits "
-                                            "only inside it"}}))
+                "permissionDecisionReason": f"afk: {path} is outside your worktree, {' and '.join(worktrees)}; a queue "
+                                            "worker edits only inside its own"}}))
 
     def cmd_watch(self, interval="2"):
         """Loop around tick for the orchestrator window's right pane. Needs no LLM, so waiting is free."""
@@ -824,7 +827,8 @@ class Afk:
             ticket_id, pane, phase, *reason = args  # the wrap-up prompt names the limit the worker went over
             status = read_json(owner.workers / ticket_id / "status.json")
             prompt = self.phase_prompt(owner, ticket_id, phase, owner.worker_clone(status), status.get("landing", "pr"),
-                                       status.get("target"), reason=reason[0] if reason else None)
+                                       status.get("target"), reason=reason[0] if reason else None,
+                                       worktrees=owner.worker_worktrees(status), slot=status.get("slot"))
             self.send_prompt(ticket_id, pane, prompt)
         elif kind == "window":
             # Cosmetic, so best-effort: a failure here must not make the next tick resend a prompt.
@@ -846,23 +850,30 @@ class Afk:
         lose.
         A worktree already gone, as after a cleanup that failed partway, holds nothing left to lose.
         """
-        worktree = owner.worktree(status["ticket"])
-        if not worktree.exists():
+        worktree = str(owner.worktree(status["ticket"]))
+        # Its own, then a queue worker's in the other repos its ticket spans, each named.
+        worktrees = [("its", worktree), *((f"its {s['repo']}", s["worktree"]) for s in status.get("siblings", []))]
+        worktrees = [(its, path) for its, path in worktrees if Path(path).exists()]
+        if not worktrees:
             return None
-        if "shell_pane" not in status:
-            return "its shell pane is unknown (it was started by an older afk)"
-        command = self.pane_command(status["shell_pane"])
-        if command is not None and command not in SHELLS:  # a pane that's gone has no human in it
-            return f"its shell pane is running {command}"
-        worktree = str(worktree)
-        # A submodule set to ignore=all would otherwise hide its changes, which the forced removal would then delete.
-        if self.run(["git", "-C", worktree, "status", "--porcelain", "--ignore-submodules=none"]).strip():
-            return "its worktree has uncommitted changes"
+        if Path(worktree).exists():  # else a cleanup cut short has killed its window already
+            if "shell_pane" not in status:
+                return "its shell pane is unknown (it was started by an older afk)"
+            command = self.pane_command(status["shell_pane"])
+            if command is not None and command not in SHELLS:  # a pane that's gone has no human in it
+                return f"its shell pane is running {command}"
+        for its, path in worktrees:
+            # A submodule set to ignore=all would otherwise hide its changes, which the forced removal would then delete.
+            if self.run(["git", "-C", path, "status", "--porcelain", "--ignore-submodules=none"]).strip():
+                return f"{its} worktree has uncommitted changes"
+        if status.get("landing", "pr") == "pr":
+            # A merged PR has its branch's work, but only in its own repo.
+            for its, path in [(its, path) for its, path in worktrees if not (ended == "merged" and path == worktree)]:
+                if self.run(["git", "-C", path, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip():
+                    return f"{its} branch has unpushed commits"
+            return None
         if ended in ("merged", "landed"):
             return None
-        if status.get("landing", "pr") == "pr":
-            unpushed = self.run(["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]).strip()
-            return "its branch has unpushed commits" if unpushed else None
         # A local-mode branch is never pushed, and work landed on its target, pushed or not, isn't lost with it, so
         # what's left goes only when the human drops it.
         if self.run(["git", "-C", worktree, "log", "--oneline", *self.unsaved(worktree, "HEAD", status["target"])]).strip():
@@ -880,7 +891,6 @@ class Afk:
         human: cleanup_blocker has already checked it holds nothing unpushed.
         """
         status = read_json(owner.workers / ticket_id / "status.json")
-        repo = str(owner.worker_clone(status))
         tracker, ticket = owner.tracker, owner.find_ticket(ticket_id)
         if ticket and ended == "merged":
             tracker.complete(ticket)
@@ -891,17 +901,20 @@ class Afk:
         if owner.on_end:
             owner.on_end(owner, status, ended)  # after the tracker's steps, as the queue's tracker finds only running tickets
         self.best_effort(["tmux", "kill-window", "-t", pane])
-        worktree = owner.worktree(ticket_id)
-        if worktree.exists():
-            # Forced, since git won't otherwise remove a worktree with submodules; cleanup_blocker has checked it's clean.
-            self.run(["git", "-C", repo, "worktree", "remove", "--force", str(worktree)])
-        else:
-            self.best_effort(["git", "-C", repo, "worktree", "prune"])  # forget a worktree whose dir is gone
         branch = owner.branch(ticket_id)
-        try:
-            self.run(["git", "-C", repo, "branch", "-D", branch])
-        except subprocess.CalledProcessError as error:
-            self.notify(owner, f"{ticket_id} cleaned up, leaving branch {branch}: {(error.stderr or '').strip()}")
+        for _, repo, worktree in owner.worker_worktrees(status):
+            repo = str(repo)
+            if worktree.exists():
+                # Forced, since git won't otherwise remove a worktree with submodules; cleanup_blocker has checked it's clean.
+                self.run(["git", "-C", repo, "worktree", "remove", "--force", str(worktree)])
+            else:
+                self.best_effort(["git", "-C", repo, "worktree", "prune"])  # forget a worktree whose dir is gone
+            try:
+                self.run(["git", "-C", repo, "branch", "-D", branch])
+            except subprocess.CalledProcessError as error:
+                if "not found" in (error.stderr or ""):
+                    continue  # deleted by a cleanup cut short, as in another of a queue worker's repos
+                self.notify(owner, f"{ticket_id} cleaned up, leaving branch {branch} in {repo}: {(error.stderr or '').strip()}")
         shutil.rmtree(owner.workers / ticket_id)
 
     def notify(self, owner, message, bell=True):
@@ -918,10 +931,11 @@ class Afk:
         except (OSError, subprocess.CalledProcessError):
             pass
 
-    def phase_prompt(self, owner, ticket_id, phase, clone, landing="pr", target=None, reason=None):
+    def phase_prompt(self, owner, ticket_id, phase, clone, landing="pr", target=None, reason=None, worktrees=(), slot=None):
         """The phase's prompt for the worker's landing mode: phase-<phase>-<landing>.md where the mode has its own.
 
-        reason is the limit a wrapping-up queue worker went over.
+        reason is the limit a wrapping-up queue worker went over. worktrees are the worker's, as worker_worktrees gives
+        them, each named in the prompt with its base and its port base on the worker's slot when its ticket spans repos.
         """
         ticket = owner.tracker.get(ticket_id)
         repo_config = owner.repo_config(clone)
@@ -931,7 +945,7 @@ class Afk:
             # A PR's critique, the queue's, is of what the PR will show: prepr merged its base from origin.
             target = f"origin/{base}"
         template = SKILL_DIR / f"phase-{phase}-{landing}.md"
-        return render(
+        prompt = render(
             template if template.is_file() else SKILL_DIR / f"phase-{phase}.md",
             ticket=ticket.id,
             ticket_path=ticket.path,
@@ -941,7 +955,19 @@ class Afk:
             ci_rounds=owner.limits.get("ci_rounds"),
             reason=reason,
             grace=owner.limits.get("wrap_up_minutes"),
-        ) + owner.guidance
+        )
+        if len(worktrees) > 1:
+            configs = [(repo, owner.repo_config(c), worktree) for repo, c, worktree in worktrees]
+            listing = "\n".join(f"- `{repo}` (base `{config.get('base', 'main')}`, "
+                                f"`AFK_PORT_BASE={config.get('port_base', 4000) + 100 * slot}`): {worktree}"
+                                for repo, config, worktree in configs)
+            # A critique's reviewers are each repo's own, over the diff against its own base, as prepr merged it.
+            others = "".join(f"\n\n`{repo}`'s reviewers:\n\n" + reviewer_list(config.get("reviewers", []),
+                                                                             f"origin/{config.get('base', 'main')}")
+                             for repo, config, _ in configs[1:]) if phase == "critique" else ""
+            prompt += render(SKILL_DIR / "queue-worktrees.md", branch=owner.branch(ticket_id), base=base, worktrees=listing,
+                             reviewers=others)
+        return prompt + owner.guidance
 
     def first_prompt(self, owner, ticket, phase, task_type, clone, landing="pr", target=None):
         """The first phase prompt, invoking the task type's skill and followed by its prompt template."""
@@ -953,9 +979,10 @@ class Afk:
             prompt = f"{task_type['skill']} {prompt}"
         return prompt
 
-    def pr_state(self, owner, status):
+    def pr_state(self, owner, status, clone=None):
         """GitHub's state for the worker's PR, OPEN, CLOSED, MERGED or NONE, its URL (None when there's no PR), and
-        whether it carries /open-pr's READY_LABEL.
+        whether it carries /open-pr's READY_LABEL. In clone's repo, if given, as for a queue worker's ticket that spans
+        repos.
 
         afk only ever reads PRs; merging is the human's call. Whoever opened the PR, the worker or the human, it is
         found by the worker's branch, so afk never depends on a URL being reported. A PR opened before the worker
@@ -965,7 +992,7 @@ class Afk:
         try:
             # From the clone, not the worktree, which a cleanup that failed partway may already have removed.
             pr = json.loads(self.run(["gh", "pr", "view", branch, "--json", "state,url,labels,createdAt"],
-                                     cwd=owner.worker_clone(status)))
+                                     cwd=clone or owner.worker_clone(status)))
         except subprocess.CalledProcessError as error:
             if "no pull requests found" not in (error.stderr or ""):
                 raise
@@ -1057,10 +1084,7 @@ class Afk:
         if repo is None:
             raise SystemExit(f"afk: {id} names no repo: give it a `Repo: owner/name` line, or pass --repo <owner/name>")
         clone = self.queue_clone(repo)
-        layers = repo_config_layers(clone)
-        if not layers:
-            raise SystemExit(f"afk: no afk repo config in {clone} (docs/agents/afk.md); run /afk-setup there first")
-        repo_config = reduce(deep_merge, layers, {})
+        repo_config = queue_repo_config(clone)
         task_types = repo_config.get("task_types", {})
         choices = launch_choices(ticket, repo_config.get("default_type"), task_types, corrections)
         if choices["type"] == HITL:
@@ -1146,6 +1170,51 @@ class Afk:
                 write_json(worker_dir / "status.json", status)  # what clean_up hands the queue to tell the ticket
                 self.clean_up(owner, entry["worker"], status["pane"], "abandoned")
         self.out(f"abandoned {id}: its worker is stopped and cleaned up, keeping only what it pushed")
+
+    def cmd_worktree(self, repo=None):
+        """Give a queue worker whose ticket spans repos a worktree in another, on its branch and prepared for its slot,
+        found as enqueue finds a clone."""
+        if not repo or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+            raise SystemExit("afk: usage: afk worktree <owner/name>")
+        owner, ticket_id = self.queue_owner(), self.env.get("AFK_TICKET")
+        path = ticket_id and self.env.get("AFK_QUEUE") and owner.workers / ticket_id / "status.json"
+        if not path or not path.exists():
+            raise SystemExit("afk: afk worktree runs only in a queue worker, from its worktree")
+        status, branch = read_json(path), owner.branch(ticket_id)
+        has = next((worktree for name, _, worktree in owner.worker_worktrees(status) if name and same(name, repo)), None)
+        if has:
+            self.out(f"worktree ready: {has} on {branch}")
+            return
+        clone = self.queue_clone(repo)
+        repo_config = queue_repo_config(clone)
+        worktree = owner.worktree(ticket_id, repo)
+        slot_env = [f"AFK_SLOT={status['slot']}", f"AFK_PORT_BASE={repo_config.get('port_base', 4000) + 100 * status['slot']}"]
+        self.run(["git", "-C", str(clone), "worktree", "add", "-b", branch, str(worktree), repo_config.get("base", "main")])
+        try:
+            self.prepare_worktree(clone, worktree, repo_config, slot_env)
+            self.add_sibling(owner, path, {"repo": repo, "clone": str(clone), "worktree": str(worktree)})
+        except BaseException:
+            # Rolled back, even on Ctrl-C, so a plain retry works, and cleanup never misses a worktree it wasn't told of.
+            self.best_effort(["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)])
+            self.best_effort(["git", "-C", str(clone), "branch", "-D", branch])
+            raise
+        # The worker's session has its own repo's slot env, which another repo's dev server may need in place of it.
+        self.out(f"worktree ready: {worktree} on {branch}; its dev server runs with: export {' '.join(slot_env)}")
+
+    def add_sibling(self, owner, path, sibling):
+        """Record a queue worker's worktree in another repo in its status, and deny it pushing to that repo's base, as it
+        is denied pushing to its own: best-effort, as every deny is, and only once its session reloads its settings."""
+        try:
+            with locked(path.parent):  # gone, lock and all, once it's cleaned up
+                status = read_json(path)
+                siblings = [*status.get("siblings", []), sibling]
+                write_json(path, {**status, "siblings": siblings})
+        except FileNotFoundError:
+            raise SystemExit("afk: this worker was cleaned up meanwhile, so its new worktree is removed")
+        base = owner.repo_config(owner.worker_clone(status)).get("base", "main")
+        others = dict.fromkeys(b for s in siblings if (b := owner.repo_config(s["clone"]).get("base", "main")) != base)
+        settings = worker_settings(base, None, (*owner.denies, *(rule for b in others for rule in push_denies(b))))
+        (path.parent / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
 
     def queue_tick(self):
         """One step of the queue's watcher: tick its workers, then start the oldest waiting tickets it has room for."""
@@ -1248,10 +1317,17 @@ class Afk:
         # The ticket gets a comment saying where its work went; None once it's gone from its tracker, with nothing to comment on.
         ticket = owner.find_ticket(status["ticket"]) if ended in ("drafted", "abandoned") else None
         if ended == "drafted":
+            # Its own repo's draft ended it; those in the other repos its ticket spans are found by its branch there too.
+            urls = [url]
+            for sibling in status.get("siblings", []):
+                state, sibling_url, _ = self.pr_state(owner, status, Path(sibling["clone"]))
+                if state == "OPEN":
+                    urls.append(sibling_url)
+            drafts = f"draft PR{'s' * (len(urls) > 1)}"
             if ticket:
-                owner.tracker.comment(ticket, f"afk opened a draft PR for this ticket: {url}")
-            self.settle(entry["id"], state="drafted", prs=[url])
-            message = f"{entry['id']} draft PR opened: {url}"
+                owner.tracker.comment(ticket, f"afk opened a {drafts} for this ticket: {', '.join(urls)}")
+            self.settle(entry["id"], state="drafted", prs=urls)
+            message = f"{entry['id']} {drafts} opened: {' '.join(urls)}"
         elif ended == "abandoned":
             reason = status.get("abandoned") or (
                 f"it didn't wrap up within {owner.limits['wrap_up_minutes']}m of going {status['wrap_up']}")
@@ -1823,8 +1899,10 @@ class Owner:
     def workers(self):
         return self.state_dir / "workers"
 
-    def worktree(self, ticket_id):
-        return self.state_dir / "worktrees" / ticket_id
+    def worktree(self, ticket_id, repo=None):
+        """The worker's worktree; for a queue worker's ticket that spans repos, its worktree in another repo, named
+        <ticket>@<owner>.<name>: no GitHub owner name holds a dot, so no two repos share one."""
+        return self.state_dir / "worktrees" / (f"{ticket_id}@{repo.lower().replace('/', '.')}" if repo else ticket_id)
 
     def branch(self, ticket_id):
         return f"afk/{self.name}-{ticket_id}"
@@ -1845,6 +1923,12 @@ class Owner:
     def worker_clone(self, status):
         """The clone a worker was started in; for one started before workers recorded it, its repo's."""
         return Path(status["clone"]) if "clone" in status else self.clone(status.get("repo"))
+
+    def worker_worktrees(self, status):
+        """Each repo a worker works in, with its clone and its worktree there: the one it was started in, then those
+        `afk worktree` added for a ticket that spans repos."""
+        return [(status.get("repo"), self.worker_clone(status), self.worktree(status["ticket"])),
+                *((s["repo"], Path(s["clone"]), Path(s["worktree"])) for s in status.get("siblings", []))]
 
     def clone(self, repo):
         clone = self.find_clone(repo)
@@ -2240,6 +2324,14 @@ def queue_tracker(run, entry):
     return (LinearTracker if entry["tracker"] == "linear" else GithubTracker)(run, entry["url"])
 
 
+def queue_repo_config(clone):
+    """The repo config a queue worker would start with in a clone, which must have one."""
+    layers = repo_config_layers(clone)
+    if not layers:
+        raise SystemExit(f"afk: no afk repo config in {clone} (docs/agents/afk.md); run /afk-setup there first")
+    return reduce(deep_merge, layers, {})
+
+
 def queue_worker(entry):
     """The id that names a queued ticket's worker, worktree and branch: its id in its own tracker, a GitHub issue's
     number, or a Linear issue's identifier lower-cased, as Linear's GitHub integration finds it in afk/queue-eng-123."""
@@ -2306,6 +2398,11 @@ def window_name(ticket):
     return f"{ticket.id}-{abbrev}"
 
 
+def push_denies(branch):
+    """Deny rules against pushing to a branch."""
+    return [f"Bash(git push * {branch})", f"Bash(git push * HEAD:{branch})", f"Bash(git push * *:{branch})"]
+
+
 def worker_settings(base, target=None, denies=()):
     """Per-session Claude settings: status hooks plus a deny list against irreversible damage, and its owner's denies.
 
@@ -2313,9 +2410,8 @@ def worker_settings(base, target=None, denies=()):
     by hand. Best-effort: a worker in auto permission mode can find another way.
     """
     hook = lambda event: [{"hooks": [{"type": "command", "command": f"{shlex.quote(AFK_BIN)} hook {event}"}]}]
-    pushes = lambda branch: [f"Bash(git push * {branch})", f"Bash(git push * HEAD:{branch})", f"Bash(git push * *:{branch})"]
     landing = [
-        *(pushes(target) if target != base else []),
+        *(push_denies(target) if target != base else []),
         f"Bash(git update-ref *refs/heads/{target})",
         f"Bash(git update-ref *refs/heads/{target} *)",
         f"Bash(git checkout {target})",
@@ -2330,7 +2426,7 @@ def worker_settings(base, target=None, denies=()):
                 "Bash(git push * -f)",
                 "Bash(git push * -f *)",
                 "Bash(git push * +*)",
-                *pushes(base),
+                *push_denies(base),
                 *landing,
                 "Bash(gh pr merge *)",
                 "Bash(git worktree remove *)",
@@ -2570,7 +2666,7 @@ def main(argv, run=None, env=None, stdin=None, stdout=None, clock=None):
         clock or time.time,
     )
     if not argv:
-        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|close|land|drop|status|view|hook|check|trial|enqueue|queue|dequeue> ...")
+        app.out("usage: afk <init|frontier|next|split|start|watch|tick|report|close|land|drop|status|view|hook|check|trial|enqueue|queue|dequeue|worktree> ...")
         return 2
     command, args = argv[0], argv[1:]
     handler = getattr(app, "cmd_" + command, None)

@@ -341,6 +341,24 @@ echo "$time_url $date_url $now_url"
 - [ ] While /now runs, `afk queue pause`. Enqueue /time again, then close its issue on GitHub. /now carries on to its draft, but nothing new starts. `afk queue resume`: within a few seconds /time is removed from the queue with a notification that it was closed, and `afk queue` lists it as `removed … it was closed`.
 - [ ] While a worker runs, stop the watcher with Ctrl-C in its pane, which closes it, and start another: `tmux new-window -t afk-queue afk queue watch`. It carries on driving that worker.
 
+**A ticket that spans repos (optional)**
+
+Needs a second throwaway repo, cloned beside the first, with an afk repo config of its own:
+
+```bash
+mkdir -p ~/code/afk-e2e-client && cd ~/code/afk-e2e-client && git init -b main
+mkdir -p docs/agents && cp ~/code/afk-e2e/docs/agents/afk.md docs/agents/ && cp -r ~/code/afk-e2e/.claude .  # its pre-PR skill
+printf 'import sys, urllib.request\nprint(urllib.request.urlopen(sys.argv[1] + "/").read().decode())\n' > client.py
+git add . && git commit -m "Client" && gh repo create afk-e2e-client --private --source . --push
+cd ~/code/afk-e2e
+ping_url=$(gh issue create --title "Add a /ping endpoint and a client command for it" --body "\`GET /ping\` returns \`pong\`, and \`client.py <url> ping\` in <you>/afk-e2e-client calls it.$criteria")
+```
+
+- [ ] In the shell that set it, `afk enqueue "$ping_url"` (a slash command's shell doesn't have `$ping_url`). In the worker's shell pane, which isn't the worker's session, `AFK_QUEUE=1 AFK_TICKET=<n> afk worktree <you>/nowhere` refuses, saying there's no clone of it, and from any shell outside a queue worker `afk worktree <you>/afk-e2e-client` refuses, naming a queue worker.
+- [ ] During implement the worker runs `afk worktree <you>/afk-e2e-client`. A worktree `<n>@<you>.afk-e2e-client` appears beside its own under `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/worktrees/`, on branch `afk/queue-<n>` from the client's `main`, and the worker's status lists it under `siblings`. It printed the client's `export AFK_SLOT=8 AFK_PORT_BASE=…`.
+- [ ] Every phase prompt after that lists both worktrees, each with its repo and base, and the worker verifies, pre-PRs and critiques both. It may edit files in either worktree, and still nowhere else.
+- [ ] draft: one draft PR opens in each repo, each description linking the ticket and the other PR. Once it reports `done`, the ticket's comment, the notification and `afk queue`'s `drafted` line link both drafts, and both worktrees and both repos' local `afk/queue-<n>` branches are gone.
+
 **Wrap-up and abandonment (optional)**
 
 Write `[queue.limits]` with `ticket_minutes = 2` and `wrap_up_minutes = 1` into `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/config.toml`, then enqueue a fresh issue (any small endpoint).
@@ -410,7 +428,7 @@ linear issue create --team TEAM --title "/clock endpoint" --yes --description "R
 
 ## 14. Tear down
 
-- [ ] Stop `afk watch` and `afk queue watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, and the queue's outcomes from this run (with `afk queue` empty and no worker running, `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/queue.json`). Remove the tmux sessions, `~/code/afk-e2e`, the GitHub repo (`gh repo delete afk-e2e`), and, if you ran section 13, its Linear issues (`linear issue delete` each of P, L1–L6, Q1 and Q2) and any throwaway Linear project.
+- [ ] Stop `afk watch` and `afk queue watch`. Remove `${XDG_STATE_HOME:-~/.local/state}/afk/afk-e2e` and `afk-e2e-local`, and the queue's outcomes from this run (with `afk queue` empty and no worker running, `${XDG_STATE_HOME:-~/.local/state}/afk/.queue/queue.json`). Remove the tmux sessions, `~/code/afk-e2e` and, if you made it, `~/code/afk-e2e-client`, the GitHub repos (`gh repo delete afk-e2e`, and `gh repo delete afk-e2e-client`), and, if you ran section 13, its Linear issues (`linear issue delete` each of P, L1–L6, Q1 and Q2) and any throwaway Linear project.
 
 ## Defects
 

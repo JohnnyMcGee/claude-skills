@@ -1752,6 +1752,19 @@ class QueueWorkerTestCase(QueueTickTestCase):
     def prompts_sent(self, pane="%5"):
         return WorkerTestCase.prompts_sent(self, pane)
 
+    def denied(self, command):
+        """Whether the worker's settings deny the shell command."""
+        settings = json.loads((self.state_home / "afk" / ".queue" / "workers" / "12" / "settings.json").read_text())
+        return any(fnmatch.fnmatchcase(f"Bash({command})", rule) for rule in settings["permissions"]["deny"])
+
+    def about_to(self, tool, env=None, **tool_input):
+        """What the worker's PreToolUse hook says to the tool call, or None if it lets it be."""
+        worktree = self.state_home / "afk" / ".queue" / "worktrees" / "12"
+        payload = {"session_id": "s", "transcript_path": str(self.tmp / "12.jsonl"), "hook_event_name": "PreToolUse",
+                   "cwd": str(worktree), "tool_name": tool, "tool_input": tool_input}
+        output = self.afk("hook", "activity", stdin=json.dumps(payload), env=env or self.worker_env())
+        return json.loads(output)["hookSpecificOutput"] if output.strip() else None
+
 
 class QueuePhaseTest(QueueWorkerTestCase):
     def test_each_done_phase_advances_to_the_next_critiquing_and_then_opening_a_draft(self):
@@ -2307,9 +2320,6 @@ class QueueWatchTest(QueueTickTestCase):
 
 
 class QueueWorkerRestrictionTest(QueueWorkerTestCase):
-    def denied(self, command):
-        settings = json.loads((self.state_home / "afk" / ".queue" / "workers" / "12" / "settings.json").read_text())
-        return any(fnmatch.fnmatchcase(f"Bash({command})", rule) for rule in settings["permissions"]["deny"])
 
     def test_a_queue_worker_keeps_a_pr_mode_workers_deny_list(self):
         for command in ["git push --force origin afk/queue-12", "git push origin main", "gh pr merge 7 --squash",
@@ -2325,14 +2335,6 @@ class QueueWorkerRestrictionTest(QueueWorkerTestCase):
             self.assertTrue(self.denied(command), command)
         for command in ["afk report done 'Opened the draft'", "gh pr create --draft --base main", "gh pr view"]:
             self.assertFalse(self.denied(command), command)
-
-    def about_to(self, tool, env=None, **tool_input):
-        """What the worker's PreToolUse hook says to the tool call, or None if it lets it be."""
-        worktree = self.state_home / "afk" / ".queue" / "worktrees" / "12"
-        payload = {"session_id": "s", "transcript_path": str(self.tmp / "12.jsonl"), "hook_event_name": "PreToolUse",
-                   "cwd": str(worktree), "tool_name": tool, "tool_input": tool_input}
-        output = self.afk("hook", "activity", stdin=json.dumps(payload), env=env or self.worker_env())
-        return json.loads(output)["hookSpecificOutput"] if output.strip() else None
 
     def test_a_queue_worker_may_edit_only_inside_its_worktree(self):
         worktree = self.state_home / "afk" / ".queue" / "worktrees" / "12"
@@ -2354,6 +2356,282 @@ class QueueWorkerRestrictionTest(QueueWorkerTestCase):
 
         self.assertIsNone(self.about_to("Edit", env={"AFK_PROJECT": "widgets", "AFK_TICKET": "03"},
                                         file_path=str(self.repo / "widget.py")))
+
+
+class QueueWorktreeTestCase(QueueWorkerTestCase):
+    """acme/widgets#12's queue worker, with a clone of acme/gadgets beside acme/widgets' for `afk worktree` to find."""
+
+    def setUp(self):
+        super().setUp()
+        self.gadgets = self.clone(self.tmp / "gadgets", "git@github.com:acme/gadgets.git")
+        (self.gadgets / ".env").write_text("SECRET=1\n")
+        config = self.gadgets / "docs" / "agents" / "afk.md"
+        config.parent.mkdir(parents=True)
+        config.write_text('+++\nbase = "develop"\nport_base = 5000\ncopy = [".env"]\nbootstrap = ["npm ci"]\n'
+                          'reviewers = ["gadget-review --base {{target}}"]\n+++\n\n# AFK\n')
+
+    @property
+    def sibling(self):
+        return self.state_home / "afk" / ".queue" / "worktrees" / "12@acme.gadgets"  # no owner name holds a dot
+
+
+class QueueWorktreeTest(QueueWorktreeTestCase):
+    def test_afk_worktree_adds_a_worktree_on_the_workers_branch_in_the_other_repos_clone_prepared_for_its_slot(self):
+        output = self.afk("worktree", "acme/gadgets", env=self.worker_env())
+
+        self.assertIn(["git", "-C", str(self.gadgets), "worktree", "add", "-b", "afk/queue-12", str(self.sibling), "develop"],
+                      self.run_fake.calls)
+        self.assertEqual((self.sibling / ".env").read_text(), "SECRET=1\n")
+        [bootstrap] = self.run_fake.find("env", "AFK_SLOT=8")
+        self.assertEqual(bootstrap, ["env", "AFK_SLOT=8", "AFK_PORT_BASE=5800", "sh", "-c", "npm ci"])
+        self.assertEqual(self.run_fake.cwds[self.run_fake.calls.index(bootstrap)], str(self.sibling))
+        self.assertIn(str(self.sibling), output)
+
+    def test_it_prints_the_slot_env_the_other_repos_dev_server_runs_with(self):
+        output = self.afk("worktree", "acme/gadgets", env=self.worker_env())
+
+        self.assertIn("export AFK_SLOT=8 AFK_PORT_BASE=5800", output)
+
+    def test_the_worker_is_denied_pushing_to_the_other_repos_base_too(self):
+        self.assertFalse(self.denied("git push origin develop"))
+
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+
+        for command in ["git push origin develop", "git push origin HEAD:develop", "git push origin main",
+                        "git push --force origin afk/queue-12", "gh pr ready 3"]:
+            self.assertTrue(self.denied(command), command)
+        self.assertFalse(self.denied("git push -u origin HEAD"))
+
+    def test_a_worker_cleaned_up_while_it_ran_has_the_new_worktree_and_branch_removed(self):
+        def abandoned_meanwhile(cmd):
+            shutil.rmtree(self.state_home / "afk" / ".queue" / "workers" / "12")
+            return ""
+
+        self.run_fake.responses[("env", "AFK_SLOT=8")] = abandoned_meanwhile
+        out = io.StringIO()
+        code = afk.main(["worktree", "acme/gadgets"], run=self.run_fake, env={**self.env, **self.worker_env()},
+                        stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+
+        self.assertEqual(code, 1)
+        self.assertIn("cleaned up", out.getvalue())
+        self.assertFalse(self.sibling.exists())
+        self.assertIn(["git", "-C", str(self.gadgets), "branch", "-D", "afk/queue-12"], self.run_fake.calls)
+
+    def gadgets_adds(self):
+        return [add for add in self.worktree_adds() if add[2] == str(self.gadgets)]
+
+    def test_running_it_again_for_a_repo_it_has_a_worktree_in_just_names_that_worktree(self):
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+
+        self.assertIn(str(self.sibling), self.afk("worktree", "ACME/Gadgets", env=self.worker_env()))
+        self.assertIn(str(self.state_home / "afk" / ".queue" / "worktrees" / "12"),
+                      self.afk("worktree", "acme/widgets", env=self.worker_env()))
+        self.assertEqual(len(self.gadgets_adds()), 1)
+        self.assertEqual(len(self.worktree_adds()), 2)
+
+    def test_a_bootstrap_that_fails_removes_the_new_worktree_and_branch_so_a_retry_works(self):
+        def bootstrap_fails(cmd):
+            raise subprocess.CalledProcessError(1, cmd, stderr="npm ERR! network")
+
+        self.run_fake.responses[("env", "AFK_SLOT=8")] = bootstrap_fails
+        out = io.StringIO()
+        code = afk.main(["worktree", "acme/gadgets"], run=self.run_fake, env={**self.env, **self.worker_env()},
+                        stdin=io.StringIO(), stdout=out, clock=lambda: self.now)
+
+        self.assertEqual(code, 1)
+        self.assertIn("npm ERR! network", out.getvalue())
+        self.assertFalse(self.sibling.exists())
+        self.assertIn(["git", "-C", str(self.gadgets), "branch", "-D", "afk/queue-12"], self.run_fake.calls)
+        del self.run_fake.responses[("env", "AFK_SLOT=8")]
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+        self.assertEqual(len(self.gadgets_adds()), 2)
+
+    def test_every_phase_prompt_after_it_names_each_worktree_with_its_repo_and_base(self):
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+
+        for _ in range(4):
+            self.finish_phase()
+
+        prompts = self.prompts_sent()
+        self.assertEqual([p.splitlines()[0].split(" — ")[0] for p in prompts],
+                         ["AFK phase: verify", "AFK phase: prepr", "AFK phase: critique", "AFK phase: draft"])
+        own = self.state_home / "afk" / ".queue" / "worktrees" / "12"
+        for prompt in prompts:
+            self.assertIn(f"`acme/widgets` (base `main`, `AFK_PORT_BASE=4800`): {own}", prompt)
+            self.assertIn(f"`acme/gadgets` (base `develop`, `AFK_PORT_BASE=5800`): {self.sibling}", prompt)
+            self.assertIn("afk/queue-12", prompt)
+            self.assertNotIn("{{", prompt)
+
+    def test_the_worker_may_edit_inside_its_worktree_in_the_other_repo_but_still_nowhere_else(self):
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+
+        about_to = lambda path: self.about_to("Edit", file_path=path)
+        self.assertIsNone(about_to(str(self.sibling / "gadget.py")))
+        self.assertIsNone(about_to(str(self.state_home / "afk" / ".queue" / "worktrees" / "12" / "widget.py")))
+        for path in [str(self.gadgets / "gadget.py"), str(self.sibling.with_name("13@acme.gadgets") / "gadget.py")]:
+            self.assertEqual(about_to(path)["permissionDecision"], "deny", path)
+
+    def test_abandoning_the_ticket_removes_its_worktree_and_local_branch_in_the_other_repo_too(self):
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+        self.run_fake.responses[("git", "-C", str(self.sibling), "log")] = "3f2a9c1 Half a gadget\n"  # never pushed
+
+        self.afk("dequeue", self.URL, "--abandon")
+
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.gadgets), "worktree", "remove"),
+                         [["git", "-C", str(self.gadgets), "worktree", "remove", "--force", str(self.sibling)]])
+        self.assertEqual(self.run_fake.find("git", "-C", str(self.gadgets), "branch", "-D"),
+                         [["git", "-C", str(self.gadgets), "branch", "-D", "afk/queue-12"]])
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+
+    def test_the_critique_prompt_gives_each_other_repos_reviewers_over_the_diff_against_its_own_base(self):
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+
+        for _ in range(3):
+            self.finish_phase()
+
+        verify, prepr, critique = self.prompts_sent()
+        self.assertIn("`gadget-review --base origin/develop`", critique)
+        self.assertNotIn("gadget-review", verify)
+
+    def test_a_ticket_in_one_repo_gets_no_list_of_worktrees(self):
+        self.finish_phase()
+
+        self.assertNotIn(str(self.state_home / "afk" / ".queue" / "worktrees" / "12"), self.prompts_sent()[-1])
+
+
+class QueueSiblingDraftTest(QueueWorktreeTestCase):
+    """A queue worker with a worktree in acme/gadgets too, that reports done in the draft phase."""
+
+    DRAFTS = {"widgets": "https://github.com/acme/widgets/pull/7", "gadgets": "https://github.com/acme/gadgets/pull/3"}
+
+    def setUp(self):
+        super().setUp()
+        self.afk("worktree", "acme/gadgets", env=self.worker_env())
+        self.run_fake.responses[("tmux", "display-message", "-p", "-t", "%6")] = "bash\n"  # its shell pane is idle
+        for _ in range(4):
+            self.finish_phase()
+        self.prs = dict(self.DRAFTS)
+        self.run_fake.responses[("gh", "pr", "view")] = self.pr_view
+        self.now += 60
+
+    def pr_view(self, cmd):
+        """Each clone's PR for the branch, by the clone `gh` runs in."""
+        url = self.prs.get(Path(self.run_fake.cwds[-1]).name.replace("repo", "widgets"))
+        return pr_view("OPEN", url=url) if url else no_pr(cmd)
+
+    def test_cleanup_removes_the_worktree_and_local_branch_in_every_repo(self):
+        self.finish_phase("Drafts open, CI green")
+
+        for clone, worktree in [(self.repo, self.state_home / "afk" / ".queue" / "worktrees" / "12"), (self.gadgets, self.sibling)]:
+            self.assertEqual(self.run_fake.find("git", "-C", str(clone), "worktree", "remove"),
+                             [["git", "-C", str(clone), "worktree", "remove", "--force", str(worktree)]])
+            self.assertEqual(self.run_fake.find("git", "-C", str(clone), "branch", "-D"),
+                             [["git", "-C", str(clone), "branch", "-D", "afk/queue-12"]])
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+
+    def test_the_ticket_comment_the_outcome_and_the_notification_link_the_draft_in_every_repo(self):
+        self.finish_phase("Drafts open, CI green")
+
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        for url in self.DRAFTS.values():
+            self.assertIn(url, comment[comment.index("--body") + 1])
+            self.assertIn(url, self.desktop_notifications()[-1])
+        self.assertIn(f"drafted  acme/widgets#12  Widget export  {self.DRAFTS['widgets']} {self.DRAFTS['gadgets']}",
+                      self.afk("queue"))
+
+    def test_a_repo_whose_branch_has_no_pr_goes_unlinked(self):
+        del self.prs["gadgets"]
+
+        self.finish_phase("Draft open")
+
+        [comment] = self.run_fake.find("gh", "issue", "comment")
+        self.assertIn(self.DRAFTS["widgets"], comment[comment.index("--body") + 1])
+        self.assertNotIn("gadgets", comment[comment.index("--body") + 1])
+        self.assertIn(f"drafted  acme/widgets#12  Widget export  {self.DRAFTS['widgets']}\n", self.afk("queue") + "\n")
+
+    def test_a_cleanup_that_failed_after_deleting_its_own_branch_finishes_without_a_notification(self):
+        removes, deletes = [], []
+
+        def sibling_remove_fails_once(cmd):
+            removes.append(cmd)
+            if len(removes) == 1:
+                raise subprocess.CalledProcessError(1, cmd, stderr="fatal: busy")
+            return git(cmd)
+
+        def branch_gone_once_deleted(cmd):
+            deletes.append(cmd)
+            if len(deletes) > 1:
+                raise subprocess.CalledProcessError(1, cmd, stderr="error: branch 'afk/queue-12' not found.")
+            return ""
+
+        self.run_fake.responses[("git", "-C", str(self.gadgets), "worktree", "remove")] = sibling_remove_fails_once
+        self.run_fake.responses[("git", "-C", str(self.repo), "branch", "-D")] = branch_gone_once_deleted
+        self.afk("report", "done", "Drafts open", env=self.worker_env())
+        self.afk("hook", "stop", stdin=json.dumps({"session_id": "s", "hook_event_name": "Stop"}), env=self.worker_env())
+        self.queue_fails("queue", "tick")
+
+        output = self.afk("queue", "tick")
+
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        self.assertFalse(self.sibling.exists())
+        self.assertEqual([n for n in self.desktop_notifications() if "leaving branch" in n], [])
+        self.assertNotIn("\a", output)
+
+    def test_its_own_worktree_gone_still_leaves_the_other_repos_unpushed_commits_holding_cleanup_back(self):
+        shutil.rmtree(self.state_home / "afk" / ".queue" / "worktrees" / "12")  # as by a cleanup that failed partway
+
+        self.assertEqual(self.held_back_by_the_other_repo("log", "3f2a9c1 Add the gadget\n"),
+                         "its acme/gadgets branch has unpushed commits")
+
+    def held_back_by_the_other_repo(self, command, output):
+        """Finish the draft with `git <command>` in the acme/gadgets worktree printing output, which holds cleanup back
+        until it prints nothing; the status message while it's held."""
+        self.run_fake.responses[("git", "-C", str(self.sibling), command)] = output
+
+        self.finish_phase("Drafts open, CI green")
+
+        self.assertEqual(self.status()["state"], "cleanup-pending")
+        self.assertEqual(self.run_fake.find("tmux", "kill-window"), [])
+        held = self.status()["message"]
+        del self.run_fake.responses[("git", "-C", str(self.sibling), command)]
+        self.now += 60
+        self.afk("queue", "tick")
+        self.assertFalse((self.state_home / "afk" / ".queue" / "workers" / "12").exists())
+        return held
+
+    def test_unpushed_commits_in_the_other_repos_worktree_leave_it_cleanup_pending(self):
+        self.assertEqual(self.held_back_by_the_other_repo("log", "3f2a9c1 Add the gadget\n"),
+                         "its acme/gadgets branch has unpushed commits")
+
+    def test_uncommitted_changes_in_the_other_repos_worktree_leave_it_cleanup_pending(self):
+        self.assertEqual(self.held_back_by_the_other_repo("status", " M gadget.py\n"),
+                         "its acme/gadgets worktree has uncommitted changes")
+
+
+class QueueWorktreeRefusalTest(QueueWorktreeTestCase):
+    def refused(self, repo, env):
+        out = io.StringIO()
+        code = afk.main(["worktree", repo], run=self.run_fake, env={**self.env, **env}, stdin=io.StringIO(), stdout=out,
+                        clock=lambda: self.now)
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertEqual(len(self.worktree_adds()), 1)  # the worker's own
+        return out.getvalue()
+
+    def test_a_repo_with_no_clone_near_the_worker_nor_in_the_registry_is_refused(self):
+        output = self.refused("acme/nowhere", self.worker_env())
+
+        self.assertIn("no clone of acme/nowhere", output)
+        self.assertIn("[repos]", output)
+
+    def test_a_repo_with_no_afk_repo_config_is_refused(self):
+        shutil.rmtree(self.gadgets / "docs")
+
+        self.assertIn("run /afk-setup there first", self.refused("acme/gadgets", self.worker_env()))
+
+    def test_it_is_refused_outside_a_queue_worker(self):
+        for env in [{}, {"AFK_TICKET": "12"}, {"AFK_PROJECT": "widgets", "AFK_TICKET": "03"}, {"AFK_QUEUE": "1"},
+                    {"AFK_QUEUE": "1", "AFK_TICKET": "13"}]:
+            self.assertIn("a queue worker", self.refused("acme/gadgets", env), env)
 
 
 class LinearQueueTestCase(QueueTickTestCase):
