@@ -1228,6 +1228,7 @@ Open the PR as a draft. In the pr phase, push the branch and run `gh pr create -
 title and {ticket} in the body so Linear links it, before `/open-pr`: it finds the open draft and clears its gates.
 Leave it a draft. Marking it ready for review is mine."""
 PULL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
+TICKET = re.compile(r"linear\.app/[^/\s]+/issue/([A-Za-z0-9]+-\d+)")
 
 
 def asks(items):
@@ -1414,6 +1415,10 @@ def entry(name, profile, group):
     elif lead["source"] == "slack" and facts.get("ask"):
         channel, _, thread = lead["native_id"].partition("/")
         action, urgency = {"type": "slack_reply", "params": {"channel": channel, "thread_ts": thread}}, "normal"
+    elif lead["source"] == "linear" and kind in ("mention", "comment") and facts.get("ask") and TICKET.search(lead["subject"]):
+        # A task asked on a ticket gets a reply too, not a ticket of its own: it is already one
+        parent = {"parent_id": facts["comment_id"]} if facts.get("comment_id") else {}
+        action, urgency = {"type": "linear_reply", "params": {"issue": TICKET.search(lead["subject"])[1], **parent}}, "normal"
     elif kind in ("mention", "ticket_change", "dm", "thread_question"):
         urgency = "normal"
     if any(urgent(profile.get("urgency", {}), i) for i in group):

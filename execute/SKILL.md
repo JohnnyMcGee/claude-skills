@@ -31,12 +31,13 @@ The run is done when every entry in the plan has a recorded result.
 | `gh_review` | `process execute review <profile> <entry id>`. It submits the approved draft with the entry's event (`COMMENT` or `REQUEST_CHANGES`, never `APPROVE`) and records the result itself. |
 | `gh_thread_reply` | The draft is my reply, then an optional `## Fix` section. If there is a fix, make it first (as `gh_fix_pr` below) and push it. Then `process execute reply <profile> <entry id>`: it posts the text above `## Fix` in the comment's own thread and records the result itself. If the fix failed, record the failure instead and post nothing. |
 | `gh_fix_pr` | Fix the PR in a scratch worktree and push, below. Record `success --link <the pushed commit link>`. |
+| `linear_reply` | Post the approved draft, byte for byte, with `mcp__linear-server__save_comment`: a new comment on the ticket in `params.issue`, with `params.parent_id` as its parent when there is one. Never edit or delete a comment: pass no comment id of its own. Record `success --link <the new comment's URL>`. |
 | `linear_promote` | Move the ticket in `params.ticket` from Backlog to its team's Todo state with `mcp__linear-server__save_issue`, and change nothing else about it. Record `success --link <params.url>`. If it is no longer in Backlog, change nothing and record a failure saying where it is. |
 | anything else | Not executable yet. Record a failure: `no executor step for <type> yet`. |
 
 AFK launches never reach your plan: `process execute` writes each approved one as an `afk` ticket and starts its worker itself.
 
-You send nothing to GitHub yourself: you hold no GitHub write tool, only these steps. Your one Linear write is a promotion. You can read files only in a fix's worktree.
+You send nothing to GitHub yourself: you hold no GitHub write tool, only these steps. Your Linear writes are a promotion and an approved reply. You can read files only in a fix's worktree.
 
 ### Fixing a PR
 

@@ -858,6 +858,55 @@ class LinearInboxTest(TriageTestCase):
         self.assertEqual(failed["status"], "failed")
 
 
+class LinearReplyTest(TriageTestCase):
+    def ask(self, **over):
+        """Dee asking me, in a comment on WID-12, to pick an option."""
+        base = {
+            "native_id": "notif-12",
+            "kind": "mention",
+            "subject": "https://linear.app/acme/issue/WID-12#comment-c12",
+            "link": "https://linear.app/acme/issue/WID-12#comment-c12",
+            "actor": {"name": "Dee", "role": "person"},
+            "summary": "Dee asked you to pick option A or B for the WID-12 fix",
+            "context": "@me-dev option A (new index) or B (cache the query)? Need your call before I start.",
+            "facts": {"notification_id": "notif-12", "ask": "question", "comment_id": "c-12"},
+        }
+        return linear(**{**base, **over})
+
+    def test_a_linear_mention_that_asks_me_something_gets_a_drafted_reply_in_its_comment_thread(self):
+        self.emit(self.ask(), source="linear")
+
+        queue = self.triage()
+
+        [reply] = [e for e in queue if e["kind"] == "mention"]
+        self.assertEqual((reply["action"]["type"], reply["action"]["params"]), ("linear_reply", {"issue": "WID-12", "parent_id": "c-12"}))
+        self.assertEqual((reply["autonomy"], reply["status"], reply["urgency"]), ("draft", "pending", "normal"))
+        self.assertTrue(reply["action"]["draft"])
+        self.assertEqual([e["action"]["params"]["notification_ids"] for e in queue if e["action"]["type"] == "linear_mark_read"], [["notif-12"]])
+        self.assertEqual(self.process("validate", "queue_entry", str(self.state / "queue.jsonl")), "")
+
+    def test_a_task_asked_in_a_comment_on_my_ticket_gets_a_drafted_reply_too(self):
+        self.emit(self.ask(kind="comment", summary="Dee asked you to close WID-12 if it is done", facts={"notification_id": "notif-12", "ask": "task", "comment_id": "c-12"}), source="linear")
+
+        [reply] = [e for e in self.triage() if e["kind"] == "comment"]
+
+        self.assertEqual((reply["action"]["type"], reply["status"]), ("linear_reply", "pending"))
+
+    def test_a_mention_in_a_ticket_description_replies_on_the_ticket(self):
+        self.emit(self.ask(subject="https://linear.app/acme/issue/WID-12", facts={"notification_id": "notif-12", "ask": "question"}), source="linear")
+
+        [reply] = [e for e in self.triage() if e["kind"] == "mention"]
+
+        self.assertEqual(reply["action"]["params"], {"issue": "WID-12"})
+
+    def test_a_linear_notification_that_asks_nothing_stays_an_fyi(self):
+        self.emit(self.ask(kind="notification", summary="Cal completed WID-12", facts={"notification_id": "notif-12"}), source="linear")
+
+        [fyi] = [e for e in self.triage() if e["kind"] == "notification"]
+
+        self.assertEqual((fyi["status"], fyi["action"]["type"]), ("info", "none"))
+
+
 class NeverActionTest(TriageTestCase):
     def test_my_approved_green_pr_is_an_fyi_never_a_merge(self):
         self.emit(my_pr(mergeable="mergeable", checks="passing", review="approved"))
@@ -1290,6 +1339,21 @@ class LearningTest(ExecuteTestCase):
         self.assertIn("gh_review cannot be silent", out)
         self.assertEqual(process.load_profile(self.tmp / "config" / "process" / "profiles" / "acme.md")["autonomy"]["silent"], [])
         self.assertEqual(self.entry(review["id"])["status"], "approved")  # the approval itself still stands
+
+
+class LinearReplyExecuteTest(ExecuteTestCase):
+    def test_an_approved_linear_reply_reaches_the_executor_with_my_text_and_records_the_posted_comment(self):
+        self.emit(LinearReplyTest.ask(self), source="linear")
+        [reply] = [e for e in self.triage() if e["kind"] == "mention"]
+        self.decide(reply, draft="Option A: the index is cheaper to keep right.")
+        self.process("execute")
+
+        plan = self.process("execute", "plan", "acme")
+        self.assertIn(f'{reply["id"]}  linear_reply {{"issue": "WID-12", "parent_id": "c-12"}}', plan)
+        self.assertIn("    | Option A: the index is cheaper to keep right.", plan)
+
+        self.process("execute", "result", "acme", reply["id"], "success", "--link", "https://linear.app/acme/issue/WID-12#comment-c13")
+        self.assertEqual(self.entry(reply["id"])["status"], "done")
 
 
 class ExecutorStepsTest(ExecuteTestCase):

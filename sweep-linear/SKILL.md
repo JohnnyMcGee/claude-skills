@@ -36,6 +36,8 @@ One item per ask. Every item carries `source: "linear"`, `actor` (`{"name": <nam
 
 **Notifications** get `native_id`: the notification id, `version`: its `updatedAt`, and `facts.notification_id`: the notification id.
 
+A `mention` or `comment` also gets `facts.comment_id`, the comment's id, when it is in a comment, and `facts.ask` when it asks something of me: `question` when it wants an answer or a decision (pick an option, OK a plan), `task` when it wants something done (close a ticket, look into X). Leave `ask` out when it only reports, or when a bot or integration posted it. Triage drafts a reply to every ask.
+
 | Notification | `kind` | `subject` |
 |---|---|---|
 | I was mentioned | `mention` | the issue URL, plus `#comment-<id>` when the mention is in a comment |

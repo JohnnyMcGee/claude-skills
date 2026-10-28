@@ -52,7 +52,8 @@
             "review": {"enum": ["approved", "changes_requested", "review_required", "none"]},
             "draft": {"type": "boolean"},
             "notification_id": {"description": "Linear: the notification this item came from, to mark read.", "type": "string", "minLength": 1},
-            "ask": {"description": "Slack, Gmail: what the message asks of me. task: work to do (Slack: becomes a ticket). question: needs an answer from me. Absent: nothing is asked.", "enum": ["task", "question"]},
+            "comment_id": {"description": "Linear: the comment a mention or comment item came from, to reply under it.", "type": "string", "minLength": 1},
+            "ask": {"description": "Slack, Gmail, Linear: what the message asks of me. task: work to do (Slack: becomes a ticket). question: needs an answer from me. Absent: nothing is asked.", "enum": ["task", "question"]},
             "answered": {"description": "Slack: I already replied or reacted after the ask. emit drops the item.", "type": "boolean"},
             "channel": {"description": "Slack: the channel name (#deploys) or DM.", "type": "string", "minLength": 1},
             "noise": {"description": "Gmail: a newsletter or notification mail, to label and archive.", "type": "boolean"},
@@ -66,7 +67,7 @@
     },
     "action_type": {
       "description": "Every action triage may propose. Merging, approving others' PRs and prod changes are absent on purpose: they are never actions.",
-      "enum": ["none", "linear_mark_read", "gh_review", "gh_thread_reply", "gh_fix_pr", "slack_reply", "email_reply", "rsvp", "linear_promote", "linear_create_issue", "gmail_archive", "afk_launch"]
+      "enum": ["none", "linear_mark_read", "gh_review", "gh_thread_reply", "gh_fix_pr", "slack_reply", "email_reply", "linear_reply", "rsvp", "linear_promote", "linear_create_issue", "gmail_archive", "afk_launch"]
     },
     "pr_ref": {
       "type": "object",
@@ -127,6 +128,20 @@
               "type": "object",
               "required": ["channel", "thread_ts"],
               "properties": {"channel": {"type": "string", "minLength": 1}, "thread_ts": {"type": "string", "minLength": 1}}
+            }
+          }
+        },
+        {
+          "properties": {
+            "type": {"const": "linear_reply"},
+            "params": {
+              "description": "A comment on the ticket, under the comment that asked when there is one.",
+              "type": "object",
+              "required": ["issue"],
+              "properties": {
+                "issue": {"description": "The Linear identifier.", "type": "string", "pattern": "^[A-Za-z0-9]+-\\d+$"},
+                "parent_id": {"description": "The asking comment's id.", "type": "string", "minLength": 1}
+              }
             }
           }
         },

@@ -181,8 +181,8 @@ allowed_tools = [
 # The executor: the only phase that may send, and only what I approved (or promoted to silent). It sends and pushes
 # through `process execute` steps, which post exactly the approved text and check the PR is mine, so it holds no GitHub
 # write tool. Each step is named: a bare `process execute` would start a second executor. It reads only its worktree.
-# Its one Linear write moves a ticket whose promotion I approved from Backlog to Todo. AFK launches need no tool here:
-# `process execute` writes the afk spec and starts the worker itself.
+# Its Linear writes move a ticket whose promotion I approved from Backlog to Todo, and post a reply I approved as a
+# comment. AFK launches need no tool here: `process execute` writes the afk spec and starts the worker itself.
 [phases.execute]
 model = "opus"
 allowed_tools = [
@@ -198,6 +198,7 @@ allowed_tools = [
   "mcp__linear-server__get_issue",
   "mcp__linear-server__list_issue_statuses",
   "mcp__linear-server__save_issue",
+  "mcp__linear-server__save_comment",
 ]
 +++
 
